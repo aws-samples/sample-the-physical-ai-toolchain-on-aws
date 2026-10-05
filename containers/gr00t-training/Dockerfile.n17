@@ -69,6 +69,15 @@ COPY containers/gr00t-training/train_entrypoint_n17.py /opt/ml/code/train_entryp
 COPY containers/gr00t-training/batch-train-entrypoint-n17.sh /opt/ml/code/batch-train
 RUN chmod +x /opt/ml/code/batch-train
 
+# Embodiment modality configs. train_entrypoint.py picks one at runtime from
+# EMBODIMENT_CONFIG (or an explicit MODALITY_CONFIG_PATH) and passes it to
+# launch_finetune.py as --modality-config-path. They are shipped as files because
+# the ENTRYPOINT below dispatches on $1 and AWS Batch job definitions cannot
+# override an entrypoint, so the embodiment has to be selectable from the
+# environment alone.
+COPY containers/gr00t-training/ur3_modality_config.py /opt/ml/code/ur3_modality_config.py
+COPY containers/gr00t-training/g1_dex3_modality_config.py /opt/ml/code/g1_dex3_modality_config.py
+
 # SageMaker compatibility
 ENV PYTHONUNBUFFERED=1
 ENV SAGEMAKER_PROGRAM=train_entrypoint.py
@@ -77,6 +86,8 @@ ENV DATASET_LOCAL_DIR="/opt/ml/input/data/training"
 ENV OUTPUT_DIR="/opt/ml/model"
 ENV BASE_MODEL_PATH="nvidia/GR00T-N1.7-3B"
 ENV GROOT_SDK_DIR="/workspace/gr00t-repo"
+# Backwards-compatible default: unset environment == the validated UR3 flow.
+ENV EMBODIMENT_CONFIG=ur3
 
 # Symlink for compatibility
 RUN ln -sf /workspace/gr00t-repo /opt/isaac-gr00t

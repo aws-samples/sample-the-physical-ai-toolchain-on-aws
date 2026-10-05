@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""GR00T N1.7-3B fine-tuning entrypoint for SageMaker.
+"""GR00T N1.7-3B fine-tuning entrypoint for SageMaker and AWS Batch.
 
-Runs inside the custom SageMaker training container (see Dockerfile.n17). It:
+Runs inside the custom training container (see Dockerfile.n17). It:
   1. Reads SageMaker hyperparameters + channel/output paths
-  2. Registers the UR3 embodiment (NEW_EMBODIMENT) modality config
-  3. Fine-tunes GR00T N1.7-3B via launch_finetune.py
-  4. Saves the model + metadata to SM_MODEL_DIR (auto-uploaded to S3)
+  2. Resolves the embodiment (NEW_EMBODIMENT) modality config to use
+  3. Pre-flights one video decode so a codec problem fails in seconds
+  4. Fine-tunes GR00T N1.7-3B via launch_finetune.py
+  5. Saves the model + metadata to SM_MODEL_DIR (auto-uploaded to S3)
+
+Embodiment selection (step 2) is driven by the environment, because the Docker
+ENTRYPOINT dispatches on $1 and AWS Batch job definitions cannot override an
+entrypoint — so the embodiment cannot be chosen from the outside any other way:
+
+  MODALITY_CONFIG_PATH  explicit path to a modality config module. Wins when set.
+  EMBODIMENT_CONFIG     'ur3' (default) | 'g1_dex3'. Named configs shipped at
+                        /opt/ml/code/ by Dockerfile.n17.
+
+'ur3' keeps the original inlined config written to the output dir, so the
+validated UR3 flow is unchanged when neither variable is set.
 
 N1.7 changes from N1.6:
   - Model: nvidia/GR00T-N1.7-3B (Cosmos-Reason2-2B backbone)
@@ -29,6 +41,17 @@ CHANNEL_TRAINING = os.environ.get("SM_CHANNEL_TRAINING", "/opt/ml/input/data/tra
 FAILURE_FILE = "/opt/ml/output/failure"
 HYPERPARAMS_FILE = "/opt/ml/input/config/hyperparameters.json"
 SDK_DIR = os.environ.get("GROOT_SDK_DIR", "/workspace/gr00t-repo")
+
+# Named embodiment configs shipped into the image by Dockerfile.n17. 'ur3' is
+# handled separately (written inline, see write_embodiment_config) so the
+# original UR3 behaviour is preserved exactly.
+CODE_DIR = "/opt/ml/code"
+EMBODIMENT_CONFIG_MODULES = {
+    "ur3": None,  # inline, written to $OUTPUT_DIR/ur3_embodiment/ur3_config.py
+    "g1_dex3": os.path.join(CODE_DIR, "g1_dex3_modality_config.py"),
+}
+# Both shipped configs call register_modality_config(..., NEW_EMBODIMENT).
+EMBODIMENT_TAG = "new_embodiment"
 
 
 # --------------------------------------------------------------------------- #
@@ -109,6 +132,98 @@ register_modality_config(ur3_config, embodiment_tag=EmbodimentTag.NEW_EMBODIMENT
     return config_path
 
 
+def resolve_embodiment_config(output_dir: str) -> str:
+    """Resolve which modality config to pass to --modality-config-path.
+
+    Precedence:
+      1. MODALITY_CONFIG_PATH, if set. A value that does not exist is a hard
+         failure, not a silent fallback: falling back to UR3 for joint-space
+         data is exactly the crash this resolver exists to prevent.
+      2. EMBODIMENT_CONFIG, defaulting to 'ur3' so an unset environment keeps
+         the validated UR3 behaviour.
+
+    Exits 1 via _write_failure() on an unknown or unusable value.
+    """
+    explicit = os.environ.get("MODALITY_CONFIG_PATH", "").strip()
+    if explicit:
+        if not os.path.exists(explicit):
+            _write_failure(
+                f"MODALITY_CONFIG_PATH is set to '{explicit}' but that file does not "
+                f"exist in the container. Ship the config via Dockerfile.n17 or use "
+                f"EMBODIMENT_CONFIG ({'|'.join(EMBODIMENT_CONFIG_MODULES)}) instead. "
+                f"This job did NOT train a model."
+            )
+            sys.exit(1)
+        return explicit
+
+    name = os.environ.get("EMBODIMENT_CONFIG", "ur3").strip() or "ur3"
+    if name not in EMBODIMENT_CONFIG_MODULES:
+        _write_failure(
+            f"Unknown EMBODIMENT_CONFIG '{name}'. Supported values: "
+            f"{', '.join(sorted(EMBODIMENT_CONFIG_MODULES))}. Set MODALITY_CONFIG_PATH "
+            f"to point at your own modality config module instead. "
+            f"This job did NOT train a model."
+        )
+        sys.exit(1)
+
+    module_path = EMBODIMENT_CONFIG_MODULES[name]
+    if module_path is None:
+        # UR3: written inline so the container stays self-contained.
+        return write_embodiment_config(output_dir)
+
+    if not os.path.exists(module_path):
+        _write_failure(
+            f"EMBODIMENT_CONFIG '{name}' maps to {module_path}, which is missing from "
+            f"the image. Rebuild the container with buildspec-n17.yml so Dockerfile.n17 "
+            f"COPYs it into {CODE_DIR}/. This job did NOT train a model."
+        )
+        sys.exit(1)
+    return module_path
+
+
+def preflight_video_decode(dataset_path: str) -> None:
+    """Decode one frame from the first video in the dataset and print the codec.
+
+    GR00T decodes with torchcodec (gr00t/utils/video_utils.get_frames_by_indices
+    -> torchcodec.decoders.VideoDecoder) against the ffmpeg runtime in the image.
+    The G1 Edu pick-and-place capture declares video.codec 'av1'. If that codec
+    is not decodable here, the dataloader would only fail many minutes into the
+    run, buried in worker tracebacks — so prove it up front instead.
+    """
+    videos_root = Path(dataset_path) / "videos"
+    if not videos_root.is_dir():
+        print(f"  Video pre-flight: skipped, no {videos_root}", flush=True)
+        return
+
+    sample = next(iter(sorted(videos_root.rglob("*.mp4"))), None)
+    if sample is None:
+        print(f"  Video pre-flight: skipped, no .mp4 under {videos_root}", flush=True)
+        return
+
+    try:
+        from torchcodec.decoders import VideoDecoder
+
+        decoder = VideoDecoder(
+            str(sample), device="cpu", dimension_order="NHWC", num_ffmpeg_threads=0
+        )
+        codec = getattr(decoder.metadata, "codec", "unknown")
+        frame = decoder.get_frames_at(indices=[0]).data
+        print(
+            f"  Video pre-flight: OK — {sample.name} codec={codec} "
+            f"frame={tuple(frame.shape)}",
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001 - any decode problem is fatal here
+        _write_failure(
+            f"Video decode pre-flight failed on {sample} ({type(e).__name__}: {e}). "
+            f"This dataset's videos cannot be decoded by torchcodec/ffmpeg in this "
+            f"image. The G1 Edu capture is AV1 (meta/info.json video.codec 'av1'): if "
+            f"AV1 decode is unsupported here, transcode the videos to H.264 and "
+            f"re-stage the dataset to S3, then resubmit. This job did NOT train a model."
+        )
+        sys.exit(1)
+
+
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
@@ -139,11 +254,16 @@ def run_training() -> None:
     print(f"  Learning rate:    {learning_rate}")
     print(f"  Grad accum:       {gradient_accumulation_steps}")
     print(f"  GPUs:             {num_gpus}")
+    print(f"  Embodiment:       {os.environ.get('EMBODIMENT_CONFIG', 'ur3')}")
     print(flush=True)
 
-    # Write and register embodiment config
-    config_path = write_embodiment_config(output_dir)
+    # Resolve the embodiment config (inline UR3 by default, or a shipped module)
+    config_path = resolve_embodiment_config(output_dir)
     print(f"  Embodiment config: {config_path}", flush=True)
+    print(f"  Embodiment tag:    {EMBODIMENT_TAG}", flush=True)
+
+    # Fail fast on an undecodable video codec rather than deep inside the dataloader
+    preflight_video_decode(dataset_path)
 
     # Delete pre-computed stats (format may differ between SDK versions)
     import glob
@@ -167,7 +287,7 @@ def run_training() -> None:
         "--dataset-path", dataset_path,
         "--output-dir", output_dir,
         "--modality-config-path", config_path,
-        "--embodiment-tag", "new_embodiment",
+        "--embodiment-tag", EMBODIMENT_TAG,
         "--global-batch-size", str(global_batch_size),
         "--gradient-accumulation-steps", str(gradient_accumulation_steps),
         "--max-steps", str(max_steps),
@@ -236,6 +356,9 @@ def main():
         "backbone": "Cosmos-Reason2-2B (Qwen3-VL)",
         "min_vram": "48 GB",
         "action_horizon": 16,
+        "embodiment_config": os.environ.get("EMBODIMENT_CONFIG", "ur3"),
+        "modality_config_path": os.environ.get("MODALITY_CONFIG_PATH", ""),
+        "embodiment_tag": EMBODIMENT_TAG,
     }
     with open(Path(MODEL_DIR) / "training_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)

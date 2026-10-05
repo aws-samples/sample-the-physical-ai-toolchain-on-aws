@@ -2,9 +2,10 @@
 GR00T modality config for the Unitree G1 Edu + Dex3-1 hands (NEW_EMBODIMENT).
 
 This is the config the N1.7 training job loads via `--modality-config-path`.
-`train_entrypoint_n17.py` also keeps an inline copy so the container stays
-self-contained (same two-copy convention as `ur3_modality_config.py`) — keep the
-two in sync.
+`Dockerfile.n17` COPYs this file to `/opt/ml/code/g1_dex3_modality_config.py` and
+`train_entrypoint_n17.py` selects it with `EMBODIMENT_CONFIG=g1_dex3` — so unlike
+`ur3_modality_config.py` (whose content is also inlined in the entrypoint), this
+file IS the copy that runs. Edit it here and rebuild the image.
 
 Dataset: `pick_place_data`, LeRobot v2.1, `robot_type = "Unitree_G1_Dex3"`,
 201 episodes, 30 fps, single camera, 28-DOF joint-space teleop recording.
