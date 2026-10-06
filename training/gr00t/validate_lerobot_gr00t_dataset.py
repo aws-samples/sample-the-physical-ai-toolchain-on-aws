@@ -5,7 +5,7 @@ Validate that a LeRobot dataset will actually load in the GR00T N1.7 container.
 This re-implements, outside the container, every assertion
 `gr00t/data/dataset/lerobot_episode_loader.py` makes while loading a dataset, so
 a malformed dataset fails here in seconds instead of 20 minutes into a GPU job
-that has already paid for an instance and a 22.7 GB image pull.
+that has already paid for an instance and a 22.6 GB image pull.
 
 Checks (each printed as PASS / FAIL / WARN):
   A  meta/info.json, meta/episodes.jsonl, meta/tasks.jsonl and meta/modality.json

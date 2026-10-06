@@ -48,7 +48,7 @@ import boto3
 
 # Live Batch resources for this stack. The queue feeds the g6e.12xlarge (4x L40S)
 # compute environment physical-ai-dev-gr00t-compute, which sits at desiredvCpus 0
-# when idle — the first job of the day pays an EC2 capacity wait plus a ~22.7 GB
+# when idle — the first job of the day pays an EC2 capacity wait plus a ~22.6 GB
 # ECR image pull before any application log line appears.
 DEFAULT_JOB_QUEUE = "physical-ai-dev-gr00t-queue"
 DEFAULT_JOB_DEFINITION = "physical-ai-dev-gr00t-n17-training"
@@ -204,7 +204,7 @@ def watch_job(batch_client, logs_client, job_id: str, poll_interval: int = 10) -
     Phase dwell times are printed as each transition happens because they are the
     numbers the workshop guide quotes:
       RUNNABLE dwell  = EC2 capacity wait (cold compute environment scale-up)
-      STARTING dwell  = ~22.7 GB ECR image pull onto the fresh instance
+      STARTING dwell  = ~22.6 GB ECR image pull onto the fresh instance
       RUNNING dwell   = dataset download + stats generation + training
     """
     print(f"[{_stamp()}] watching job {job_id}")
@@ -323,7 +323,7 @@ def submit_training_job(
               f"({len(environment)} entries, no command, no resourceRequirements)")
         print()
         print("Next step: drop --dry-run to submit. The compute environment starts from")
-        print("desiredvCpus 0, so expect an EC2 capacity wait plus a ~22.7 GB image pull")
+        print("desiredvCpus 0, so expect an EC2 capacity wait plus a ~22.6 GB image pull")
         print("before the first application log line.")
         return {"dry_run": True, "payload": payload, "region": region}
 
