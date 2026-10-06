@@ -134,7 +134,9 @@ terraform apply -var="aws_region=us-east-2"
 ```bash
 cd isaac-gr00t-on-aws/infra
 terraform init
-# Single-GPU (primary). The job-definition shape defaults to 16 / 122880 / 1.
+# Single-GPU (primary). This is the default shape — instance type g6e.4xlarge
+# and job-definition 16 / 122880 / 1 — so the -var below is redundant and is
+# passed only to make the shape explicit in the command you run.
 terraform plan  -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch_instance_type=g6e.4xlarge"
 terraform apply -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch_instance_type=g6e.4xlarge"
 
@@ -365,8 +367,9 @@ aws codebuild batch-get-builds \
   --query 'builds[0].{status:buildStatus,phase:currentPhase}'
 ```
 
-**Measured build phases** (`BUILD_GENERAL1_2XLARGE`, from-scratch, no layer
-cache):
+**Measured build phases** — the first of this guide's two rebuilds, the one that
+made the container embodiment-selectable (`BUILD_GENERAL1_2XLARGE`,
+from-scratch, no layer cache):
 
 | phase | duration |
 |---|---|
@@ -378,7 +381,11 @@ cache):
 | POST_BUILD (push 22.6 GB, two tags) | 583 s (9 m 43 s) |
 | **total wall clock** | **19 m 57 s** |
 
-Resulting image: 22,597,572,749 B (22.6 GB).
+That image measured 22,597,572,749 B. A second rebuild on the same buildspec and
+compute type — adding the basename command dispatch and `TUNE_VISUAL` — took
+**20 m 59 s** with the same phase shape, so budget ~20 min per rebuild. The
+image now carried by `:n17` is from that second build: **22,597,509,931 B
+(22.6 GB)**. The superseded image keeps its dated tag.
 
 > **Budget for the queue.** A first attempt on `BUILD_GENERAL1_2XLARGE` sat in
 > `QUEUED` for **1502 s (25 m 2 s)** before provisioning — a capacity wait, not a
@@ -745,14 +752,29 @@ way to confirm which modality config a checkpoint was trained with.
 
 The compute environment sits at `minvCpus=0` / `desiredvCpus=0` and scales to
 zero on its own. A job in `RUNNABLE` costs nothing — no instance exists yet.
-`desiredvCpus` rises to 48 while a job is queued and returns to 0 once the job
-reaches a terminal state.
+While a job is queued, `desiredvCpus` rises to the job's vCPU request and
+returns to 0 once the job reaches a terminal state. **Match the number below to
+the compute environment you actually deployed** — one instance's worth of vCPUs,
+not more:
+
+| compute environment | vCPUs per instance | `desiredvCpus` for one warm instance |
+|---|---|---|
+| `g6e.4xlarge` (single-GPU, primary) | 16 | `16` |
+| `g6e.12xlarge` (4-GPU alternative) | 48 | `48` |
+
+The 0 → **48** transition recorded in this guide's validation evidence was
+measured on the **deployed `g6e.12xlarge`** compute environment with the 48-vCPU
+job shape of live revision 1. On the `g6e.4xlarge` CE that Step 2 creates, the
+equivalent figure is 16, and passing 48 there scales to **three** instances
+(~$9/hr) instead of one.
 
 ```bash
-# Keep an instance warm during an active iteration session
+# Keep ONE instance warm during an active iteration session.
+# 16 = g6e.4xlarge (the Step 2 default). Use 48 only on a g6e.12xlarge CE.
+# minvCpus stays 0 so the environment can still fall back to zero on its own.
 aws batch update-compute-environment \
   --compute-environment "physical-ai-dev-gr00t-compute" \
-  --compute-resources 'minvCpus=48,desiredvCpus=48' \
+  --compute-resources 'minvCpus=0,desiredvCpus=16' \
   --region us-east-2
 
 # Scale back to zero when done
@@ -761,6 +783,10 @@ aws batch update-compute-environment \
   --compute-resources 'minvCpus=0,desiredvCpus=0' \
   --region us-east-2
 ```
+
+> Raising `minvCpus` above 0 pins the instance up: Batch will not scale it down
+> on an empty queue, and it keeps billing until a second command sets it back.
+> If you do raise it, you must return it to 0 explicitly.
 
 On-demand Linux pricing in us-east-2, from the AWS Pricing API:
 
@@ -786,11 +812,18 @@ either way yet.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_batch` | `false` | Set to `true` to deploy the Batch resources |
-| `batch_instance_type` | `g6.12xlarge` | The deployed CE is `g6e.12xlarge`. Pass `g6e.4xlarge` for the single-GPU path |
+| `batch_instance_type` | `g6e.4xlarge` | Matches the single-GPU job shape below. The currently deployed CE is `g6e.12xlarge`, so changing this replaces the compute environment |
 | `batch_max_vcpus` | `96` | Maximum vCPUs for auto-scaling |
 | `batch_job_vcpus` | `16` | Job-definition vCPU request. `48` for `g6e.12xlarge` |
 | `batch_job_memory_mib` | `122880` | Job-definition memory request. `180000` for `g6e.12xlarge` |
-| `batch_job_gpus` | `1` | Job-definition GPU request. `4` only with `TUNE_VISUAL=1` |
+| `batch_job_gpus` | `1` | Job-definition GPU request. `4` only with `batch_instance_type=g6e.12xlarge` |
+
+The job definition carries two `lifecycle` preconditions that reject an
+inconsistent pair at plan time: `batch_job_gpus` must equal the GPU count of
+`batch_instance_type`, and that instance type's cards must be 48 GB-class. Both
+mismatches are otherwise silent — too many GPUs parks the job in `RUNNABLE` with
+no `statusReason`, and a 24 GB L4 (`g6.12xlarge`) lets the job launch and then
+OOM mid-load.
 
 ---
 
@@ -804,7 +837,7 @@ Measured in account `<ACCOUNT_ID>`, region `us-east-2`.
 | Secrets Manager HCL (`batch.tf`, `outputs.tf`) | ⚠️ Written, **not applied** | `fmt -check` + `init -backend=false` + `validate` all exit 0. No `plan`/`apply` against real state; live job-definition rev 1 still carries the plaintext `HF_TOKEN`. |
 | Single-GPU job shape HCL (`batch_job_vcpus` / `_memory_mib` / `_gpus` = 16 / 122880 / 1) | ⚠️ Written, **not applied** | `validate` exits 0. Live rev 1 still requests 48 / 180000 / 4, which no `g6e.4xlarge` can place. |
 | Single-GPU compute environment (`g6e.4xlarge`) | ⬜ **Does not exist** | The deployed CE offers `g6e.12xlarge` only. Creating one is a pending decision; until then a 1-GPU job cannot be scheduled at all. |
-| Container rebuild (CodeBuild, `buildspec-n17.yml`) | ✅ Validated | 19 m 57 s for the embodiment-selectable build; a second build added the basename command dispatch and `TUNE_VISUAL`. ECR `:n17` digest changed each time. |
+| Container rebuild (CodeBuild, `buildspec-n17.yml`) | ✅ Validated | 19 m 57 s for the embodiment-selectable build, 20 m 59 s for the second build that added the basename command dispatch and `TUNE_VISUAL`. ECR `:n17` digest changed each time. |
 | Entrypoint command dispatch (`batch-train` / `/opt/ml/code/batch-train` / `./batch-train`) | ✅ Validated | All three argv forms reach the Batch branch, and an empty command still takes the SageMaker path — exercised against the entrypoint extracted from the pushed image. |
 | Single-GPU memory budget at `TUNE_VISUAL=0` | ⚠️ **Derived, not measured** | 22,023 MiB static of 45,776 MiB, computed from source parameter counts. No container has run, so no peak-VRAM figure exists. |
 | Dataset prep + `meta/modality.json` | ✅ Validated | Validator: 0 problems, 2 expected warnings, 201/201 episodes, 29,105 rows |
@@ -897,9 +930,11 @@ aws batch describe-compute-environments \
   --compute-environments "physical-ai-dev-gr00t-compute" \
   --region us-east-2 --query 'computeEnvironments[0].computeResources.desiredvCpus'
 
-# 3. Destroy the GR00T infra
+# 3. Destroy the GR00T infra. Pass the SAME -var values you applied with;
+#    g6e.4xlarge is the Step 2 default, so change it only if you deployed the
+#    4-GPU alternative (then also pass the 48 / 180000 / 4 job shape).
 cd isaac-gr00t-on-aws/infra
-terraform destroy -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch_instance_type=g6e.12xlarge"
+terraform destroy -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch_instance_type=g6e.4xlarge"
 ```
 
 Staged datasets and checkpoints live in the Foundation buckets and are not

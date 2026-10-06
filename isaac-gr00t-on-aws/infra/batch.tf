@@ -9,9 +9,9 @@ variable "enable_batch" {
 }
 
 variable "batch_instance_type" {
-  description = "Instance type for Batch compute (GPU required, multi-GPU recommended)"
+  description = "Instance type for Batch compute. Default matches the single-GPU job shape below (g6e.4xlarge = 1x L40S 48 GB). Pass g6e.12xlarge together with batch_job_vcpus=48 / batch_job_memory_mib=180000 / batch_job_gpus=4"
   type        = string
-  default     = "g6.12xlarge"
+  default     = "g6e.4xlarge"
 }
 
 variable "batch_max_vcpus" {
@@ -27,7 +27,12 @@ variable "batch_max_vcpus" {
 # us-east-2 (30/30 launch attempts failed across all three AZs over 2 h 38 m).
 # A job whose resourceRequirements exceed what the compute environment can place
 # stays in RUNNABLE forever, so these three must match the instance type in use.
-# For the 4-GPU g6e.12xlarge shape pass: 48 / 180000 / 4.
+# For the 4-GPU g6e.12xlarge shape pass: 48 / 180000 / 4 AND
+# batch_instance_type = g6e.12xlarge. The job definition carries a precondition
+# that rejects a GPU count the chosen instance type does not have, because the
+# failure mode of a mismatch is silent: too many GPUs parks the job in RUNNABLE,
+# and too few per-GPU memory (e.g. the 24 GB cards of g6.12xlarge against the
+# 22,023 MiB static footprint plus activations) lets it launch and then OOM.
 
 variable "batch_job_vcpus" {
   description = "vCPUs requested by the GR00T N1.7 job definition (16 = g6e.4xlarge, 48 = g6e.12xlarge)"
@@ -77,6 +82,31 @@ data "aws_secretsmanager_secret" "hf_token" {
 locals {
   batch_vpc_id     = var.enable_batch ? data.aws_ssm_parameter.vpc_id[0].value : ""
   batch_subnet_ids = var.enable_batch ? split(",", data.aws_ssm_parameter.private_subnet_ids[0].value) : []
+
+  # Physical GPU count and per-GPU VRAM for the instance types this guide
+  # reasons about, used only by the job definition's precondition below. An
+  # instance type that is absent from these maps is not rejected — it simply
+  # cannot be checked, so the precondition lets it through.
+  batch_gpus_per_instance = {
+    "g6e.4xlarge"  = 1
+    "g6e.12xlarge" = 4
+    "g6.4xlarge"   = 1
+    "g6.12xlarge"  = 4
+  }
+  batch_gpu_mib_per_instance = {
+    "g6e.4xlarge"  = 46068 # L40S 48 GB
+    "g6e.12xlarge" = 46068 # L40S 48 GB
+    "g6.4xlarge"   = 22888 # L4 24 GB
+    "g6.12xlarge"  = 22888 # L4 24 GB
+  }
+
+  # A 48 GB-class card is required. The derived static footprint at
+  # TUNE_VISUAL=0 is 22,023 MiB before activations, so a 24 GB L4 is excluded
+  # even on a 4-GPU g6.12xlarge: the job is placeable there, launches, and OOMs.
+  batch_min_gpu_mib = 32768
+
+  batch_instance_gpus    = lookup(local.batch_gpus_per_instance, var.batch_instance_type, var.batch_job_gpus)
+  batch_instance_gpu_mib = lookup(local.batch_gpu_mib_per_instance, var.batch_instance_type, local.batch_min_gpu_mib)
 }
 
 # --- Security Group ---
@@ -349,6 +379,21 @@ resource "aws_batch_job_definition" "groot_n17" {
       { name = "HF_TOKEN_SECRET_ID", value = "${var.project_name}/hf-token" }
     ]
   })
+
+  # Both mismatches fail silently at runtime, hours after apply, so they are
+  # caught here instead: more GPUs than the instance has parks the job in
+  # RUNNABLE with no statusReason, and a card too small to hold the model lets
+  # the job launch and then OOM mid-load.
+  lifecycle {
+    precondition {
+      condition     = var.batch_job_gpus == local.batch_instance_gpus
+      error_message = "batch_job_gpus (${var.batch_job_gpus}) does not match the ${local.batch_instance_gpus} GPUs on batch_instance_type ${var.batch_instance_type}. Use g6e.4xlarge with 16 / 122880 / 1, or g6e.12xlarge with 48 / 180000 / 4."
+    }
+    precondition {
+      condition     = local.batch_instance_gpu_mib >= local.batch_min_gpu_mib
+      error_message = "batch_instance_type ${var.batch_instance_type} has ${local.batch_instance_gpu_mib} MiB per GPU, below the ${local.batch_min_gpu_mib} MiB this training job needs. GR00T N1.7-3B occupies 22,023 MiB static at TUNE_VISUAL=0 before activations; use a 48 GB-class card such as g6e.4xlarge."
+    }
+  }
 
   tags = {
     Project     = var.project_name
