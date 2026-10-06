@@ -6,7 +6,7 @@
 # Fine-tunes NVIDIA GR00T N1.6-3B on customer data in LeRobot v2 format.
 # Runs on SageMaker (ml.g5.12xlarge) or AWS Batch (g6e.4xlarge+).
 #
-# Requires NGC API key to pull the base image (nvcr.io/nvidia/pytorch).
+# The base image (nvcr.io/nvidia/pytorch) is pullable without an NGC API key.
 
 FROM nvcr.io/nvidia/pytorch:25.04-py3
 
