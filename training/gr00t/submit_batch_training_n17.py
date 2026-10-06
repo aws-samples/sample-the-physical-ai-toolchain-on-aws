@@ -29,7 +29,7 @@ Usage:
         --dataset-s3-uri s3://physical-ai-dev-datasets-<ACCOUNT_ID>/groot-data/pick_place_data/ \
         --max-steps 15 --embodiment-config g1_dex3
 
-    # Real smoke test (starts one g6e.12xlarge, 4x L40S, from a cold queue):
+    # Real smoke test (the deployed compute environment offers g6e.12xlarge only):
     python submit_batch_training_n17.py \
         --job-name g1-dex3-smoke \
         --max-steps 15 --embodiment-config g1_dex3
@@ -46,10 +46,12 @@ from datetime import datetime, timezone
 
 import boto3
 
-# Live Batch resources for this stack. The queue feeds the g6e.12xlarge (4x L40S)
-# compute environment physical-ai-dev-gr00t-compute, which sits at desiredvCpus 0
-# when idle — the first job of the day pays an EC2 capacity wait plus a ~22.6 GB
-# ECR image pull before any application log line appears.
+# Live Batch resources for this stack. The queue feeds the compute environment
+# physical-ai-dev-gr00t-compute, which currently offers g6e.12xlarge ONLY and sits
+# at desiredvCpus 0 when idle — the first job of the day pays an EC2 capacity wait
+# plus a ~22.6 GB ECR image pull before any application log line appears. The
+# single-GPU g6e.4xlarge target needs a compute environment that does not exist
+# yet, so the defaults below (per-device batch for 1 GPU) are ahead of the infra.
 DEFAULT_JOB_QUEUE = "physical-ai-dev-gr00t-queue"
 DEFAULT_JOB_DEFINITION = "physical-ai-dev-gr00t-n17-training"
 DEFAULT_REGION = "us-east-2"
@@ -64,15 +66,23 @@ BATCH_LOG_GROUP = "/aws/batch/job"
 DATASETS_BUCKET_TEMPLATE = "physical-ai-dev-datasets-{account_id}"
 DEFAULT_DATASET_PREFIX = "groot-data/pick_place_data/"
 
-# Measured-working on 4x L40S: 100 steps in 917s, loss 1.35 -> 1.25
-# (isaac-gr00t-on-aws/n17-sagemaker-training-guide.md), and the values job
-# definition revision 1 already carries. BATCH_SIZE is the pre-accumulation global
-# batch summed across GPUs, so 8 means per-device 2 on 4 GPUs and the effective
-# optimizer batch is 16. Do not lower these without an observed OOM; if one
-# appears, the lever is --batch-size 4 --grad-accum-steps 4, which holds the
-# effective batch at 16 (FinetuneConfig has no --gradient-checkpointing flag).
-DEFAULT_BATCH_SIZE = 8
-DEFAULT_GRAD_ACCUM_STEPS = 2
+# Single-GPU defaults (g6e.4xlarge, 1x L40S 48 GB), which is the primary target:
+# g6e.12xlarge capacity could not be obtained at all. BATCH_SIZE is the GLOBAL
+# pre-accumulation batch and the trainer derives per_device = global // num_gpus
+# (gr00t/experiment/experiment.py:263-266), so on 1 GPU BATCH_SIZE *is* the
+# per-device batch — the 4-GPU pair 8/2 would mean per-device 8 here. 2 x 8 keeps
+# the effective optimizer batch at 16 with a per-device batch of 2.
+# DERIVED, NOT MEASURED: with TUNE_VISUAL=0 the static footprint is ~22.0 GiB of
+# the card's 44.7 GiB; the first real run must report peak VRAM before these are
+# raised (4/4 is the next step up, same effective batch, half the optimizer steps).
+DEFAULT_BATCH_SIZE = 2
+DEFAULT_GRAD_ACCUM_STEPS = 8
+
+# Vision-tower tuning. Off matches upstream (FinetuneConfig.tune_visual = False)
+# and is what makes one 48 GB card viable: trainable parameters drop from ~2.03B
+# to 877,747,328 (projector + DiT action head), and the frozen backbone retains no
+# activation graph. On requires 4 GPUs so DeepSpeed ZeRO engages.
+DEFAULT_TUNE_VISUAL = False
 
 # 15 steps is enough to prove the pipeline end to end without burning GPU time.
 DEFAULT_MAX_STEPS = 15
@@ -114,6 +124,7 @@ def build_environment(
     embodiment_config: str,
     batch_size: int,
     grad_accum_steps: int,
+    tune_visual: bool = DEFAULT_TUNE_VISUAL,
     checkpoint_prefix: str = "",
     hf_token_secret_id: str = "",
 ) -> list:
@@ -129,6 +140,10 @@ def build_environment(
         {"name": "EMBODIMENT_CONFIG", "value": embodiment_config},
         {"name": "BATCH_SIZE", "value": str(batch_size)},
         {"name": "GRAD_ACCUM_STEPS", "value": str(grad_accum_steps)},
+        # Always sent, never omitted: which parameters train is the difference
+        # between a job that fits one card and one that does not, so it should be
+        # explicit in the submission and in the log banner rather than inherited.
+        {"name": "TUNE_VISUAL", "value": "1" if tune_visual else "0"},
     ]
     if checkpoint_prefix:
         environment.append({"name": "CHECKPOINT_PREFIX", "value": checkpoint_prefix})
@@ -149,9 +164,11 @@ def build_payload(
     """Build the batch:SubmitJob payload.
 
     containerOverrides carries environment entries and nothing else: no command, no
-    resourceRequirements. The job definition owns 48 vCPU / 180000 MiB / 4 GPU and
-    the ["/opt/ml/code/batch-train"] command, and overriding the command cannot work
-    anyway (the image's ENTRYPOINT dispatches on $1).
+    resourceRequirements. The job definition owns the vCPU / memory / GPU shape and
+    the batch-train command. The command is left alone deliberately: the image's
+    ENTRYPOINT dispatches on the basename of $1, so an override that is not
+    *-/batch-train silently selects the SageMaker path, which downloads no dataset
+    and uploads no checkpoint.
     """
     return {
         "jobName": job_name,
@@ -293,6 +310,7 @@ def submit_training_job(
     embodiment_config: str = "g1_dex3",
     batch_size: int = DEFAULT_BATCH_SIZE,
     grad_accum_steps: int = DEFAULT_GRAD_ACCUM_STEPS,
+    tune_visual: bool = DEFAULT_TUNE_VISUAL,
     checkpoint_prefix: str = "",
     hf_token_secret_id: str = "",
     job_queue: str = DEFAULT_JOB_QUEUE,
@@ -307,6 +325,7 @@ def submit_training_job(
         embodiment_config=embodiment_config,
         batch_size=batch_size,
         grad_accum_steps=grad_accum_steps,
+        tune_visual=tune_visual,
         checkpoint_prefix=checkpoint_prefix,
         hf_token_secret_id=hf_token_secret_id,
     )
@@ -337,6 +356,7 @@ def submit_training_job(
     print(f"  job definition: {job_definition}")
     print(f"  dataset:        {dataset_s3_uri}")
     print(f"  embodiment:     {embodiment_config}")
+    print(f"  tune visual:    {tune_visual}")
     print(f"  max steps:      {max_steps}  (batch {batch_size} x grad accum {grad_accum_steps})")
     print()
     print(f"Next step: re-attach any time with --watch-only {job_id}, or check it manually:")
@@ -366,7 +386,15 @@ def main():
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help=f"Global batch size, pre-accumulation (default {DEFAULT_BATCH_SIZE}, measured working on 4x L40S)",
+        help=f"Global batch size, pre-accumulation (default {DEFAULT_BATCH_SIZE}). "
+        "On a 1-GPU instance this is also the per-device batch",
+    )
+    parser.add_argument(
+        "--tune-visual",
+        action="store_true",
+        help="Train the vision tower too (~2.03B trainable params instead of "
+        "877,747,328). Needs 4 GPUs so DeepSpeed ZeRO engages; off by default, "
+        "matching upstream",
     )
     parser.add_argument(
         "--grad-accum-steps",
@@ -456,6 +484,7 @@ def main():
         embodiment_config=args.embodiment_config,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
+        tune_visual=args.tune_visual,
         checkpoint_prefix=args.checkpoint_prefix,
         hf_token_secret_id=args.hf_token_secret_id,
         job_queue=args.job_queue,

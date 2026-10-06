@@ -88,6 +88,12 @@ ENV BASE_MODEL_PATH="nvidia/GR00T-N1.7-3B"
 ENV GROOT_SDK_DIR="/workspace/gr00t-repo"
 # Backwards-compatible default: unset environment == the validated UR3 flow.
 ENV EMBODIMENT_CONFIG=ur3
+# Vision-tower tuning off by default, matching upstream (FinetuneConfig.tune_visual
+# = False). Frozen, the trainable set is the projector + DiT action head only,
+# which is what lets this train on a single 48 GB L40S. Set TUNE_VISUAL=1 to
+# restore the ~2B-trainable-parameter configuration, which needs 4 GPUs so that
+# DeepSpeed ZeRO engages.
+ENV TUNE_VISUAL=0
 
 # Symlink for compatibility
 RUN ln -sf /workspace/gr00t-repo /opt/isaac-gr00t

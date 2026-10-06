@@ -20,6 +20,33 @@ variable "batch_max_vcpus" {
   default     = 96
 }
 
+# --- Job-definition resource shape ---
+#
+# Defaults describe a SINGLE-GPU g6e.4xlarge (1x L40S 48 GB, 16 vCPU, 128 GiB),
+# which is the primary target: g6e.12xlarge capacity could not be obtained in
+# us-east-2 (30/30 launch attempts failed across all three AZs over 2 h 38 m).
+# A job whose resourceRequirements exceed what the compute environment can place
+# stays in RUNNABLE forever, so these three must match the instance type in use.
+# For the 4-GPU g6e.12xlarge shape pass: 48 / 180000 / 4.
+
+variable "batch_job_vcpus" {
+  description = "vCPUs requested by the GR00T N1.7 job definition (16 = g6e.4xlarge, 48 = g6e.12xlarge)"
+  type        = number
+  default     = 16
+}
+
+variable "batch_job_memory_mib" {
+  description = "Memory (MiB) requested by the GR00T N1.7 job definition. Leaves ~8 GiB of a 128 GiB g6e.4xlarge to the ECS agent and kernel"
+  type        = number
+  default     = 122880
+}
+
+variable "batch_job_gpus" {
+  description = "GPUs requested by the GR00T N1.7 job definition. 1 requires TUNE_VISUAL=0 (frozen vision tower); 4 is needed before DeepSpeed ZeRO engages"
+  type        = number
+  default     = 1
+}
+
 # --- Read shared VPC from Foundation ---
 
 data "aws_ssm_parameter" "vpc_id" {
@@ -287,19 +314,27 @@ resource "aws_batch_job_definition" "groot_n17" {
     # dispatch literally compares against.
     command = ["batch-train"]
 
-    # Matches g6e.12xlarge: 48 vCPU, 4x L40S, 180000 MiB of the instance's 384 GiB.
+    # Must be placeable on the compute environment's instance type, or the job
+    # waits in RUNNABLE indefinitely with no statusReason. Defaults are the
+    # single-GPU g6e.4xlarge shape; see the variable block at the top of this file.
     resourceRequirements = [
-      { type = "VCPU", value = "48" },
-      { type = "MEMORY", value = "180000" },
-      { type = "GPU", value = "4" }
+      { type = "VCPU", value = tostring(var.batch_job_vcpus) },
+      { type = "MEMORY", value = tostring(var.batch_job_memory_mib) },
+      { type = "GPU", value = tostring(var.batch_job_gpus) }
     ]
 
     environment = [
       { name = "BASE_MODEL", value = "nvidia/GR00T-N1.7-3B" },
-      # Global (pre-accumulation) batch summed across GPUs; effective optimizer
-      # batch is BATCH_SIZE * GRAD_ACCUM_STEPS = 16.
-      { name = "BATCH_SIZE", value = "8" },
-      { name = "GRAD_ACCUM_STEPS", value = "2" },
+      # Global (pre-accumulation) batch; the trainer derives
+      # per_device = BATCH_SIZE / num_gpus, so at 1 GPU this IS the per-device
+      # batch. 2 x 8 keeps the effective optimizer batch at 16. DERIVED, not
+      # measured: raise only after a real run reports peak VRAM.
+      { name = "BATCH_SIZE", value = "2" },
+      { name = "GRAD_ACCUM_STEPS", value = "8" },
+      # Frozen vision tower (upstream default). This is what makes one 48 GB L40S
+      # viable: 877,747,328 trainable parameters instead of ~2.03B. Set to "1"
+      # only together with batch_job_gpus = 4.
+      { name = "TUNE_VISUAL", value = "0" },
       { name = "MAX_STEPS", value = "100" },
       # MANDATORY and must stay consistent with DATASET_S3_URI below. The image
       # defaults to "ur3" so the validated UR3 flow is unchanged when nothing is

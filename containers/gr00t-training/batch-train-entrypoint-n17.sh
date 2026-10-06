@@ -15,6 +15,9 @@
 #   EMBODIMENT_CONFIG   - embodiment modality config to use: ur3 (default) | g1_dex3
 #   MODALITY_CONFIG_PATH- explicit path to a modality config module (wins over
 #                         EMBODIMENT_CONFIG; must exist inside the container)
+#   TUNE_VISUAL         - 0 (default, upstream behaviour) | 1. Off keeps the
+#                         vision tower frozen so the job fits one 48 GB L40S;
+#                         on adds ~1.15B trainable params and needs 4 GPUs.
 #   HF_TOKEN            - HuggingFace token for model download (optional)
 #   HF_TOKEN_SECRET_ID  - Secrets Manager secret id/ARN holding the token. Used
 #                         only when HF_TOKEN is unset; resolved with the Batch
@@ -40,6 +43,7 @@ OUTPUT_DIR="/opt/ml/model"
 JOB_ID="${AWS_BATCH_JOB_ID:-local}"
 EMBODIMENT_CONFIG="${EMBODIMENT_CONFIG:-ur3}"
 MODALITY_CONFIG_PATH="${MODALITY_CONFIG_PATH:-}"
+TUNE_VISUAL="${TUNE_VISUAL:-0}"
 SECRET_ID="${HF_TOKEN_SECRET_ID:-}"
 
 # --- Download dataset from S3 ---
@@ -70,6 +74,7 @@ echo "  GPUs:             $NPROC"
 echo "  Job ID:           $JOB_ID"
 echo "  Embodiment:       $EMBODIMENT_CONFIG"
 echo "  Modality config:  ${MODALITY_CONFIG_PATH:-<from embodiment>}"
+echo "  Tune visual:      $TUNE_VISUAL"
 echo "============================================================"
 
 mkdir -p "$OUTPUT_DIR"
@@ -101,6 +106,7 @@ fi
 # train_entrypoint.py reads these from the environment; a Batch job definition
 # cannot override the Docker ENTRYPOINT, so this is the only seam available.
 export EMBODIMENT_CONFIG
+export TUNE_VISUAL
 if [ -n "$MODALITY_CONFIG_PATH" ]; then
     export MODALITY_CONFIG_PATH
 fi

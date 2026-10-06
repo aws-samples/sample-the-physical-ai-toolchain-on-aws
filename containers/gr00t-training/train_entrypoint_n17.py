@@ -15,6 +15,10 @@ entrypoint — so the embodiment cannot be chosen from the outside any other way
   MODALITY_CONFIG_PATH  explicit path to a modality config module. Wins when set.
   EMBODIMENT_CONFIG     'ur3' (default) | 'g1_dex3'. Named configs shipped at
                         /opt/ml/code/ by Dockerfile.n17.
+  TUNE_VISUAL           '0' (default, matching upstream) | '1'. When off, the
+                        vision tower stays frozen and only the projector + DiT
+                        action head train, which is what makes a single 48 GB
+                        L40S viable.
 
 'ur3' keeps the original inlined config written to the output dir, so the
 validated UR3 flow is unchanged when neither variable is set.
@@ -53,6 +57,9 @@ EMBODIMENT_CONFIG_MODULES = {
 # Both shipped configs call register_modality_config(..., NEW_EMBODIMENT).
 EMBODIMENT_TAG = "new_embodiment"
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"", "0", "false", "no", "off"}
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -66,6 +73,29 @@ def _write_failure(message: str) -> None:
     except OSError:
         pass
     print(f"\n  FAILURE: {message}", file=sys.stderr, flush=True)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env var. An unrecognised value is a hard failure.
+
+    Silently treating a typo ("TUNE_VISUAL=ture") as False would change which
+    parameters train, and the only symptom would be a different memory profile
+    many minutes in — so refuse instead of guessing.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    _write_failure(
+        f"{name}='{raw}' is not a boolean. Use one of "
+        f"{sorted(_TRUE_VALUES)} or {sorted(v for v in _FALSE_VALUES if v)}. "
+        f"This job did NOT train a model."
+    )
+    sys.exit(1)
 
 
 def _hp(name, default):
@@ -237,13 +267,22 @@ def run_training() -> None:
     dataset_path = CHANNEL_TRAINING
     output_dir = MODEL_DIR
     max_steps = int(_hp("max_steps", "10000"))
-    # Defaults validated on ml.g6e.12xlarge (4x L40S, DeepSpeed ZeRO auto-enabled
-    # at num_gpus>1). Single-GPU instances OOM at the optimizer step regardless
-    # of batch size — see n17-sagemaker-training-guide.md.
+    # batch_size is the GLOBAL, pre-accumulation batch: the trainer derives
+    # per_device = global_batch_size // num_gpus (experiment.py:263-266), so on a
+    # 1-GPU instance this value IS the per-device batch. DeepSpeed ZeRO only
+    # engages at num_gpus>1 (experiment.py:258-262); a single-GPU run relies on a
+    # frozen vision tower instead (TUNE_VISUAL=0, the default) to fit in 48 GB.
     global_batch_size = int(_hp("batch_size", "8"))
     learning_rate = float(_hp("learning_rate", "1e-4"))
     gradient_accumulation_steps = int(_hp("gradient_accumulation_steps", "2"))
     save_steps = int(_hp("save_steps", "2000"))
+    # Vision-tower tuning is OFF by default, matching upstream
+    # (finetune_config.py:52 and gr00t_n1d7.py:46 both default tune_visual=False).
+    # Frozen, the trainable set is the projector + DiT action head only, and the
+    # backbone retains no activation graph. Enabled, it adds ~1.15B trainable
+    # parameters (and their fp32 grads + AdamW moments) plus the whole ViT/LLM
+    # activation graph, which is why the 4-GPU configuration needs DeepSpeed ZeRO.
+    tune_visual = _env_flag("TUNE_VISUAL", False)
 
     print("=== GR00T N1.7-3B Fine-Tuning ===")
     print(f"  Base model:       {base_model}")
@@ -254,7 +293,9 @@ def run_training() -> None:
     print(f"  Learning rate:    {learning_rate}")
     print(f"  Grad accum:       {gradient_accumulation_steps}")
     print(f"  GPUs:             {num_gpus}")
+    print(f"  Per-device batch: {global_batch_size // max(num_gpus, 1)}")
     print(f"  Embodiment:       {os.environ.get('EMBODIMENT_CONFIG', 'ur3')}")
+    print(f"  Tune visual:      {tune_visual} (TUNE_VISUAL)")
     print(flush=True)
 
     # Resolve the embodiment config (inline UR3 by default, or a shipped module)
@@ -276,8 +317,9 @@ def run_training() -> None:
 
     # N1.7 uses launch_finetune.py CLI with torchrun internally.
     # NOTE: this CLI has no --gradient-checkpointing flag (verified via --help on
-    # the built image). Memory is controlled via global-batch-size / grad-accum
-    # and which modules are tuned (--tune-visual adds a large trainable block).
+    # the built image), and the custom modules never call a checkpoint function
+    # anyway. Memory is controlled via global-batch-size / grad-accum and by which
+    # modules are tuned — --tune-visual is the expensive one, see TUNE_VISUAL.
     cmd = [
         sys.executable, "-m", "torch.distributed.run",
         "--nproc_per_node", str(num_gpus),
@@ -295,7 +337,7 @@ def run_training() -> None:
         "--save-steps", str(save_steps),
         "--save-total-limit", "3",
         "--no-tune-llm",
-        "--tune-visual",
+        "--tune-visual" if tune_visual else "--no-tune-visual",
         "--tune-projector",
         "--tune-diffusion-model",
         "--dataloader-num-workers", "4",
@@ -337,11 +379,13 @@ def main():
         run_training()
     except Exception as e:
         _write_failure(
-            f"GR00T N1.7 fine-tune failed: {e}. N1.7's default tuned modules "
-            f"(~2B trainable params) need DeepSpeed ZeRO to fit in GPU memory, "
-            f"which only activates when num_gpus>1. Use ml.g6e.12xlarge (4 GPUs) "
-            f"or larger, not ml.g6e.4xlarge (1 GPU) which OOMs at any batch size. "
-            f"Check CloudWatch logs for details."
+            f"GR00T N1.7 fine-tune failed: {e}. If this was CUDA OOM: with "
+            f"TUNE_VISUAL=1 the trainable set is ~2B parameters, which needs "
+            f"DeepSpeed ZeRO and therefore num_gpus>1 (4x L40S). With the default "
+            f"TUNE_VISUAL=0 the vision tower stays frozen and the job is expected "
+            f"to fit one 48 GB L40S — lower BATCH_SIZE (it is the per-device batch "
+            f"on a 1-GPU instance) and raise GRAD_ACCUM_STEPS to keep the effective "
+            f"batch. Check CloudWatch logs for details."
         )
         traceback.print_exc()
         sys.exit(1)
@@ -359,6 +403,7 @@ def main():
         "embodiment_config": os.environ.get("EMBODIMENT_CONFIG", "ur3"),
         "modality_config_path": os.environ.get("MODALITY_CONFIG_PATH", ""),
         "embodiment_tag": EMBODIMENT_TAG,
+        "tune_visual": _env_flag("TUNE_VISUAL", False),
     }
     with open(Path(MODEL_DIR) / "training_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
