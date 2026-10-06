@@ -155,6 +155,48 @@ def build_environment(
     return environment
 
 
+def _job_definition_gpus(job_definition: str, region: str):
+    """Return the GPU count the job definition requests, or None if unreadable.
+
+    Read-only (describe-job-definitions). Returns None rather than raising so a
+    permissions or naming problem does not block a submission that would
+    otherwise be fine.
+    """
+    try:
+        client = boto3.client("batch", region_name=region)
+        name = job_definition.split(":")[0]
+        revisions = client.describe_job_definitions(
+            jobDefinitionName=name, status="ACTIVE"
+        )["jobDefinitions"]
+        if not revisions:
+            return None
+        latest = max(revisions, key=lambda d: d["revision"])
+        for req in latest.get("containerProperties", {}).get("resourceRequirements", []):
+            if req.get("type") == "GPU":
+                return int(req["value"])
+    except Exception:  # noqa: BLE001 - advisory check only
+        return None
+    return None
+
+
+def _check_batch_divides_gpus(job_definition: str, batch_size: int, region: str, parser) -> None:
+    """Refuse a global batch the trainer cannot split across the job's GPUs."""
+    gpus = _job_definition_gpus(job_definition, region)
+    if not gpus:
+        return
+    if batch_size % gpus != 0 or batch_size < gpus:
+        suggestion = gpus * 2
+        parser.error(
+            f"--batch-size {batch_size} is not usable on {job_definition}, which "
+            f"requests {gpus} GPU(s). BATCH_SIZE is the GLOBAL batch and the trainer "
+            f"asserts global_batch_size % num_gpus == 0 before dividing it into the "
+            f"per-device batch, so this job would fail at startup. Use "
+            f"--batch-size {suggestion} --grad-accum-steps {max(1, 16 // suggestion)} "
+            f"to keep the effective batch at 16, or point --job-definition at a "
+            f"{batch_size}-GPU-or-fewer shape."
+        )
+
+
 def build_payload(
     job_name: str,
     job_queue: str,
@@ -472,6 +514,16 @@ def main():
             "workshop-assets URI will fail with AccessDenied. Stage the dataset with "
             "training/gr00t/prepare_g1_dex3_dataset.py --upload first."
         )
+
+    if not args.dry_run:
+        # The GPU count comes from the job definition, and BATCH_SIZE is the
+        # GLOBAL batch: the trainer asserts global_batch_size % num_gpus == 0 and
+        # divides to get the per-device batch. The single-GPU default
+        # (BATCH_SIZE=2) is therefore invalid on a 4-GPU job definition — 2 % 4,
+        # and per-device would round to 0. Catch it here rather than after a
+        # capacity wait and a 22.6 GB image pull. Read-only; skipped in --dry-run
+        # so a dry run still needs no AWS call at all.
+        _check_batch_divides_gpus(args.job_definition, args.batch_size, args.region, parser)
 
     timestamp = _utc_now().strftime("%Y%m%d-%H%M%S")
     base_name = args.job_name or "gr00t-n17-finetune"

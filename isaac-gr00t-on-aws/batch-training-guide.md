@@ -661,6 +661,14 @@ things on different hardware:
 | **`g6e.4xlarge` (primary)** | 1 | **2** | **2** | **8** | 16 |
 | `g6e.12xlarge` (alternative) | 4 | 8 | 2 | 2 | 16 |
 
+> **`BATCH_SIZE` must be divisible by the job definition's GPU count.** The
+> trainer asserts `global_batch_size % num_gpus == 0` before dividing, so the
+> single-GPU default `2` fails at startup on the 4-GPU job definition that is live
+> in this account. `submit_batch_training_n17.py` reads the job definition's GPU
+> count and refuses the mismatch up front, naming the pair to use instead; a
+> hand-written `aws batch submit-job` gets no such check and fails after the
+> capacity wait and the 22.6 GB image pull.
+
 The 4-GPU pair `8` / `2` on one GPU would mean a **per-device batch of 8**, not 2.
 `2` / `8` is deliberately conservative: it holds the per-device batch at 2 while
 halving the optimizer round trips of a `1` / `16` run, and the derived peak
@@ -860,6 +868,7 @@ reservations, another region, or another instance family.
 | `AccessDenied` reading `DATASET_S3_URI` | The instance role grants S3 only on `arn:aws:s3:::physical-ai-dev-*`, and the canonical dataset lives in `physical-ai-workshop-assets-<ACCOUNT_ID>` | Stage a prepared copy to `s3://physical-ai-dev-datasets-<ACCOUNT_ID>/groot-data/pick_place_data/`. Do **not** widen the policy. |
 | `HF_TOKEN` still appears in plaintext in the job definition | The Secrets Manager migration is written in `batch.tf` but **not applied** — applying registers a new revision | Apply `isaac-gr00t-on-aws/infra` deliberately (`enable_batch=true`), then confirm the new revision has `HF_TOKEN_SECRET_ID` and no `HF_TOKEN` |
 | `HuggingFace credential: NOT resolved` in the logs | The instance role has no `secretsmanager:GetSecretValue` yet (see the row above) | Harmless: `nvidia/GR00T-N1.7-3B` is not gated and training continues. Fix by applying the Terraform. |
+| `AssertionError: global_batch_size must be divisible by num_gpus` at startup | `BATCH_SIZE` does not divide the job definition's GPU count — e.g. the single-GPU default `2` against a 4-GPU job definition | Match the pair to the shape: `2`/`8` for 1 GPU, `8`/`2` for 4 GPUs. `submit_batch_training_n17.py` refuses the mismatch before submitting. |
 | `CUDA out of memory` on one GPU | Either `TUNE_VISUAL=1` (which needs 4 GPUs for ZeRO sharding), or the per-device batch is too large — remember `BATCH_SIZE` *is* the per-device batch at `num_gpus=1` | Confirm the log banner says `Tune visual: False`. Then step down `BATCH_SIZE=1` with `GRAD_ACCUM_STEPS=16` to hold the effective batch at 16. No `--gradient-checkpointing` flag exists in this SDK revision, and the custom modules never call a checkpoint function, so it would not help. |
 | `TUNE_VISUAL=1` on a 1-GPU instance OOMs | At `num_gpus=1` DeepSpeed is disabled outright (`experiment.py:258-262`), so the ~2.03B trainable parameters carry unsharded fp32 grads and AdamW moments, and the ViT/LLM activation graph is retained | Leave `TUNE_VISUAL=0` on one GPU. Visual tuning is a 4-GPU configuration. |
 | Log banner shows `Tune visual: True` when you expected frozen | `TUNE_VISUAL` was set to `1` somewhere — job definition environment, or `--tune-visual` on the submitter | The submitter always sends `TUNE_VISUAL` explicitly, so the submitted value wins over the job definition. Check the payload it printed. |
