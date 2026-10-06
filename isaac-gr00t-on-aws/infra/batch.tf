@@ -280,8 +280,12 @@ resource "aws_batch_job_definition" "groot_n17" {
   type  = "container"
 
   container_properties = jsonencode({
-    image   = "${local.account_id}.dkr.ecr.${local.region}.amazonaws.com/${var.project_name}/gr00t-training:n17"
-    command = ["/opt/ml/code/batch-train"]
+    image = "${local.account_id}.dkr.ecr.${local.region}.amazonaws.com/${var.project_name}/gr00t-training:n17"
+    # Selects the Batch branch of the image's ENTRYPOINT. The image dispatches on
+    # the basename of $1, so "/opt/ml/code/batch-train" (what live revision 1
+    # carries) also works; the bare token is used here because it is what the
+    # dispatch literally compares against.
+    command = ["batch-train"]
 
     # Matches g6e.12xlarge: 48 vCPU, 4x L40S, 180000 MiB of the instance's 384 GiB.
     resourceRequirements = [
@@ -297,6 +301,12 @@ resource "aws_batch_job_definition" "groot_n17" {
       { name = "BATCH_SIZE", value = "8" },
       { name = "GRAD_ACCUM_STEPS", value = "2" },
       { name = "MAX_STEPS", value = "100" },
+      # MANDATORY and must stay consistent with DATASET_S3_URI below. The image
+      # defaults to "ur3" so the validated UR3 flow is unchanged when nothing is
+      # set, which means a job definition pointing at 28-DOF G1 joint data has to
+      # say so explicitly: the UR3 config is end-effector (XYZ_ROTVEC) and raises
+      # inside scipy's Rotation.from_rotvec on a 7-element joint group.
+      { name = "EMBODIMENT_CONFIG", value = "g1_dex3" },
       { name = "AWS_DEFAULT_REGION", value = local.region },
       { name = "CHECKPOINT_BUCKET", value = data.aws_ssm_parameter.checkpoints_bucket[0].value },
       { name = "DATASET_S3_URI", value = "s3://${data.aws_ssm_parameter.datasets_bucket.value}/groot-data/pick_place_data/" },

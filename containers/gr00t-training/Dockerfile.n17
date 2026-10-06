@@ -97,9 +97,20 @@ RUN mkdir -p ${DATASET_LOCAL_DIR} ${OUTPUT_DIR}
 WORKDIR /opt/ml/code
 
 # Smart entrypoint: supports both SageMaker (default) and Batch (pass "batch-train" as arg)
+#
+# The dispatch matches on the BASENAME of $1, so "batch-train",
+# "/opt/ml/code/batch-train" and "./batch-train" all reach the Batch path. AWS
+# Batch job definitions have no entrypoint override and their `command` arrives
+# here as "$@", so an exact-string test fell through to the SageMaker branch for
+# the fully-qualified path that both the live job definition and anyone typing
+# the real path into the console would use. That branch does not sync
+# DATASET_S3_URI, does not resolve HF_TOKEN_SECRET_ID and does not upload
+# checkpoints, so the failure surfaced as an empty dataset directory with no
+# obvious cause. Keep this tolerant: the job definition is created by hand in
+# the console in the workshop flow.
 COPY <<'EOF' /opt/ml/code/entrypoint.sh
 #!/bin/bash
-if [ "$1" = "batch-train" ]; then
+if [ "$(basename -- "${1:-}")" = "batch-train" ]; then
     exec bash /opt/ml/code/batch-train
 else
     exec python /opt/ml/code/train_entrypoint.py "$@"
