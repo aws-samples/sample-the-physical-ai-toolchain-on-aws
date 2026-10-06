@@ -1,8 +1,8 @@
 version: 0.2
 
 # Builds the GR00T fine-tuning container in CodeBuild and pushes it to ECR.
-# Base image is an AWS PyTorch Deep Learning Container (ECR account 763104351884);
-# CodeBuild authenticates to that account in pre_build. No NGC credentials required.
+# Base image is nvcr.io/nvidia/pytorch, which NGC serves to anonymous pulls, so an
+# NGC API key is optional: pre_build logs in to nvcr.io only if the secret is readable.
 #
 # Env vars provided by the ContainerBuild construct:
 #   ECR_REPO_URI        - full ECR repo URI (…/physical-ai/gr00t-training)
@@ -21,10 +21,14 @@ phases:
       # (763104351884). CodeBuild must authenticate to pull it.
       - echo "Logging in to the AWS DLC ECR account (763104351884)..."
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin 763104351884.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-      # NGC login for the pytorch base image
-      - echo "Logging in to NGC (nvcr.io)..."
-      - NGC_API_KEY=$(aws secretsmanager get-secret-value --secret-id "physical-ai/ngc-api-key" --region "$AWS_DEFAULT_REGION" --query SecretString --output text)
-      - echo "$NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+      # Optional NGC login for the pytorch base image (anonymous pulls also work).
+      - |
+        if NGC_API_KEY=$(aws secretsmanager get-secret-value --secret-id "${NGC_SECRET_NAME:-physical-ai/ngc-api-key}" --region "$AWS_DEFAULT_REGION" --query SecretString --output text 2>/dev/null); then
+          echo "Logging in to NGC (nvcr.io)..."
+          echo "$NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+        else
+          echo "No readable NGC key; pulling nvcr.io/nvidia/pytorch anonymously."
+        fi
   build:
     commands:
       - echo "Building gr00t-training image..."

@@ -124,7 +124,7 @@ aws codebuild start-build \
     "physical-ai-dev-datasets-<ACCOUNT_ID>/codebuild-source/source.zip"
 ```
 
-> **Note:** Unlike Isaac Lab, GR00T uses an AWS PyTorch DLC as its base image — no NGC API key needed for the build. The DLC ECR account (763104351884) is authenticated automatically in the buildspec.
+> **Note:** The GR00T training image builds from `nvcr.io/nvidia/pytorch`, which NGC serves to anonymous pulls, so an NGC API key is optional. If `physical-ai/ngc-api-key` exists and the build role can read it, the buildspec logs in to `nvcr.io`; otherwise it pulls anonymously.
 
 ### 3c. Monitor progress
 
@@ -135,7 +135,7 @@ aws codebuild batch-get-builds \
   --query 'builds[0].{status:buildStatus,phase:currentPhase}'
 ```
 
-**Build time:** ~15-30 minutes (DLC base is smaller than NGC).
+**Build time:** ~15-30 minutes.
 
 ---
 
