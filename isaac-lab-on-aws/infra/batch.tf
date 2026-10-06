@@ -51,10 +51,10 @@ resource "aws_security_group" "batch" {
 
   # Self-referencing: allow all traffic between compute nodes (NCCL)
   ingress {
-    from_port = 0
-    to_port   = 0
-    protocol  = "-1"
-    self      = true
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
     description = "NCCL inter-node communication"
   }
 
@@ -192,12 +192,18 @@ resource "aws_batch_compute_environment" "rl" {
   service_role = aws_iam_role.batch_service[0].arn
 
   compute_resources {
-    type               = "EC2"
-    instance_role      = aws_iam_instance_profile.batch[0].arn
-    instance_type      = [var.batch_instance_type]
-    max_vcpus          = var.batch_max_vcpus
-    min_vcpus          = 16
-    desired_vcpus      = 16
+    type          = "EC2"
+    instance_role = aws_iam_instance_profile.batch[0].arn
+    instance_type = [var.batch_instance_type]
+    max_vcpus     = var.batch_max_vcpus
+    # Scale from zero. A non-zero floor here keeps a GPU instance alive even with an
+    # empty queue: this environment held an idle g6e.4xlarge continuously from
+    # 2026-09-23 to 2026-10-05 ($3.00/hr in us-east-2, ~$920) with no jobs ever
+    # submitted, and it also consumed a slot of the g6e.4xlarge capacity reservation
+    # that the GR00T training lab depends on. Batch scales this environment up on
+    # demand, so a warm floor buys nothing that justifies that cost.
+    min_vcpus          = 0
+    desired_vcpus      = 0
     security_group_ids = [aws_security_group.batch[0].id]
     subnets            = local.batch_subnet_ids
 
