@@ -5,12 +5,18 @@ Fine-tune **GR00T N1.7-3B** on AWS Batch against the 201-episode **Unitree G1 Ed
 infrastructure, the container rebuild that makes the image embodiment-selectable,
 the dataset preparation, and the job submission.
 
-Every number quoted below was measured in this account. Anything that has not
-been observed is labelled **untested** rather than estimated — see
-[Validation Status](#validation-status). The one thing this procedure has **not**
-yet produced is a completed training run: `g6e.12xlarge` capacity could not be
-obtained in us-east-2 (details in the Validation Status and Troubleshooting
-sections).
+**The primary target is a single GPU**: `g6e.4xlarge` (1× L40S 48 GB). Leaving the
+vision tower frozen — the upstream default — drops the trainable set to
+877,747,328 parameters, which fits one card with room to spare. The 4-GPU
+`g6e.12xlarge` path is kept as an alternative, but it could not be scheduled at
+all: 30 of 30 instance-launch attempts failed across all three us-east-2 AZs
+during a 2 h 38 m wait.
+
+Every number quoted below was either measured in this account or explicitly
+labelled **derived** (calculated from source) or **untested** — see
+[Validation Status](#validation-status). Two things this procedure has **not**
+yet produced: a completed training run, and any measured GPU memory figure. No
+container has started yet, so nothing in the training path is validated.
 
 ---
 
@@ -43,21 +49,50 @@ sections).
                              ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ 5. Training Job (AWS Batch)                                              │
-│    g6e.12xlarge (4× L40S, 48 GB each) · DeepSpeed ZeRO · ckpts → S3      │
+│    g6e.4xlarge (1× L40S 48 GB) · frozen vision tower · ckpts → S3        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Hardware:** compute environment `physical-ai-dev-gr00t-compute` launches a
-single `g6e.12xlarge` — 48 vCPU, 384 GiB RAM, 4× NVIDIA L40S (48 GB each), with a
-512 GiB gp3 root volume from the launch template (the container image alone is
-22.6 GB).
+**Hardware (primary):** `g6e.4xlarge` — 16 vCPU, 128 GiB RAM, 1× NVIDIA L40S
+(48 GB), 512 GiB gp3 root volume from the launch template (the container image
+alone is 22.6 GB).
 
-**Why 4 GPUs:** at `num_gpus > 1` the trainer enables DeepSpeed ZeRO-2, which
-shards the AdamW moments and gradients across ranks. At one GPU DeepSpeed is
-switched off entirely and the ~2.03B trainable parameters plus their fp32
-optimizer state (~36.9 GB static) do not leave enough headroom on a single 48 GB
-card. A single-GPU `g6e.4xlarge` run is **not** a supported configuration for
-this image.
+**Why one GPU is enough: `TUNE_VISUAL=0`.** Upstream defaults `tune_visual` to
+`False` (`gr00t/configs/finetune_config.py:52` and
+`gr00t/configs/model/gr00t_n1d7.py:46`); this container's entrypoint used to force
+it on. With the vision tower frozen, the trainable set is the projector plus the
+DiT action head — **877,747,328 parameters**, derived from source — and the frozen
+backbone retains no activation graph at all, because no backbone parameter
+requires grad. Turning it on adds roughly 1.15B trainable parameters, their fp32
+gradients and AdamW moments, *and* the whole ViT/LLM activation graph, which is
+what previously forced 4 GPUs.
+
+Derived memory budget at `TUNE_VISUAL=0` (fp32 params + fp32 grads + two AdamW
+moments; the model loads in fp32 because `launch_finetune.py` forces
+`load_bf16 = False`):
+
+| term | size |
+|---|---|
+| params, 3.14B × 4 B | 11,978 MiB |
+| grads, 877,747,328 × 4 B | 3,348 MiB |
+| AdamW moments, 877,747,328 × 8 B | 6,697 MiB |
+| **static total** | **22,023 MiB** |
+| card | 45,776 MiB |
+| **headroom for activations, workspaces, fragmentation** | **23,753 MiB** |
+
+> **This budget is DERIVED, not measured.** No container has run. The first real
+> run must report peak VRAM; until then treat the batch geometry below as a
+> conservative starting point rather than a validated setting.
+
+**The 4-GPU alternative (`g6e.12xlarge`, `TUNE_VISUAL=1`)** still works in
+principle — DeepSpeed ZeRO-2 engages at `num_gpus > 1` and shards gradients and
+optimizer state — but:
+
+> ⚠️ **`g6e.12xlarge` could not be obtained in us-east-2.** One instance, 30
+> launch attempts, all three AZs (2a ×15, 2c ×9, 2b ×6), every one
+> `InsufficientInstanceCapacity`, over a 2 h 38 m 29 s `RUNNABLE` dwell. Quota was
+> not the constraint. Do not plan a workshop around it; the only guaranteed
+> capacity here is an on-demand reservation of `g6e.4xlarge`.
 
 ---
 
@@ -68,8 +103,9 @@ this image.
 | AWS CLI configured | `aws sts get-caller-identity` |
 | Terraform >= 1.5 (`~/bin/terraform` here) | `terraform version` |
 | Foundation deployed | `aws ssm get-parameter --name /physical-ai/vpc-id --region us-east-2` |
-| EC2 quota: `Running On-Demand G and VT instances` >= 48 vCPU | Service Quotas, code `L-DB2E81BA` |
-| `g6e.12xlarge` **capacity** in at least one private-subnet AZ | see Troubleshooting — quota is not the same as capacity |
+| EC2 quota: `Running On-Demand G and VT instances` >= 16 vCPU (48 for the 4-GPU path) | Service Quotas, code `L-DB2E81BA` |
+| Capacity for the instance type you target | see Troubleshooting — quota is not the same as capacity. `g6e.4xlarge` is reservation-backed here; `g6e.12xlarge` was unobtainable |
+| A compute environment that can place the job's shape | **Not yet true for `g6e.4xlarge`**: the deployed CE offers `g6e.12xlarge` only, so a 16 vCPU / 1 GPU job stays `RUNNABLE`. Creating a single-GPU CE is a pending decision, not something this guide has done |
 | NGC API key in Secrets Manager (`physical-ai/ngc-api-key`) | `aws secretsmanager describe-secret --secret-id physical-ai/ngc-api-key --region us-east-2` |
 | HuggingFace token in Secrets Manager (`physical-ai/hf-token`) | `aws secretsmanager describe-secret --secret-id physical-ai/hf-token --region us-east-2` |
 | Python 3.10+ with `pyarrow` (dataset prep only) | `python3 -c "import pyarrow"` |
@@ -98,9 +134,19 @@ terraform apply -var="aws_region=us-east-2"
 ```bash
 cd isaac-gr00t-on-aws/infra
 terraform init
-terraform plan -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch_instance_type=g6e.12xlarge"
-terraform apply -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch_instance_type=g6e.12xlarge"
+# Single-GPU (primary). The job-definition shape defaults to 16 / 122880 / 1.
+terraform plan  -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch_instance_type=g6e.4xlarge"
+terraform apply -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch_instance_type=g6e.4xlarge"
+
+# 4-GPU alternative: the instance type AND the job shape must both change.
+# terraform apply -var="aws_region=us-east-2" -var="enable_batch=true" \
+#   -var="batch_instance_type=g6e.12xlarge" \
+#   -var="batch_job_vcpus=48" -var="batch_job_memory_mib=180000" -var="batch_job_gpus=4"
 ```
+
+> The **deployed** compute environment in this account is `g6e.12xlarge`, created
+> before the single-GPU finding. Changing it is a pending decision, so nothing in
+> this account can currently place a 1-GPU job.
 
 **What this creates:**
 
@@ -108,9 +154,9 @@ terraform apply -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch
 |----------|---------|
 | CodeBuild: `physical-ai-dev-gr00t-training-build` | Builds the GR00T training container |
 | CodeBuild: `physical-ai-dev-gr00t-inference-build` | Builds the GR00T inference container |
-| Batch compute env: `physical-ai-dev-gr00t-compute` | `g6e.12xlarge` (4× L40S, 512 GiB gp3 root), min/desired 0 vCPU, max 96 |
+| Batch compute env: `physical-ai-dev-gr00t-compute` | `var.batch_instance_type` — the **deployed** one is `g6e.12xlarge` (4× L40S, 512 GiB gp3 root), min/desired 0 vCPU, max 96. A single-GPU run needs a CE offering `g6e.4xlarge` |
 | Batch job queue: `physical-ai-dev-gr00t-queue` | Job scheduling |
-| Batch job definition: `physical-ai-dev-gr00t-n17-training` | Image `:n17`, 48 VCPU / 180000 MEMORY / 4 GPU |
+| Batch job definition: `physical-ai-dev-gr00t-n17-training` | Image `:n17`, command `batch-train`, 16 VCPU / 122880 MEMORY / 1 GPU by default (variables — `48 / 180000 / 4` for the 4-GPU path), plus the **mandatory** `EMBODIMENT_CONFIG=g1_dex3` and `TUNE_VISUAL=0` (see [Required job-definition fields](#required-job-definition-fields)) |
 | Security group | Outbound access for ECR/S3/HuggingFace |
 | IAM roles | Batch service role, Batch instance role (S3 + ECR pull + one secret) |
 
@@ -133,6 +179,50 @@ terraform output
 > `training/gr00t/submit_batch_training_n17.py` refuses any `--job-definition`
 > whose name does not contain `n17` for exactly this reason.
 
+### Required job-definition fields
+
+Whether the job definition comes from Terraform, `aws batch
+register-job-definition`, or the **AWS console form** (the path a workshop
+attendee follows), these fields are all required. Nothing here is optional, and
+two of them fail *silently* rather than loudly when they are wrong.
+
+| Console field | Value | Why it matters |
+|---|---|---|
+| Job definition name | `physical-ai-dev-gr00t-n17-training` | Any name is fine, but it must contain `n17` for `submit_batch_training_n17.py` to accept it |
+| Platform / type | EC2, container | Not Fargate: this needs GPUs |
+| Image | `<ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/physical-ai/gr00t-training:n17` | Note the spelling `gr00t`, not `groot` |
+| Command | `batch-train` | Selects the Batch branch of the image entrypoint. `/opt/ml/code/batch-train` and `./batch-train` work too — the entrypoint matches on the basename. **An empty command runs the SageMaker path, which downloads no dataset and uploads no checkpoint.** |
+| vCPUs | `16` | `g6e.4xlarge`. Use `48` for `g6e.12xlarge` |
+| Memory | `122880` MiB | Leaves ~8 GiB of the 128 GiB instance to the ECS agent and kernel. Use `180000` for `g6e.12xlarge` |
+| GPUs | `1` | 1× L40S. Use `4` only together with `TUNE_VISUAL=1` |
+| Execution role | *leave empty* | Not needed: the token is fetched at runtime with the instance role |
+| **Env: `EMBODIMENT_CONFIG`** | **`g1_dex3`** | **Mandatory.** The image default is `ur3`. Omitting it does not error — the job trains the UR3 end-effector config against 28-DOF joint data and dies inside `scipy`'s `Rotation.from_rotvec`, or worse, trains something meaningless |
+| Env: `DATASET_S3_URI` | `s3://physical-ai-dev-datasets-<ACCOUNT_ID>/groot-data/pick_place_data/` | Must be a `physical-ai-dev-*` bucket; the instance role cannot read `physical-ai-workshop-assets-*` |
+| Env: `CHECKPOINT_BUCKET` | `physical-ai-dev-checkpoints-<ACCOUNT_ID>` | Omitting it means the checkpoints are lost when the container exits |
+| **Env: `TUNE_VISUAL`** | **`0`** | **Mandatory for a 1-GPU job.** `0` freezes the vision tower (upstream default) and is what makes a single 48 GB card viable: 877,747,328 trainable parameters instead of ~2.03B. `1` is only valid with 4 GPUs, where DeepSpeed ZeRO shards the optimizer state. A bad value (e.g. `ture`) is a hard failure, not a silent default |
+| Env: `BASE_MODEL` | `nvidia/GR00T-N1.7-3B` | |
+| Env: `BATCH_SIZE` / `GRAD_ACCUM_STEPS` | `2` / `8` | `BATCH_SIZE` is the **global, pre-accumulation** batch and the trainer computes `per_device = BATCH_SIZE / num_gpus`, so on 1 GPU it *is* the per-device batch. 2 × 8 keeps the effective optimizer batch at 16. On 4 GPUs use `8` / `2` for the same effective batch |
+| Env: `MAX_STEPS` | `100` (or `15` for a smoke test) | |
+| Env: `AWS_DEFAULT_REGION` | `us-east-2` | Used by the in-container `aws s3`/`secretsmanager` calls |
+| Env: `HF_TOKEN_SECRET_ID` | `physical-ai/hf-token` | Optional in practice — `nvidia/GR00T-N1.7-3B` is not gated, so an unresolved lookup is a warning |
+
+If the compute environment is also being created by hand, reuse the existing
+CloudFormation stack outputs rather than inventing new ones:
+`BatchPrivateSubnetId`, `BatchLaunchTemplateId` (the 512 GiB gp3 root volume the
+22.6 GB image needs) and `BatchInstanceProfileArn` (the role scoped to
+`physical-ai-dev-*` S3 and ECR pull).
+
+> **The job's shape must be placeable on the compute environment's instance
+> type.** AWS Batch does not reject an unplaceable job — it parks it in
+> `RUNNABLE` indefinitely with a null `statusReason`, which looks exactly like a
+> capacity shortage. A 16 vCPU / 1 GPU job cannot run on a CE that offers only
+> `g6e.12xlarge`, and a 48 vCPU / 4 GPU job cannot run on one that offers only
+> `g6e.4xlarge`. Check both before blaming capacity.
+
+> **Do not put a HuggingFace token, or any other secret, in a job-definition
+> environment variable.** Environment values are visible to anyone who can call
+> `describe-job-definitions`. Pass `HF_TOKEN_SECRET_ID` instead.
+
 ### Pending apply: the HF_TOKEN → Secrets Manager migration
 
 The Terraform in `isaac-gr00t-on-aws/infra/batch.tf` now codifies the job
@@ -140,6 +230,14 @@ definition **without** a plaintext `HF_TOKEN` entry. The live revision 1 in this
 account still carries one, because the Terraform has been written and validated
 but **not applied** — applying registers a new job-definition revision, which is
 a separately approved action.
+
+Two more written-not-applied changes ride along in the same resource: the
+command is now `["batch-train"]` and the environment carries
+`EMBODIMENT_CONFIG=g1_dex3`. Live revision 1 keeps `["/opt/ml/code/batch-train"]`
+and no `EMBODIMENT_CONFIG`; the first is harmless after the container rebuild
+(the entrypoint matches on basename), the second is **not** — until the apply
+lands, every submission against revision 1 must pass `EMBODIMENT_CONFIG=g1_dex3`
+in `--container-overrides`, which `submit_batch_training_n17.py` always does.
 
 What the config does:
 
@@ -195,9 +293,19 @@ The rebuilt entrypoint is embodiment-selectable:
 
 | variable | meaning |
 |---|---|
-| `EMBODIMENT_CONFIG` | `ur3` (default) or `g1_dex3`. `g1_dex3` selects `/opt/ml/code/g1_dex3_modality_config.py`. An unknown value fails immediately. |
+| `EMBODIMENT_CONFIG` | **Mandatory for this dataset: `g1_dex3`.** The image default is `ur3`, so leaving it out does not error — it silently trains the UR3 end-effector config on 28-DOF joint data and raises inside SciPy. `g1_dex3` selects `/opt/ml/code/g1_dex3_modality_config.py`. An unknown value fails immediately. |
 | `MODALITY_CONFIG_PATH` | Optional absolute path inside the container; wins over `EMBODIMENT_CONFIG`. Set-but-missing is a hard failure, not a silent fallback. |
+| `TUNE_VISUAL` | `0` (default, matching upstream) or `1`. `0` freezes the vision tower: 877,747,328 trainable parameters, fits one L40S. `1` restores the ~2.03B-parameter configuration and needs 4 GPUs. An unparseable value is a hard failure. |
 | `HF_TOKEN_SECRET_ID` | Secrets Manager id, read only when `HF_TOKEN` is unset. |
+
+The same rebuild also fixed the **command dispatch**. The entrypoint used to test
+`$1` against the exact string `batch-train`, but the job definition (and anyone
+typing the real path) passes `/opt/ml/code/batch-train`, which did not match — so
+the container fell through to the SageMaker branch, which does **not** download
+`DATASET_S3_URI`, does not resolve `HF_TOKEN_SECRET_ID` and does not upload
+checkpoints. It now dispatches on the **basename** of `$1`, so `batch-train`,
+`/opt/ml/code/batch-train` and `./batch-train` all reach the Batch path, and an
+argument-free invocation still takes the SageMaker path.
 
 Both configs register under `EmbodimentTag.NEW_EMBODIMENT`, so
 `--embodiment-tag new_embodiment` is passed either way — the G1's 28-dim action
@@ -467,6 +575,15 @@ Because `nvidia/GR00T-N1.7-3B` is not gated, a failed lookup only prints
 Use `--container-overrides` with **environment entries only**. Do not register a
 new job-definition revision for a configuration change.
 
+> **`EMBODIMENT_CONFIG=g1_dex3` is mandatory on every submission against live
+> revision 1**, which ships no `EMBODIMENT_CONFIG` of its own. The image default
+> is `ur3`, and the UR3 config is an end-effector config: against this 28-DOF
+> joint-space dataset it raises inside SciPy's `Rotation.from_rotvec`. Omitting it
+> produces a failed job, not a warning. `submit_batch_training_n17.py` always
+> sends it; a hand-written `aws batch submit-job` must too. The same applies to
+> `DATASET_S3_URI` (the live revision still points at the old UR3 prefix unless
+> the Terraform has been applied).
+
 ### Recommended: the submitter script
 
 ```bash
@@ -499,14 +616,17 @@ The payload it sends (verified by `--dry-run`):
       { "name": "DATASET_S3_URI", "value": "s3://physical-ai-dev-datasets-<ACCOUNT_ID>/groot-data/pick_place_data/" },
       { "name": "MAX_STEPS", "value": "15" },
       { "name": "EMBODIMENT_CONFIG", "value": "g1_dex3" },
-      { "name": "BATCH_SIZE", "value": "8" },
-      { "name": "GRAD_ACCUM_STEPS", "value": "2" }
+      { "name": "BATCH_SIZE", "value": "2" },
+      { "name": "GRAD_ACCUM_STEPS", "value": "8" },
+      { "name": "TUNE_VISUAL", "value": "0" }
     ]
   }
 }
 ```
 
-No `command`, no `resourceRequirements` — environment only.
+No `command`, no `resourceRequirements` — environment only. The command is left
+alone on purpose: the entrypoint dispatches on the basename of `$1`, so an
+override that is not `…/batch-train` silently selects the SageMaker path.
 
 ### Equivalent raw CLI
 
@@ -521,19 +641,34 @@ aws batch submit-job \
       {"name": "DATASET_S3_URI", "value": "s3://physical-ai-dev-datasets-<ACCOUNT_ID>/groot-data/pick_place_data/"},
       {"name": "MAX_STEPS", "value": "15"},
       {"name": "EMBODIMENT_CONFIG", "value": "g1_dex3"},
-      {"name": "BATCH_SIZE", "value": "8"},
-      {"name": "GRAD_ACCUM_STEPS", "value": "2"}
+      {"name": "BATCH_SIZE", "value": "2"},
+      {"name": "GRAD_ACCUM_STEPS", "value": "8"},
+      {"name": "TUNE_VISUAL", "value": "0"}
     ]
   }'
 ```
 
-Keep `BATCH_SIZE=8` / `GRAD_ACCUM_STEPS=2` on 4× L40S: those are the values
-recorded as measured-working on the same hardware in
-[n17-sagemaker-training-guide.md](n17-sagemaker-training-guide.md). `BATCH_SIZE`
-is the global, pre-accumulation batch across all GPUs, so 8 means per-device 2,
-and the effective optimizer batch is 16. If OOM appears, drop to `BATCH_SIZE=4`
-with `GRAD_ACCUM_STEPS=4` to hold the effective batch. There is no
-`--gradient-checkpointing` lever in this SDK revision.
+### Batch geometry
+
+`BATCH_SIZE` is the **global, pre-accumulation** batch. The trainer derives
+`per_device_train_batch_size = global_batch_size // num_gpus`
+(`gr00t/experiment/experiment.py:263-266`, with
+`assert global_batch_size % num_gpus == 0`), so the same number means different
+things on different hardware:
+
+| instance | GPUs | `BATCH_SIZE` | per-device | `GRAD_ACCUM_STEPS` | effective batch |
+|---|---|---|---|---|---|
+| **`g6e.4xlarge` (primary)** | 1 | **2** | **2** | **8** | 16 |
+| `g6e.12xlarge` (alternative) | 4 | 8 | 2 | 2 | 16 |
+
+The 4-GPU pair `8` / `2` on one GPU would mean a **per-device batch of 8**, not 2.
+`2` / `8` is deliberately conservative: it holds the per-device batch at 2 while
+halving the optimizer round trips of a `1` / `16` run, and the derived peak
+(~22.0 GiB static plus activations, workspaces and fragmentation) leaves well over
+40% of the card unused. `4` / `4` is the next step up — take it once a real run
+reports peak VRAM. If OOM appears first, go to `1` / `16`. There is no
+`--gradient-checkpointing` lever in this SDK revision, and the custom modules
+never call a checkpoint function, so it would not help anyway.
 
 ---
 
@@ -557,13 +692,15 @@ never leaves `RUNNABLE` has no logs at all — that is a capacity signal, not a
 missing-log bug.
 
 Expected log sequence once a container runs (**untested — see Validation
-Status**): the `batch-train` banner echoing `Embodiment:` and `Modality config:`;
-`Video pre-flight: OK - episode_000000.mp4 codec=… frame=…`; `Generating stats
-for /opt/ml/input/data/training`; `Generating relative stats` for `left_arm` /
-`right_arm`; the `launch_finetune.py` command line with `--embodiment-tag
-new_embodiment` and the `g1_dex3` modality path; the 3.14B-parameter model load
-(~2.03B trainable); DeepSpeed ZeRO at `num_gpus=4`; then
-`{'loss': …, 'grad_norm': …, 'learning_rate': …}` lines.
+Status**): the `batch-train` banner echoing `Embodiment:`, `Modality config:` and
+`Tune visual:`; `Video pre-flight: OK - episode_000000.mp4 codec=… frame=…`;
+`Generating stats for /opt/ml/input/data/training`; `Generating relative stats`
+for `left_arm` / `right_arm`; the `launch_finetune.py` command line with
+`--embodiment-tag new_embodiment`, the `g1_dex3` modality path and
+`--no-tune-visual`; the 3.14B-parameter model load (877,747,328 trainable with
+the vision tower frozen — this is the first chance to confirm the derived figure);
+then `{'loss': …, 'grad_norm': …, 'learning_rate': …}` lines. On a 1-GPU run there
+is **no** DeepSpeed line: ZeRO only engages at `num_gpus > 1`.
 
 ### The three success checks
 
@@ -617,9 +754,22 @@ aws batch update-compute-environment \
   --region us-east-2
 ```
 
-> **Warning:** a warm `g6e.12xlarge` bills continuously. Check current on-demand
-> pricing for your region before leaving one up, and scale back to zero as soon
-> as the iteration session ends.
+On-demand Linux pricing in us-east-2, from the AWS Pricing API:
+
+| instance | GPUs | $/hr |
+|---|---|---|
+| `g6e.4xlarge` (primary) | 1× L40S | **$3.00424** |
+| `g6e.12xlarge` (alternative) | 4× L40S | **$10.49264** |
+
+A run's cost is that rate × wall clock, and no training wall clock has been
+measured yet — so this guide quotes no per-run figure. Note the single-GPU path is
+~3.5× cheaper per hour, which only matters if it is not more than 3.5× slower; at
+877,747,328 trainable parameters versus ~2.03B there is no measurement to say
+either way yet.
+
+> **Warning:** a warm instance bills continuously whether or not a job is
+> running. Scale back to zero as soon as the iteration session ends. A job sitting
+> in `RUNNABLE` bills nothing, because no instance exists yet.
 
 ---
 
@@ -628,8 +778,11 @@ aws batch update-compute-environment \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_batch` | `false` | Set to `true` to deploy the Batch resources |
-| `batch_instance_type` | `g6.12xlarge` | Pass `g6e.12xlarge` — the validated 4× L40S (48 GB) shape. The deployed CE is `g6e.12xlarge`. |
-| `batch_max_vcpus` | `96` | Maximum vCPUs for auto-scaling (two 48-vCPU instances) |
+| `batch_instance_type` | `g6.12xlarge` | The deployed CE is `g6e.12xlarge`. Pass `g6e.4xlarge` for the single-GPU path |
+| `batch_max_vcpus` | `96` | Maximum vCPUs for auto-scaling |
+| `batch_job_vcpus` | `16` | Job-definition vCPU request. `48` for `g6e.12xlarge` |
+| `batch_job_memory_mib` | `122880` | Job-definition memory request. `180000` for `g6e.12xlarge` |
+| `batch_job_gpus` | `1` | Job-definition GPU request. `4` only with `TUNE_VISUAL=1` |
 
 ---
 
@@ -641,21 +794,45 @@ Measured in account `<ACCOUNT_ID>`, region `us-east-2`.
 |------|--------|-------|
 | Terraform deploy (Foundation + GR00T infra) | ✅ Validated | VPC, Batch CE, queue, CodeBuild, instance role all live and `VALID` |
 | Secrets Manager HCL (`batch.tf`, `outputs.tf`) | ⚠️ Written, **not applied** | `fmt -check` + `init -backend=false` + `validate` all exit 0. No `plan`/`apply` against real state; live job-definition rev 1 still carries the plaintext `HF_TOKEN`. |
-| Container rebuild (CodeBuild, `buildspec-n17.yml`) | ✅ Validated | 19 m 57 s, ECR `:n17` digest changed, both new modality configs present in the image |
+| Single-GPU job shape HCL (`batch_job_vcpus` / `_memory_mib` / `_gpus` = 16 / 122880 / 1) | ⚠️ Written, **not applied** | `validate` exits 0. Live rev 1 still requests 48 / 180000 / 4, which no `g6e.4xlarge` can place. |
+| Single-GPU compute environment (`g6e.4xlarge`) | ⬜ **Does not exist** | The deployed CE offers `g6e.12xlarge` only. Creating one is a pending decision; until then a 1-GPU job cannot be scheduled at all. |
+| Container rebuild (CodeBuild, `buildspec-n17.yml`) | ✅ Validated | 19 m 57 s for the embodiment-selectable build; a second build added the basename command dispatch and `TUNE_VISUAL`. ECR `:n17` digest changed each time. |
+| Entrypoint command dispatch (`batch-train` / `/opt/ml/code/batch-train` / `./batch-train`) | ✅ Validated | All three argv forms reach the Batch branch, and an empty command still takes the SageMaker path — exercised against the entrypoint extracted from the pushed image. |
+| Single-GPU memory budget at `TUNE_VISUAL=0` | ⚠️ **Derived, not measured** | 22,023 MiB static of 45,776 MiB, computed from source parameter counts. No container has run, so no peak-VRAM figure exists. |
 | Dataset prep + `meta/modality.json` | ✅ Validated | Validator: 0 problems, 2 expected warnings, 201/201 episodes, 29,105 rows |
 | Dataset staged to the dev datasets bucket | ✅ Validated | 409 objects / 134,298,177 B; workshop-assets source untouched at 407 |
 | Batch job submission + queue admission | ✅ Validated | `SUBMITTED` → `RUNNABLE` in **30 s** |
 | `g6e.12xlarge` instance launch | ❌ **Blocked — no EC2 capacity** | Job held `RUNNABLE` for **2 h 38 m 29 s**; 30/30 ASG launch attempts failed `InsufficientInstanceCapacity` across all three AZs (2a ×15, 2c ×9, 2b ×6) |
+| `g6e.4xlarge` instance launch | ⬜ Untested | No single-GPU compute environment exists yet, so nothing has been submitted against one |
 | ECR image pull onto a Batch instance | ⬜ Untested | `STARTING` never reached; no measured pull time exists |
 | In-container dataset download | ⬜ Untested | `RUNNING` never reached |
 | AV1 video decode (torchcodec pre-flight) | ⬜ Untested | The largest remaining risk. The pre-flight turns a silent late failure into an immediate, legible one. |
-| GR00T N1.7-3B model load + DeepSpeed ZeRO at 4 GPUs | ⬜ Untested | No container ever started |
+| GR00T N1.7-3B model load (1 GPU, frozen vision tower) | ⬜ Untested | No container ever started; the 877,747,328 trainable-parameter figure is derived from source, not read from a log |
+| DeepSpeed ZeRO at 4 GPUs (`TUNE_VISUAL=1`) | ⬜ Untested | No container ever started |
 | Training steps / loss / per-step timing | ⬜ Untested | **No training timing is quoted anywhere in this guide** because none has been measured |
 | Checkpoint upload to S3 | ⬜ Untested | `s3://physical-ai-dev-checkpoints-<ACCOUNT_ID>/` is still empty (0 objects) |
 
 Nothing was billed for the blocked run: no `g6e.12xlarge` was ever launched. AWS
 Batch keeps retrying on its own, so a job left in `RUNNABLE` starts by itself
 when capacity frees up — it does not need resubmitting.
+
+### The job definition was never functional, independent of the capacity problem
+
+Worth stating plainly, because it changes how much the blocked run proved: the
+`:n17` job definition could not have trained anything even with capacity. Its
+command `/opt/ml/code/batch-train` did not match the entrypoint's exact-string
+test, so the container would have taken the SageMaker branch, found
+`/opt/ml/input/data/training` empty (that branch performs no `aws s3 sync`) and
+failed with no dataset — and it would never have uploaded a checkpoint. The
+capacity shortage hid the defect rather than causing it. The basename dispatch
+fixes it, but **the fix is unexercised against a real job**: a smoke test must
+actually run before this guide is treated as a validated procedure.
+
+The same applies to the resource shape. Live revision 1 requests 48 vCPU /
+180000 MiB / 4 GPU, which no `g6e.4xlarge` can place — so even with reserved
+single-GPU capacity, a job against revision 1 would sit in `RUNNABLE` with a null
+`statusReason` and look like another capacity shortage. That is why the shape is
+now a Terraform variable rather than a literal.
 
 ### Capacity, for workshop planning
 
@@ -673,16 +850,19 @@ reservations, another region, or another instance family.
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| Job stuck in `RUNNABLE`, `statusReason` null, no log stream | No `g6e.12xlarge` **capacity** (not quota, not config) — the CE is `VALID` and `desiredvCpus` did rise | Inspect the backing ASG: `aws autoscaling describe-scaling-activities --auto-scaling-group-name <ce-asg> --region us-east-2 --query 'Activities[].{code:StatusCode,cause:StatusMessage}'`. `InsufficientInstanceCapacity` means wait — Batch retries by itself. Check the quota separately with `aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA`. |
+| Job stuck in `RUNNABLE`, `statusReason` null, **and `desiredvCpus` never rises** | The job's `resourceRequirements` cannot be placed on the CE's instance type — e.g. 16 vCPU / 1 GPU against a `g6e.12xlarge`-only CE, or 48 vCPU / 4 GPU against a `g6e.4xlarge` one. Batch parks the job instead of rejecting it | Compare `aws batch describe-job-definitions --job-definition-name <name> --query 'jobDefinitions[-1].containerProperties.resourceRequirements'` against `aws batch describe-compute-environments --compute-environments <ce> --query 'computeEnvironments[0].computeResources.instanceTypes'`. Fix the shape (`batch_job_vcpus` / `batch_job_memory_mib` / `batch_job_gpus`) or the CE — do not wait for capacity. |
+| Job stuck in `RUNNABLE`, `statusReason` null, no log stream | No **capacity** for the instance type (not quota, not config) — the CE is `VALID` and `desiredvCpus` did rise | Inspect the backing ASG: `aws autoscaling describe-scaling-activities --auto-scaling-group-name <ce-asg> --region us-east-2 --query 'Activities[].{code:StatusCode,cause:StatusMessage}'`. `InsufficientInstanceCapacity` means wait — Batch retries by itself. Check the quota separately with `aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA`. |
 | Tempted to pin the CE to the AZ the error message names | The "you can currently get capacity in us-east-2b/c" hint is a point-in-time pool estimate | **Do not.** us-east-2b was recommended by both the 2a and 2c failure messages and itself failed 6/6. Pinning reduces the number of pools the ASG can try and fixes nothing. |
 | `CannotPullContainerError` / repository does not exist | Job submitted against `physical-ai-dev-gr00t-training` (any revision), which points at the misspelled repo `physical-ai/groot-training` | Submit against `physical-ai-dev-gr00t-n17-training` |
-| Container trains a UR3 end-effector config on G1 data, or SciPy raises in `Rotation.from_rotvec` | `EMBODIMENT_CONFIG` not set, so the default `ur3` config ran | Pass `EMBODIMENT_CONFIG=g1_dex3` in `--container-overrides`. A Batch `command` override cannot fix this: `Dockerfile.n17` sets an `ENTRYPOINT` and Batch has no entrypoint override. |
+| Container trains a UR3 end-effector config on G1 data, or SciPy raises in `Rotation.from_rotvec` | `EMBODIMENT_CONFIG` not set, so the image default `ur3` ran. Live job-definition revision 1 ships no `EMBODIMENT_CONFIG` | Pass `EMBODIMENT_CONFIG=g1_dex3` — in `--container-overrides` for every submission, or as a job-definition environment entry (see [Required job-definition fields](#required-job-definition-fields)). A Batch `command` override cannot fix this: `Dockerfile.n17` sets an `ENTRYPOINT` and Batch has no entrypoint override. |
+| Logs show the `=== GR00T N1.7-3B Fine-Tuning ===` banner but no `Downloading dataset from S3`, and the job dies on an empty dataset directory | The container took the SageMaker branch: the `command` basename is not `batch-train` (e.g. empty command, or `bash -c …`). That branch performs no `aws s3 sync` and no checkpoint upload | Set the command to `batch-train` (`/opt/ml/code/batch-train` and `./batch-train` also work on images built after the basename-dispatch fix). Confirm the first log line is the `batch-train` banner with `Embodiment:` and `Modality config:`. |
 | Video pre-flight fails with a torchcodec/ffmpeg error on `episode_000000.mp4` | AV1 decode (`video.codec: "av1"`) unavailable in the image's ffmpeg/torchcodec combination | Transcode all 201 videos to H.264 (`ffmpeg -i in.mp4 -c:v libx264 -pix_fmt yuv420p out.mp4`), re-stage the dataset to S3, resubmit. This is a data fix, not a container change. |
 | `AccessDenied` reading `DATASET_S3_URI` | The instance role grants S3 only on `arn:aws:s3:::physical-ai-dev-*`, and the canonical dataset lives in `physical-ai-workshop-assets-<ACCOUNT_ID>` | Stage a prepared copy to `s3://physical-ai-dev-datasets-<ACCOUNT_ID>/groot-data/pick_place_data/`. Do **not** widen the policy. |
 | `HF_TOKEN` still appears in plaintext in the job definition | The Secrets Manager migration is written in `batch.tf` but **not applied** — applying registers a new revision | Apply `isaac-gr00t-on-aws/infra` deliberately (`enable_batch=true`), then confirm the new revision has `HF_TOKEN_SECRET_ID` and no `HF_TOKEN` |
 | `HuggingFace credential: NOT resolved` in the logs | The instance role has no `secretsmanager:GetSecretValue` yet (see the row above) | Harmless: `nvidia/GR00T-N1.7-3B` is not gated and training continues. Fix by applying the Terraform. |
-| `CUDA out of memory` | Batch geometry too large for 48 GB cards | `BATCH_SIZE=4` with `GRAD_ACCUM_STEPS=4` keeps the effective batch at 16. No `--gradient-checkpointing` flag exists in this SDK revision. |
-| Single-GPU run OOMs at the optimizer step | At `num_gpus=1` DeepSpeed is disabled outright, so there is no ZeRO sharding and no offload path in the shipped configs | Use a 4-GPU instance. Making 1 GPU work requires source edits inside the image, not configuration. |
+| `CUDA out of memory` on one GPU | Either `TUNE_VISUAL=1` (which needs 4 GPUs for ZeRO sharding), or the per-device batch is too large — remember `BATCH_SIZE` *is* the per-device batch at `num_gpus=1` | Confirm the log banner says `Tune visual: False`. Then step down `BATCH_SIZE=1` with `GRAD_ACCUM_STEPS=16` to hold the effective batch at 16. No `--gradient-checkpointing` flag exists in this SDK revision, and the custom modules never call a checkpoint function, so it would not help. |
+| `TUNE_VISUAL=1` on a 1-GPU instance OOMs | At `num_gpus=1` DeepSpeed is disabled outright (`experiment.py:258-262`), so the ~2.03B trainable parameters carry unsharded fp32 grads and AdamW moments, and the ViT/LLM activation graph is retained | Leave `TUNE_VISUAL=0` on one GPU. Visual tuning is a 4-GPU configuration. |
+| Log banner shows `Tune visual: True` when you expected frozen | `TUNE_VISUAL` was set to `1` somewhere — job definition environment, or `--tune-visual` on the submitter | The submitter always sends `TUNE_VISUAL` explicitly, so the submitted value wins over the job definition. Check the payload it printed. |
 | `episodes.jsonl not found` | A LeRobot **v3** dataset — v3 dropped `meta/episodes.jsonl` | N1.7 needs `meta/episodes.jsonl` with a `length` field. It does **not** care about `codebase_version`, so **no v2.1 → v2.0 conversion is needed**; for a v3 source use the upstream `scripts/lerobot_conversion/convert_v3_to_v2.py`. |
 | Stats look wrong / normalization is odd | A hand-written `meta/stats.json` was shipped | It is deleted on entry and regenerated in-container by `gr00t.data.stats` on rank 0. Do not author one. |
 | `No space left on device` | Image is 22.6 GB | The launch template provides a 512 GiB gp3 root volume; confirm the CE is using it |
@@ -721,8 +901,13 @@ removed by this destroy. Delete them explicitly if you want them gone — and le
 
 ## Next Steps
 
-- Re-run the smoke test when `g6e.12xlarge` capacity is available, and fill in
-  the untested rows of the Validation Status table with measured numbers
+- Create a single-GPU (`g6e.4xlarge`) compute environment against the reserved
+  capacity, then run the smoke test and fill in the untested rows of the
+  Validation Status table with measured numbers — including **peak VRAM**, which
+  is the one number that turns the derived memory budget into a measured one
+- Apply the Terraform so the job definition carries the single-GPU shape,
+  `EMBODIMENT_CONFIG`, `TUNE_VISUAL` and the Secrets Manager reference (this
+  registers a new job-definition revision)
 - Apply the Secrets Manager Terraform to retire the plaintext `HF_TOKEN`
 - Deploy the trained model for inference (see `containers/gr00t-inference/`)
 - Compare with the [SageMaker N1.7 path](n17-sagemaker-training-guide.md) for
