@@ -69,6 +69,15 @@ COPY containers/gr00t-training/train_entrypoint_n17.py /opt/ml/code/train_entryp
 COPY containers/gr00t-training/batch-train-entrypoint-n17.sh /opt/ml/code/batch-train
 RUN chmod +x /opt/ml/code/batch-train
 
+# Embodiment modality configs. train_entrypoint.py picks one at runtime from
+# EMBODIMENT_CONFIG (or an explicit MODALITY_CONFIG_PATH) and passes it to
+# launch_finetune.py as --modality-config-path. They are shipped as files because
+# the ENTRYPOINT below dispatches on $1 and AWS Batch job definitions cannot
+# override an entrypoint, so the embodiment has to be selectable from the
+# environment alone.
+COPY containers/gr00t-training/ur3_modality_config.py /opt/ml/code/ur3_modality_config.py
+COPY containers/gr00t-training/g1_dex3_modality_config.py /opt/ml/code/g1_dex3_modality_config.py
+
 # SageMaker compatibility
 ENV PYTHONUNBUFFERED=1
 ENV SAGEMAKER_PROGRAM=train_entrypoint.py
@@ -77,6 +86,14 @@ ENV DATASET_LOCAL_DIR="/opt/ml/input/data/training"
 ENV OUTPUT_DIR="/opt/ml/model"
 ENV BASE_MODEL_PATH="nvidia/GR00T-N1.7-3B"
 ENV GROOT_SDK_DIR="/workspace/gr00t-repo"
+# Backwards-compatible default: unset environment == the validated UR3 flow.
+ENV EMBODIMENT_CONFIG=ur3
+# Vision-tower tuning off by default, matching upstream (FinetuneConfig.tune_visual
+# = False). Frozen, the trainable set is the projector + DiT action head only,
+# which is what lets this train on a single 48 GB L40S. Set TUNE_VISUAL=1 to
+# restore the ~2B-trainable-parameter configuration, which needs 4 GPUs so that
+# DeepSpeed ZeRO engages.
+ENV TUNE_VISUAL=0
 
 # Symlink for compatibility
 RUN ln -sf /workspace/gr00t-repo /opt/isaac-gr00t
@@ -86,9 +103,20 @@ RUN mkdir -p ${DATASET_LOCAL_DIR} ${OUTPUT_DIR}
 WORKDIR /opt/ml/code
 
 # Smart entrypoint: supports both SageMaker (default) and Batch (pass "batch-train" as arg)
+#
+# The dispatch matches on the BASENAME of $1, so "batch-train",
+# "/opt/ml/code/batch-train" and "./batch-train" all reach the Batch path. AWS
+# Batch job definitions have no entrypoint override and their `command` arrives
+# here as "$@", so an exact-string test fell through to the SageMaker branch for
+# the fully-qualified path that both the live job definition and anyone typing
+# the real path into the console would use. That branch does not sync
+# DATASET_S3_URI, does not resolve HF_TOKEN_SECRET_ID and does not upload
+# checkpoints, so the failure surfaced as an empty dataset directory with no
+# obvious cause. Keep this tolerant: the job definition is created by hand in
+# the console in the workshop flow.
 COPY <<'EOF' /opt/ml/code/entrypoint.sh
 #!/bin/bash
-if [ "$1" = "batch-train" ]; then
+if [ "$(basename -- "${1:-}")" = "batch-train" ]; then
     exec bash /opt/ml/code/batch-train
 else
     exec python /opt/ml/code/train_entrypoint.py "$@"
