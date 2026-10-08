@@ -14,7 +14,11 @@
 #
 # Requires NGC API key to pull the base image (nvcr.io/nvidia/pytorch).
 
-FROM nvcr.io/nvidia/pytorch:25.04-py3
+# Base layers come from NGC by default. The workshop CloudFormation template can
+# override this with a pre-mirrored image in a central ECR, so participant accounts
+# never need an NGC key. See isaac-gr00t-on-aws/event-build-image.sh.
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.04-py3
+FROM ${BASE_IMAGE}
 
 # N1.7 General Release commit
 ARG GROOT_COMMIT=1a1837f20538b7d7e21f977a11a5aee14f99803c

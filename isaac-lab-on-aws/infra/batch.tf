@@ -202,8 +202,12 @@ resource "aws_batch_compute_environment" "rl" {
     # submitted, and it also consumed a slot of the g6e.4xlarge capacity reservation
     # that the GR00T training lab depends on. Batch scales this environment up on
     # demand, so a warm floor buys nothing that justifies that cost.
+    # desired_vcpus is deliberately NOT set. It is the one field in this block that Batch
+    # itself writes - it raises it to place a job and drops it back when the queue drains -
+    # so pinning it here would show drift on every plan and a mid-job apply would push it
+    # back to 0 and pull capacity out from under the running job. Omitted, the provider
+    # leaves it computed, and with min_vcpus at 0 the environment still starts at 0.
     min_vcpus          = 0
-    desired_vcpus      = 0
     security_group_ids = [aws_security_group.batch[0].id]
     subnets            = local.batch_subnet_ids
 
