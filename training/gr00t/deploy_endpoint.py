@@ -44,7 +44,7 @@ def _defaults(region):
     acct = _account(region)
     project, env = os.environ.get("PROJECT_NAME", "physical-ai"), os.environ.get("ENVIRONMENT", "dev")
     image = os.environ.get("GROOT_INFERENCE_IMAGE",
-                           f"{acct}.dkr.ecr.{region}.amazonaws.com/{project}/groot-inference:latest")
+                           f"{acct}.dkr.ecr.{region}.amazonaws.com/{project}/gr00t-inference:latest")
     role = os.environ.get("SAGEMAKER_ROLE_ARN",
                           f"arn:aws:iam::{acct}:role/{project}-{env}-sagemaker-role")
     return image, role
