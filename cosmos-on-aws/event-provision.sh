@@ -21,9 +21,8 @@
 #                       cluster: the prefix appears in the cluster name AND in IAM role
 #                       names that hardcode "cosmos3", so a different eks_cluster_name
 #                       alone is NOT enough to avoid collisions.
-#                       NOTE: the IRSA policy scopes S3 to
-#                       physical-ai-<ENVIRONMENT>-datasets-<account>, so a non-default
-#                       value needs a matching Foundation deployment for pods to read S3.
+#                       NOTE: the IRSA policy grants DATA_BUCKET (and the weights
+#                       bucket); with DATA_BUCKET set no Foundation deployment is needed.
 #   EKS_CLUSTER_NAME    Cluster name suffix               (default cosmos3)
 #   GPU_INSTANCE_TYPE   GPU node instance type            (default g6e.4xlarge)
 #   GPU_AZ              AZ to pin the GPU node group to   (default: any private subnet)
@@ -34,6 +33,30 @@
 #                       provider must reach the Kubernetes API to refresh state).
 #   CENTRAL_WEIGHTS_S3  Central S3 prefix with Cosmos 3 Nano weights (optional)
 #   COSMOS_IMAGE_URI    ECR image for vllm-omni cosmos3; also warms the node's image cache
+#   DATA_BUCKET         Workshop data bucket (optional). The pod IRSA policy grants it,
+#                       and CENTRAL_WEIGHTS_S3 is relayed into it when the account has no
+#                       /physical-ai/datasets-bucket SSM parameter.
+#   VPC_ID              VPC to build the cluster in. Empty = read the Foundation VPC
+#                       from SSM. Must be set together with EKS_NODE_SUBNET_IDS.
+#   EKS_NODE_SUBNET_IDS Comma-separated subnet IDs for the node groups (system + GPU).
+#                       Empty = read the Foundation private subnets from SSM. With
+#                       GPU_AZ set, at least one must be in GPU_AZ.
+#   EKS_CONTROL_PLANE_SUBNET_IDS  Comma-separated subnet IDs for the EKS control plane
+#                       ENIs; must span two AZs. Empty = the node subnets. Requires
+#                       VPC_ID and EKS_NODE_SUBNET_IDS.
+#   EKS_API_INGRESS_SG_IDS  Comma-separated security group IDs allowed to reach the
+#                       cluster's private API endpoint on 443 (for example the
+#                       workstation's). Empty = no extra rule.
+#   ENABLE_IMAGE_BUILDS true or false, default false. true keeps the Cosmos Transfer /
+#                       Cosmos 3 image-build CodeBuild projects, which need the Foundation
+#                       ECR SSM parameters. Set it when you run this script by hand in a
+#                       Foundation account whose state already holds those projects;
+#                       otherwise the next run destroys them.
+#   POD_GRANT_FOUNDATION_BUCKET  empty (default) = grant the Foundation datasets bucket
+#                       only when DATA_BUCKET is unset; true or false = force it on or
+#                       off. Set true when you run this by hand in a Foundation account
+#                       with DATA_BUCKET set and still need pods to read the Foundation
+#                       bucket (for example cosmos3-job.yaml).
 #   TF_DIR              Terraform directory               (default: <repo>/cosmos-on-aws/infra)
 
 set -euo pipefail
@@ -49,11 +72,49 @@ GPU_DESIRED_SIZE="${GPU_DESIRED_SIZE:-1}"
 CENTRAL_WEIGHTS_S3="${CENTRAL_WEIGHTS_S3:-}"
 COSMOS_IMAGE_URI="${COSMOS_IMAGE_URI:-}"
 WORKSTATION_ROLE_ARN="${WORKSTATION_ROLE_ARN:-}"
+VPC_ID="${VPC_ID:-}"
+EKS_NODE_SUBNET_IDS="${EKS_NODE_SUBNET_IDS:-}"
+EKS_CONTROL_PLANE_SUBNET_IDS="${EKS_CONTROL_PLANE_SUBNET_IDS:-}"
+EKS_API_INGRESS_SG_IDS="${EKS_API_INGRESS_SG_IDS:-}"
+DATA_BUCKET="${DATA_BUCKET:-}"
+# Resolved in section 2 only when CENTRAL_WEIGHTS_S3 is set; "" keeps the staging Job
+# heredoc safe under set -u when only COSMOS_IMAGE_URI is set.
+WEIGHTS_BUCKET=""
+ENABLE_IMAGE_BUILDS="${ENABLE_IMAGE_BUILDS:-false}"
+POD_GRANT_FOUNDATION_BUCKET="${POD_GRANT_FOUNDATION_BUCKET:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TF_DIR="${TF_DIR:-$SCRIPT_DIR/infra}"
 TERRAFORM_VERSION="${TERRAFORM_VERSION:-1.16.4}"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+# stderr: survives $( ... ), where stdout would be captured and discarded.
+die() { log "ERROR: $*" >&2; exit 1; }
+# "a, b" -> ["a", "b"]; validates every element against an ID regex.
+# Empty input returns [] BEFORE touching the array: on bash < 4.4 (macOS /bin/bash
+# 3.2) expanding an empty array under `set -u` aborts with "unbound variable".
+to_hcl_list() {  # $1=name $2=value $3=regex
+  local out="" item
+  local -a items=()
+  [ -n "${2//[[:space:],]/}" ] || { printf '[]'; return 0; }
+  IFS=',' read -r -a items <<< "$2"
+  for item in "${items[@]}"; do
+    item="${item//[[:space:]]/}"; [ -z "$item" ] && continue
+    [[ "$item" =~ $3 ]] || die "$1 contains '$item', which is not a valid ID"
+    out="${out:+$out, }\"$item\""
+  done
+  printf '[%s]' "$out"
+}
+
+# Validate the switches before anything else runs. Terraform would reject a bad value
+# too, but only after the tfvars is published and `terraform init` has run.
+case "$ENABLE_IMAGE_BUILDS" in
+  true|false) ;;
+  *) die "ENABLE_IMAGE_BUILDS must be true or false, got '$ENABLE_IMAGE_BUILDS'" ;;
+esac
+case "$POD_GRANT_FOUNDATION_BUCKET" in
+  ''|true|false) ;;
+  *) die "POD_GRANT_FOUNDATION_BUCKET must be empty, true or false, got '$POD_GRANT_FOUNDATION_BUCKET'" ;;
+esac
 
 #-----------------------------------------------------------------------------------
 # 1. Tooling
@@ -74,6 +135,110 @@ fi
 # early sends SIGPIPE to terraform and the script dies with exit 141 - which happened
 # as soon as terraform printed an extra upgrade-notice line.
 terraform version
+
+#-----------------------------------------------------------------------------------
+# 1b. Network preflight
+#
+# When the caller passes a network (the workshop stack passes its own VPC), check it
+# here, before Terraform: a wrong ID, a subnet in another VPC, a single-AZ control plane
+# or no node subnet in GPU_AZ would otherwise surface much later as an opaque plan or
+# CreateCluster error. With no network variables set, Terraform reads the Foundation VPC
+# from SSM, as before, and this section is skipped.
+#-----------------------------------------------------------------------------------
+SUBNET_RE='^subnet-[0-9a-f]{8,17}$'
+# "a, b,,c" -> one trimmed, non-empty item per line (empty input prints nothing).
+split_csv() {
+  local item
+  local -a items=()
+  [ -n "${1//[[:space:],]/}" ] || return 0
+  IFS=',' read -r -a items <<< "$1"
+  for item in "${items[@]}"; do
+    item="${item//[[:space:]]/}"
+    [ -n "$item" ] && printf '%s\n' "$item"
+  done
+  return 0
+}
+
+if [ -n "${VPC_ID}${EKS_NODE_SUBNET_IDS}${EKS_CONTROL_PLANE_SUBNET_IDS}" ]; then
+  VPC_RE='^vpc-[0-9a-f]{8,17}$'
+  if ! [[ "$VPC_ID" =~ $VPC_RE ]] || [ -z "${EKS_NODE_SUBNET_IDS//[[:space:],]/}" ]; then
+    die "VPC_ID and EKS_NODE_SUBNET_IDS must be set together (control-plane subnets also require them)"
+  fi
+  # Called directly (not in $( )), so a malformed ID exits here with a named cause.
+  to_hcl_list EKS_NODE_SUBNET_IDS "$EKS_NODE_SUBNET_IDS" "$SUBNET_RE" >/dev/null
+  to_hcl_list EKS_CONTROL_PLANE_SUBNET_IDS "$EKS_CONTROL_PLANE_SUBNET_IDS" "$SUBNET_RE" >/dev/null
+
+  NODE_SUBNETS="$(split_csv "$EKS_NODE_SUBNET_IDS")"
+  CP_SUBNETS="$(split_csv "$EKS_CONTROL_PLANE_SUBNET_IDS")"
+  # Empty control-plane list = the EKS module falls back to the node subnets.
+  [ -n "$CP_SUBNETS" ] || CP_SUBNETS="$NODE_SUBNETS"
+  # One describe call for the unique set (the node subnet is usually in both lists).
+  SUBNET_ARGS=()
+  while IFS= read -r sid; do
+    SUBNET_ARGS+=("$sid")
+  done <<< "$(printf '%s\n%s\n' "$NODE_SUBNETS" "$CP_SUBNETS" | sort -u | awk 'NF')"
+  SUBNET_LIST="${SUBNET_ARGS[*]}"
+
+  if ! SUBNET_ROWS="$(aws ec2 describe-subnets --region "$AWS_REGION_NAME" \
+       --subnet-ids "${SUBNET_ARGS[@]}" \
+       --query 'Subnets[].[SubnetId,VpcId,AvailabilityZone,AvailabilityZoneId]' \
+       --output text)"; then
+    die "describe-subnets failed for ${SUBNET_LIST} (wrong ID or Region?)"
+  fi
+  # $1=subnet ID, $2=column (2 VpcId, 3 AvailabilityZone, 4 AvailabilityZoneId).
+  # awk reads all input (no early exit), so the printf never sees SIGPIPE under pipefail.
+  subnet_field() {
+    printf '%s\n' "$SUBNET_ROWS" \
+      | awk -F'\t' -v id="$1" -v col="$2" '$1 == id && !found { print $col; found = 1 }'
+  }
+
+  for sid in "${SUBNET_ARGS[@]}"; do
+    vpc="$(subnet_field "$sid" 2)"
+    [ -n "$vpc" ] || die "describe-subnets returned no row for ${sid}"
+    [ "$vpc" = "$VPC_ID" ] || die "subnet ${sid} is in ${vpc}, not VPC_ID ${VPC_ID}"
+  done
+
+  # EKS rejects control planes in these AZ IDs (EKS docs). Names map to IDs per account,
+  # so the template's derived AZ can land on one in us-east-1.
+  EKS_UNSUPPORTED_AZ_IDS="use1-az3 usw1-az2 cac1-az3"
+  # Subnet IDs were validated against SUBNET_RE above, so word-splitting them is safe.
+  CP_AZS=""
+  CP_AZ_COUNT=0
+  CP_AZ_LOG=""
+  for sid in $CP_SUBNETS; do
+    az="$(subnet_field "$sid" 3)"
+    az_id="$(subnet_field "$sid" 4)"
+    case " $EKS_UNSUPPORTED_AZ_IDS " in *" $az_id "*)
+      die "control-plane subnet $sid is in $az ($az_id), which EKS does not support. Delete the stack and recreate it with the parameter EksControlPlaneSecondaryAz set to a supported AZ (or choose a different AZ 2)." ;;
+    esac
+    case " $CP_AZS " in
+      *" $az "*) ;;
+      *) CP_AZS="${CP_AZS:+$CP_AZS }$az"; CP_AZ_COUNT=$((CP_AZ_COUNT + 1)) ;;
+    esac
+    CP_AZ_LOG="${CP_AZ_LOG:+$CP_AZ_LOG, }${sid} ${az} (${az_id})"
+  done
+  [ "$CP_AZ_COUNT" -ge 2 ] || die "EKS control plane subnets span only ${CP_AZS}; EKS needs two AZs"
+
+  NODE_AZS=""
+  NODE_LOG=""
+  for sid in $NODE_SUBNETS; do
+    az="$(subnet_field "$sid" 3)"
+    case " $NODE_AZS " in *" $az "*) ;; *) NODE_AZS="${NODE_AZS:+$NODE_AZS }$az" ;; esac
+    NODE_LOG="${NODE_LOG:+$NODE_LOG, }${sid} (${az})"
+  done
+  if [ -n "$GPU_AZ" ]; then
+    case " $NODE_AZS " in
+      *" $GPU_AZ "*) ;;
+      *) die "no node subnet in GPU_AZ=${GPU_AZ} (node subnets are in ${NODE_AZS})" ;;
+    esac
+  fi
+
+  log "Network: VPC ${VPC_ID}"
+  log "  node subnets: ${NODE_LOG}"
+  log "  control-plane subnets: ${CP_AZ_LOG}"
+else
+  log "Network: no VPC_ID/subnets passed - Terraform reads the Foundation VPC from SSM"
+fi
 
 #-----------------------------------------------------------------------------------
 # 2. Terraform: EKS cluster with a PRE-WARMED GPU node group
@@ -144,16 +309,68 @@ if [ -n "${PARTICIPANT_ROLE_NAME:-}" ]; then
   fi
 fi
 
-# The per-participant data bucket is created by the workshop CloudFormation stack and
-# does not match this module's <project>-<environment>-datasets-<account> naming, so the
-# pod IRSA policy will not cover it unless it is passed in explicitly. Without this the
-# generation pod gets AccessDenied reading the teleoperation dataset the lab points at.
-if [ -n "${DATA_BUCKET:-}" ]; then
-  EXTRA_BUCKETS="[\"${DATA_BUCKET}\"]"
-else
-  EXTRA_BUCKETS="[]"
+# Weights bucket: where section 4 relays CENTRAL_WEIGHTS_S3 to and where the staging Job
+# reads from. Resolved here, before the tfvars, because the pod IRSA policy must grant it.
+# An existing /physical-ai/datasets-bucket parameter (a Foundation account) wins;
+# otherwise the stack's DATA_BUCKET. The SSM read sits inside an `if`, so a missing
+# parameter - the normal case in a workshop account - cannot abort the script under set -e.
+if [ -n "$CENTRAL_WEIGHTS_S3" ]; then
+  if SSM_BUCKET="$(aws ssm get-parameter --name /physical-ai/datasets-bucket \
+       --region "$AWS_REGION_NAME" --query Parameter.Value --output text 2>/dev/null)" \
+     && [ -n "$SSM_BUCKET" ] && [ "$SSM_BUCKET" != None ]; then
+    WEIGHTS_BUCKET="$SSM_BUCKET"
+    WEIGHTS_SOURCE="SSM /physical-ai/datasets-bucket"
+  elif [ -n "$DATA_BUCKET" ]; then
+    WEIGHTS_BUCKET="$DATA_BUCKET"
+    WEIGHTS_SOURCE="DATA_BUCKET"
+  else
+    die "CENTRAL_WEIGHTS_S3 is set but there is no bucket to relay into: /physical-ai/datasets-bucket does not exist and DATA_BUCKET is unset"
+  fi
+  log "Weights bucket: ${WEIGHTS_BUCKET} (source: ${WEIGHTS_SOURCE})"
 fi
+
+# The per-participant data bucket (DATA_BUCKET) is created by the workshop CloudFormation
+# stack and does not match this module's <project>-<environment>-datasets-<account>
+# naming, so the pod IRSA policy grants it explicitly through eks_pod_extra_s3_buckets,
+# together with the weights bucket when that differs. Without this the generation pod
+# gets AccessDenied reading the teleoperation dataset the lab points at.
+EXTRA_BUCKETS_CSV="$DATA_BUCKET"
+if [ -n "$WEIGHTS_BUCKET" ] && [ "$WEIGHTS_BUCKET" != "$DATA_BUCKET" ]; then
+  EXTRA_BUCKETS_CSV="${EXTRA_BUCKETS_CSV:+$EXTRA_BUCKETS_CSV,}${WEIGHTS_BUCKET}"
+fi
+EXTRA_BUCKETS="$(to_hcl_list 'DATA_BUCKET/weights bucket' "$EXTRA_BUCKETS_CSV" \
+  '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')" || exit 1
 log "Pod S3 extra buckets: ${EXTRA_BUCKETS}"
+
+# The Foundation datasets bucket (physical-ai-<ENVIRONMENT>-datasets-<account>) is
+# granted only when DATA_BUCKET is unset, i.e. a manual run without a workshop stack.
+# S3 names are global and that one is predictable, so an account without the bucket
+# should not hand the pod write access to whoever creates it.
+# POD_GRANT_FOUNDATION_BUCKET=true|false overrides the rule.
+if [ -n "$POD_GRANT_FOUNDATION_BUCKET" ]; then
+  POD_FOUNDATION="$POD_GRANT_FOUNDATION_BUCKET"
+  POD_FOUNDATION_WHY="POD_GRANT_FOUNDATION_BUCKET"
+elif [ -n "$DATA_BUCKET" ]; then
+  POD_FOUNDATION=false
+  POD_FOUNDATION_WHY="DATA_BUCKET is set"
+else
+  POD_FOUNDATION=true
+  POD_FOUNDATION_WHY="DATA_BUCKET is unset"
+fi
+# Same rule as the Terraform precondition on the pod policy, checked before publishing.
+if [ "$POD_FOUNDATION" = false ] && [ "$EXTRA_BUCKETS" = "[]" ]; then
+  die "pod S3 policy would grant no bucket: set DATA_BUCKET or POD_GRANT_FOUNDATION_BUCKET=true"
+fi
+log "Pod S3 Foundation datasets bucket grant: ${POD_FOUNDATION} (${POD_FOUNDATION_WHY})"
+
+# Network lists. Computed here, not inside the heredoc: `die` inside $( ) only exits the
+# subshell, so `|| exit 1` stops the script (the cause is already on stderr).
+NODE_SUBNETS_HCL="$(to_hcl_list EKS_NODE_SUBNET_IDS "$EKS_NODE_SUBNET_IDS" \
+  '^subnet-[0-9a-f]{8,17}$')" || exit 1
+CP_SUBNETS_HCL="$(to_hcl_list EKS_CONTROL_PLANE_SUBNET_IDS "$EKS_CONTROL_PLANE_SUBNET_IDS" \
+  '^subnet-[0-9a-f]{8,17}$')" || exit 1
+API_SG_HCL="$(to_hcl_list EKS_API_INGRESS_SG_IDS "$EKS_API_INGRESS_SG_IDS" \
+  '^sg-[0-9a-f]{8,17}$')" || exit 1
 
 cat > terraform.tfvars <<EOF
 aws_region                      = "${AWS_REGION_NAME}"
@@ -166,24 +383,35 @@ eks_gpu_node_desired_size       = ${GPU_DESIRED_SIZE}
 eks_gpu_availability_zone       = "${GPU_AZ}"
 eks_gpu_capacity_reservation_id = "${GPU_CR_ID}"
 # Grants the workstation IAM role EKS cluster-admin. Without an access entry the
-# Helm provider cannot reach the Kubernetes API and even `terraform plan` fails with
+# Helm provider cannot reach the Kubernetes API and even \`terraform plan\` fails with
 # "Kubernetes cluster unreachable".
 eks_admin_principal_arns        = ${ADMIN_ARNS}
 # Read-only access so participants can observe the cluster in the EKS console.
 eks_view_principal_arns         = ${VIEW_ARNS}
 # Grants the generation pod read/write on the CloudFormation-created data bucket.
 eks_pod_extra_s3_buckets        = ${EXTRA_BUCKETS}
+# Image-build CodeBuild projects push to Foundation ECR repos; not used by the workshop.
+# ENABLE_IMAGE_BUILDS defaults to false (event-provision.sh accepts only true or false).
+enable_image_builds                         = ${ENABLE_IMAGE_BUILDS}
+eks_pod_grant_foundation_datasets_bucket    = ${POD_FOUNDATION}
+# Network: the workshop stack's own VPC. Empty values fall back to Foundation SSM.
+vpc_id                                      = "${VPC_ID}"
+private_subnet_ids                          = ${NODE_SUBNETS_HCL}
+eks_control_plane_subnet_ids                = ${CP_SUBNETS_HCL}
+eks_cluster_api_ingress_security_group_ids  = ${API_SG_HCL}
 EOF
 log "Wrote terraform.tfvars"
 cat terraform.tfvars
 
+# Publish BEFORE apply: the cleanup destroy (and the workstation) need these exact values,
+# including the network IDs, even if the apply below fails partway and leaves a cluster
+# in the stack VPC.
+aws s3 cp terraform.tfvars "s3://${STATE_BUCKET}/cosmos-on-aws/eks/terraform.tfvars" \
+  --only-show-errors || die "could not publish terraform.tfvars to s3://${STATE_BUCKET}"
+
 terraform init -input=false -upgrade
 log "Applying Terraform (EKS cluster + GPU node group)"
 terraform apply -input=false -auto-approve
-
-# Publish the tfvars next to the state so the workstation uses identical values.
-aws s3 cp terraform.tfvars "s3://${STATE_BUCKET}/cosmos-on-aws/eks/terraform.tfvars" \
-  --only-show-errors || log "WARNING: could not publish terraform.tfvars"
 
 CLUSTER="$(terraform output -raw eks_cluster_name)"
 IRSA_ROLE="$(terraform output -raw eks_pod_irsa_role_arn)"
@@ -287,28 +515,26 @@ if [ -z "$CENTRAL_WEIGHTS_S3" ] && [ -z "$COSMOS_IMAGE_URI" ]; then
 fi
 
 #-----------------------------------------------------------------------------------
-# 4. Relay weights: central account -> this account's Foundation datasets bucket.
+# 4. Relay weights: central account -> this account's weights bucket (WEIGHTS_BUCKET,
+#    resolved above).
 #
-# The pod reads from the Foundation bucket rather than the central one because the
-# IRSA policy Terraform creates already trusts it - no extra IAM required, and no
-# participant ever needs Hugging Face credentials or a gated-model license.
+# The pod reads from this account's bucket rather than the central one because the pod
+# IRSA policy grants WEIGHTS_BUCKET explicitly through eks_pod_extra_s3_buckets - no
+# cross-account access required, and no participant ever needs Hugging Face credentials
+# or a gated-model license.
 #-----------------------------------------------------------------------------------
-FOUNDATION_BUCKET="$(aws ssm get-parameter --name /physical-ai/datasets-bucket \
-  --region "$AWS_REGION_NAME" --query Parameter.Value --output text)"
-log "Foundation bucket: ${FOUNDATION_BUCKET}"
-
 if [ -n "$CENTRAL_WEIGHTS_S3" ]; then
-  log "Relaying weights from ${CENTRAL_WEIGHTS_S3}"
+  log "Relaying weights from ${CENTRAL_WEIGHTS_S3} to s3://${WEIGHTS_BUCKET}/cosmos3-assets/weights/"
   aws s3 sync "$CENTRAL_WEIGHTS_S3" \
-    "s3://${FOUNDATION_BUCKET}/cosmos3-assets/weights/" --only-show-errors
+    "s3://${WEIGHTS_BUCKET}/cosmos3-assets/weights/" --only-show-errors
 fi
 
 #-----------------------------------------------------------------------------------
 # 5. Staging Job: node-local weight cache + image pre-pull, in one step.
 #
-# hostPath, deliberately not EFS: eks.tf builds the cluster in the Foundation VPC
-# (read from SSM), so the workshop stack's EFS is in a different VPC and unreachable;
-# the cluster also installs ebs-csi but not efs-csi. The GPU node is pre-warmed and
+# hostPath, deliberately not EFS: the cluster runs in the workshop VPC, so the stack's
+# EFS is reachable on the network, but efs-csi is not installed (out of scope; the
+# cluster installs ebs-csi only). The GPU node is pre-warmed and
 # long-lived, so /opt/cosmos3 persists for every pod that lands on it. If the node is
 # ever replaced, re-run this script (or just re-apply the Job).
 #
@@ -349,7 +575,7 @@ spec:
               mkdir -p /models/cosmos3-nano
               if [ -n "${CENTRAL_WEIGHTS_S3}" ]; then
                 echo "Copying weights to node-local disk..."
-                aws s3 sync "s3://${FOUNDATION_BUCKET}/cosmos3-assets/weights/" \
+                aws s3 sync "s3://${WEIGHTS_BUCKET}/cosmos3-assets/weights/" \
                   /models/cosmos3-nano/ --only-show-errors
                 du -sh /models/cosmos3-nano
               fi
