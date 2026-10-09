@@ -7,8 +7,8 @@ version: 0.2
 # Env vars provided by the ContainerBuild construct:
 #   ECR_REPO_URI        - full ECR repo URI (…/physical-ai/gr00t-training)
 #   AWS_DEFAULT_REGION  - build region
-# NOTE: the ECR repo name itself ("groot-training") is unchanged — only the
-# containers/gr00t-training/ source folder was renamed for spelling consistency.
+# NOTE: the CodeBuild project is still named physical-ai-groot-training-build;
+# the ECR repo and source folder use the gr00t spelling.
 
 phases:
   pre_build:
