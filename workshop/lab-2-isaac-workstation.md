@@ -111,7 +111,7 @@ The command outputs:
 The `pai deploy workstation` command wraps:
 
 ```bash
-cd aws-physical-ai-toolchain/cdk
+cd sample-the-physical-ai-toolchain-on-aws/cdk
 
 # Deploy with the wrapper script
 ./deploy-workstation.sh
