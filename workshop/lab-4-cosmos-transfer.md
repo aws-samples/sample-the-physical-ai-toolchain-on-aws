@@ -1,6 +1,9 @@
 # Lab 4: Cosmos Transfer — Photorealistic Data Augmentation
 
 > **Status:** Validated on p5.48xlarge (8x H100 80GB) using the NIM container.
+> Also validated on a single **g6e.4xlarge (1x L40S 48GB)** using the source-built
+> `physical-ai/cosmos-transfer` image instead of the NIM — no P5 and no Capacity
+> Block needed. See [Single-GPU L40S path](#single-gpu-l40s-path-no-p5) below.
 > Geometry preservation works. Color fidelity and framerate matching require tuning.
 > See notes below for known issues and workarounds.
 
@@ -148,7 +151,8 @@ aws ec2 describe-capacity-reservations \
 Once the block is active:
 
 ```bash
-REGION="<your-region>"
+REGION="<your-region>"            # where the Capacity Block / instance is
+SECRETS_REGION="<foundation-region>"  # where the physical-ai/* secrets were created (Lab 0)
 CR_ID="<your-capacity-reservation-id>"
 BLOCK_AZ="<AZ from block output>"
 
@@ -193,7 +197,7 @@ aws ssm send-command --instance-ids $INSTANCE_ID --document-name AWS-RunShellScr
 
 # Login to NGC
 aws ssm send-command --instance-ids $INSTANCE_ID --document-name AWS-RunShellScript \
-  --parameters '{"commands":["aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key --region us-east-1 --query SecretString --output text | docker login nvcr.io --username \\$oauthtoken --password-stdin"]}' \
+  --parameters '{"commands":["aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key --region '"$SECRETS_REGION"' --query SecretString --output text | docker login nvcr.io --username \\$oauthtoken --password-stdin"]}' \
   --region $REGION
 
 # Pull the Transfer NIM (~20 min, 56 GB)
@@ -203,7 +207,7 @@ aws ssm send-command --instance-ids $INSTANCE_ID --document-name AWS-RunShellScr
 
 # Start the NIM (auto-selects H100 profile)
 aws ssm send-command --instance-ids $INSTANCE_ID --document-name AWS-RunShellScript \
-  --parameters '{"commands":["NGC_KEY=$(aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key --region us-east-1 --query SecretString --output text) && HF_TOKEN=$(aws secretsmanager get-secret-value --secret-id physical-ai/hf-token --region us-east-1 --query SecretString --output text) && docker run -d --name cosmos-transfer-nim --gpus all --ipc=host --shm-size=64g -p 8000:8000 -e NGC_API_KEY=$NGC_KEY -e HF_TOKEN=$HF_TOKEN nvcr.io/nim/nvidia/cosmos-transfer2.5-2b:latest"]}' \
+  --parameters '{"commands":["NGC_KEY=$(aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key --region '"$SECRETS_REGION"' --query SecretString --output text) && HF_TOKEN=$(aws secretsmanager get-secret-value --secret-id physical-ai/hf-token --region '"$SECRETS_REGION"' --query SecretString --output text) && docker run -d --name cosmos-transfer-nim --gpus all --ipc=host --shm-size=64g -p 8000:8000 -e NGC_API_KEY=$NGC_KEY -e HF_TOKEN=$HF_TOKEN nvcr.io/nim/nvidia/cosmos-transfer2.5-2b:latest"]}' \
   --region $REGION
 ```
 
@@ -224,7 +228,7 @@ Server is ready when it returns HTTP 200.
 ```bash
 # Copy a wrist camera clip from your Lab 1 dataset (must be 93-480 frames)
 aws ssm send-command --instance-ids $INSTANCE_ID --document-name AWS-RunShellScript \
-  --parameters '{"commands":["aws s3 cp s3://<BUCKET>/groot-data/ur3/dataset/videos/chunk-000/observation.images.wrist/episode_000009.mp4 /tmp/input_video.mp4 --region us-east-1"]}' \
+  --parameters '{"commands":["aws s3 cp s3://<BUCKET>/groot-data/ur3/dataset/videos/chunk-000/observation.images.wrist/episode_000009.mp4 /tmp/input_video.mp4 --region '"$REGION"'"]}' \
   --region $REGION
 ```
 
@@ -253,7 +257,7 @@ Upload the result to S3, then download both original and restyled:
 
 ```bash
 aws ssm send-command --instance-ids $INSTANCE_ID --document-name AWS-RunShellScript \
-  --parameters '{"commands":["aws s3 cp /tmp/transfer_output.mp4 s3://<BUCKET>/cosmos-samples/transfer_result.mp4 --region us-east-1"]}' \
+  --parameters '{"commands":["aws s3 cp /tmp/transfer_output.mp4 s3://<BUCKET>/cosmos-samples/transfer_result.mp4 --region '"$REGION"'"]}' \
   --region $REGION
 
 # Download to your laptop
@@ -274,6 +278,54 @@ aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION
 ```
 
 The Capacity Block fee is already paid regardless.
+
+---
+
+## Single-GPU L40S Path (no P5)
+
+The NIM auto-selects an H100 profile, so on L40S use the **source-built image**
+(`physical-ai/cosmos-transfer`, built by `containers/cosmos/buildspec.yml`) and its
+`examples/inference.py` entrypoint directly. Validated end-to-end on one
+`g6e.4xlarge`: 93 frames at 640x480 took **~9.5 min** of diffusion at 35 steps and
+peaked at **43.9 GB of the 46 GB** of L40S VRAM — it fits, but only with
+`--offload-guardrail-models` to keep the guardrail models (Cosmos-Guardrail1 +
+Cosmos-Reason1-7B) on the CPU. Guardrails stay enabled.
+
+```bash
+# Input must be 93-480 frames. Trim one chunk out of a longer episode:
+ffmpeg -y -i episode_000009.mp4 -frames:v 93 -c:v libx264 -crf 18 in/ur3_input.mp4
+
+# Parameter file. Note the control lives under a per-modality key ("edge", "depth",
+# "seg" or "blur") and "name" is required — a flat "control" key is rejected.
+cat > in/ur3_edge_spec.json <<'JSON'
+{
+  "name": "ur3_factory_edge",
+  "prompt": "A UR3 robot arm with a Robotiq gripper performs a pick-and-place on a workbench inside a busy industrial factory. The table is scratched brushed metal under harsh overhead fluorescent lighting. Photorealistic, sharp focus. Top-down wrist camera view.",
+  "video_path": "/workspace/in/ur3_input.mp4",
+  "num_steps": 35,
+  "guidance": 3,
+  "seed": 100,
+  "resolution": "720",
+  "edge": {"control_weight": 1.0, "preset_edge_threshold": "medium"}
+}
+JSON
+
+HF_TOKEN=$(aws secretsmanager get-secret-value --secret-id physical-ai/hf-token \
+  --region $REGION --query SecretString --output text)
+docker run --rm --gpus all --ipc=host --shm-size=32g \
+  -e HF_TOKEN="$HF_TOKEN" -e HF_HOME=/workspace/hf-cache \
+  -v /opt/hf-cache:/workspace/hf-cache \
+  -v $PWD/in:/workspace/in -v $PWD/out:/workspace/out \
+  <ACCOUNT>.dkr.ecr.$REGION.amazonaws.com/physical-ai/cosmos-transfer:latest \
+  bash -c 'python /workspace/examples/inference.py \
+    -i /workspace/in/ur3_edge_spec.json -o /workspace/out \
+    --model edge --offload-guardrail-models'
+```
+
+Outputs land in `out/` as `<name>.mp4` plus `<name>_control_edge.mp4` (the Canny edge
+map the model was conditioned on — useful for verifying geometry preservation).
+`keep_input_resolution` defaults to `true`, so the result comes back at the input's
+resolution and frame count, which is what keeps your action labels aligned.
 
 ---
 
