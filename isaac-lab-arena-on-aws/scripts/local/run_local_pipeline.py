@@ -518,11 +518,10 @@ def main():
         actual_module = Path(vla_pipeline.__file__).resolve()
         if not actual_module.is_relative_to(component):
             raise RuntimeError(f"Wrong package imported: {actual_module}")
-        commit = git(component, "rev-parse", "HEAD")
+        from vla_pipeline.source import identity as runtime_source_identity
+        commit = runtime_source_identity(component.parent)
         if commit != args.expected_commit:
             raise RuntimeError(f"Unexpected canonical commit {commit}")
-        if git(component, "status", "--porcelain", "--untracked-files=no"):
-            raise RuntimeError("Canonical tracked files have local changes")
         versions = {name: importlib.metadata.version(name)
                     for name in ("sagemaker", "boto3", "botocore", "docker")}
         if versions["sagemaker"] != "2.257.6" or versions["boto3"] != "1.43.73":

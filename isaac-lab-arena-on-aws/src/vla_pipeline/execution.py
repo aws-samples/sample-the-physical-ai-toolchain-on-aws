@@ -17,16 +17,14 @@ from urllib.parse import urlparse
 
 from .deployment import aws_session, discover, image_digest, local_instance
 from .operations import OperationBusy, Store, new_run_id, timestamp, validate_name, write_json
+from .cli_context import command_name
 
 COMPONENT = Path(__file__).resolve().parents[2]
 
 
 def source_identity():
-    def git(*args):
-        return subprocess.check_output(["git", "-C", str(COMPONENT), *args], text=True).strip()
-    if git("status", "--porcelain", "--untracked-files=normal", "--", "."):
-        raise ValueError("Commit the component's changes before launching; source must be clean")
-    return git("rev-parse", "HEAD")
+    from .source import identity
+    return identity()
 
 
 def prepare(request, deployment, check_remote=True):
@@ -45,7 +43,7 @@ def prepare(request, deployment, check_remote=True):
                                   "instance_id", "host_region") if not local.get(key)]
         if missing:
             raise ValueError("Local deployment lacks " + ", ".join(missing)
-                             + "; select these with vla deploy --use-existing")
+                             + f"; select these with {command_name()} deploy --use-existing")
         if check_remote and sys.platform == "linux":
             try:
                 identity = local_instance()
@@ -57,7 +55,7 @@ def prepare(request, deployment, check_remote=True):
             request["transport"] = "ssm"
         elif check_remote and not on_host:
             raise ValueError("Run this command on the selected EC2 host, or prepare it with "
-                             "vla deploy --prepare-host for remote execution")
+                             f"{command_name()} deploy --prepare-host for remote execution")
         else:
             request.pop("transport", None)
         request["local_target"] = dict(local)
@@ -97,7 +95,7 @@ def prepare(request, deployment, check_remote=True):
     for step, parameter in (("FineTune", "TrainImageUri"), ("SimEval", "EvalImageUri")):
         if step in request["steps"]:
             if step not in images:
-                raise ValueError(f"No {step} image selected for {request['cell']}; use vla deploy")
+                raise ValueError(f"No {step} image selected for {request['cell']}; use {command_name()} deploy")
             if check_remote:
                 images[step] = image_digest(session, images[step])
             else:
@@ -105,7 +103,7 @@ def prepare(request, deployment, check_remote=True):
                 ref = parse_ecr_reference(images[step])
                 if not ref.account or ref.region != "us-east-1" or not ref.digest:
                     raise ValueError("Offline plans require full us-east-1 ECR digest URIs; "
-                                     "select images with vla deploy")
+                                     f"select images with {command_name()} deploy")
             params[parameter] = images[step]
     if check_remote and "SimEval" in request["steps"]:
         spec = resolve(request["selection"]["model"], request["selection"]["simulator"])
@@ -162,7 +160,26 @@ def submit(request, deployment, store, run_id=None):
               "component": str(COMPONENT), "source_commit": commit,
               "request": request, "group": request.get("group"),
               "status": "Submitting", "created_at": timestamp()}
-    directory = store.create_run(record)
+    from .cli_settings import configuration_receipt
+    record["configuration_receipt"] = configuration_receipt(request)
+    if deployment.get("lifecycle"):
+        with store.lock("deployments", deployment["id"], wait=True):
+            current_deployment = store.load("deployments", deployment["id"])
+            if current_deployment["status"] != "Ready":
+                raise ValueError("The deployment is no longer Ready; no new run was submitted")
+            directory = store.create_run(record)
+            current_deployment.setdefault("run_ids", []).append(run_id)
+            store.save("deployments", current_deployment)
+            # Teardown takes this same lock. Keep it until the external
+            # submission response (or its recovery receipt) has been saved.
+            return _submit_record(request, current_deployment, record, directory, store)
+    else:
+        directory = store.create_run(record)
+    return _submit_record(request, deployment, record, directory, store)
+
+
+def _submit_record(request, deployment, record, directory, store):
+    run_id = record["id"]
     if request.get("transport") == "ssm":
         try:
             from .remote_execution import exchange
@@ -201,7 +218,7 @@ def submit_local(request, deployment, record, directory):
     local = deployment.get("local", {})
     for name in ("development_bucket", "expected_role", "scratch_root"):
         if not local.get(name):
-            raise ValueError(f"Local deployment lacks {name}; select it with vla deploy --use-existing")
+            raise ValueError(f"Local deployment lacks {name}; select it with {command_name()} deploy --use-existing")
     if sys.platform != "linux":
         raise ValueError("The local worker must execute on its selected EC2 host")
     request_path = directory / "request.json"
@@ -238,6 +255,20 @@ def submit_managed(request, deployment, record, directory, store):
     session = aws_session(deployment.get("profile"), deployment["region"])
     cfg = dataclasses.replace(discover(session, deployment["project"]),
                               pipeline_name=f"vla-{record['id']}")
+    sm = session.client("sagemaker")
+    owned = bool(deployment.get("lifecycle"))
+    if owned:
+        # A native run gets a new pipeline. Never update a similarly named
+        # pipeline belonging to another machine or deployment.
+        existing = [row for page in sm.get_paginator("list_pipelines").paginate(
+            PipelineNamePrefix=cfg.pipeline_name) for row in page["PipelineSummaries"]
+                    if row["PipelineName"] == cfg.pipeline_name]
+        if existing:
+            raise ValueError("A pipeline already uses this run ID. Choose another --run-id; it was not changed.")
+        record["resource_owner_token"] = uuid.uuid4().hex
+        record["pipeline_name"] = cfg.pipeline_name
+        store.save("runs", record)
+    tags = [{"Key": "pai-arena-owner", "Value": record["resource_owner_token"]}] if owned else []
     # Existing upload helpers use boto3.client; bind them to this explicit session.
     previous = boto3.DEFAULT_SESSION
     boto3.DEFAULT_SESSION = session
@@ -259,7 +290,6 @@ def submit_managed(request, deployment, record, directory, store):
             validate_code_uri=validate_uri, checkpoint_s3_uri=request.get("checkpoint_s3"),
             through=request["steps"][-1],
         )
-        sm = session.client("sagemaker")
         if "RegisterModel" in request["steps"]:
             group = request["parameters"]["ModelPackageGroupName"]
             try:
@@ -273,7 +303,15 @@ def submit_managed(request, deployment, record, directory, store):
                     and "does not exist" not in error["Message"].lower()
                 ):
                     raise
-                sm.create_model_package_group(ModelPackageGroupName=group)
+                if owned:
+                    record["created_model_group"] = {
+                        "name": group, "creation_requested": True, "confirmed": False,
+                        "arn": f"arn:aws:sagemaker:{record['region']}:{record['account_id']}:model-package-group/{group}"}
+                    store.save("runs", record)
+                sm.create_model_package_group(ModelPackageGroupName=group, **({"Tags": tags} if owned else {}))
+                if owned:
+                    record["created_model_group"]["confirmed"] = True
+                    store.save("runs", record)
         params = dict(request["parameters"])
         if "SimEval" in request["steps"]:
             params["EvalSourceDirUri"] = source_uri
@@ -286,7 +324,14 @@ def submit_managed(request, deployment, record, directory, store):
         missing = {p.name for p in pipeline.parameters if p.default_value is None} - params.keys()
         if missing:
             raise ValueError(f"Resolved request lacks required pipeline parameters: {sorted(missing)}")
-        version = upsert_versioned(pipeline, cfg.role_arn)
+        if owned:
+            record["pipeline_creation_requested"] = True
+            store.save("runs", record)
+            version = pipeline.create(role_arn=cfg.role_arn, tags=tags)
+            if "PipelineVersionId" not in version:
+                version = pipeline.update(role_arn=cfg.role_arn)
+        else:
+            version = upsert_versioned(pipeline, cfg.role_arn)
         values = [{"Name": key, "Value": str(value)} for key, value in params.items()]
         write_json(directory / "submitted-parameters.json", values)
         record.update(pipeline_name=cfg.pipeline_name, pipeline_version=version["PipelineVersionId"],
@@ -443,6 +488,11 @@ def observe(record, store=None):
                 and set(proof.get("pipeline_steps", {})) == set(record["request"]["steps"])
             )
             result["verification_scope"] = proof.get("verification_scope")
+            if proof.get("contract_checks"):
+                result["contract_checks"] = proof["contract_checks"]
+                if proof["contract_checks"]["status"] != "passed":
+                    result.update(independently_verified=False, status="VerificationFailed",
+                                  failure_reason="Named pipeline checks failed; inspect contract-checks.json")
             result["outputs"] = proof.get("outputs") or state.get("outputs", {})
             for key in ("episodes", "success_rate"):
                 if key in proof:
@@ -560,12 +610,18 @@ def refresh(record, store, *, verify=False):
                     else:
                         log = store.path("runs", record["id"]).parent / "verification.log"
                         with log.open("a") as stream:
+                            attempt_start = stream.tell()
                             completed = subprocess.run([
                                 sys.executable, str(COMPONENT / "scripts/local/verify_run.py"),
                                 "--run-dir", state["run_dir"],
                             ], stdout=stream, stderr=subprocess.STDOUT)
                         if completed.returncode:
-                            raise ValueError(f"Independent verification failed; inspect {log}")
+                            with log.open("rb") as stream:
+                                stream.seek(max(attempt_start, log.stat().st_size - 4000))
+                                detail = stream.read(4000).decode(errors="replace").strip()
+                            raise ValueError(
+                                f"Independent verification exited {completed.returncode}: "
+                                f"{detail or 'No diagnostic output was written.'}\nFull log: {log}")
                         state = observe(state, store=store)
                         if not state.get("independently_verified"):
                             raise ValueError("Independent verification did not establish the requested result")
@@ -631,7 +687,8 @@ def stop(record, store=None):
         record = store.load("runs", record["id"])
         if record["mode"] == "local":
             require_execution_host(record)
-            subprocess.run(["sudo", "systemctl", "stop", f"vla-local-{validate_name(record['id'])}"], check=True)
+            from .cleanup import _stop_local_service
+            _stop_local_service(f"vla-local-{validate_name(record['id'])}", 120)
         else:
             if not record.get("execution_arn"):
                 raise ValueError("No recorded execution ARN; reconcile the submission before cancelling")

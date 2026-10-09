@@ -5,6 +5,7 @@ This module is offline: no SageMaker imports, credential lookup or AWS calls.
 from __future__ import annotations
 
 import json
+import copy
 import math
 import re
 import sys
@@ -20,6 +21,7 @@ from .registry import (
     select_volume_gb,
 )
 from .workflow import selected_steps
+from .cli_context import command_name
 
 GPU_STEPS = ("FineTune", "SimEval")
 
@@ -55,19 +57,31 @@ def selected_cell(args):
         if explicit == (cell["model"], cell["version"], cell["simulator"], cell["suite"]):
             return name, cell
     raise ValueError(
-        "This selection is not exposed by the current frontend. Run 'vla cells' for "
+        f"This selection is not exposed by the current frontend. Run '{command_name()} cells' for "
         "available choices; the README lists additional legacy backend workflows."
     )
 
 
 def resolve_run(args):
+    args = copy.copy(args)
     name, cell = selected_cell(args)
     through = args.through or ("RegisterModel" if args.mode == "managed" else "SuccessGate")
     if args.mode == "local" and through == "RegisterModel":
         raise ValueError("RegisterModel requires managed execution")
     steps = selected_steps(through, checkpoint=bool(args.checkpoint_s3))
+    if getattr(args, "sample", False):
+        for step, field, value in (("FineTune", "train_steps", 200),
+                                   ("SimEval", "eval_trials", 3),
+                                   ("SuccessGate", "threshold", 0.0)):
+            if step in steps and getattr(args, field) is None:
+                setattr(args, field, value)
     if args.mode == "local" and not cell["local_profile"]:
         raise ValueError(f"{name} currently supports managed execution only")
+    recording = getattr(args, "record_video", False)
+    if recording == "auto":
+        recording = cell["simulator"] == "isaac_arena" and "SimEval" in steps
+    if recording and (cell["simulator"] != "isaac_arena" or "SimEval" not in steps):
+        raise ValueError("--record-video requires an Arena run that includes SimEval")
     instances = assignments(args.instance, "--instance")
     volumes = assignments(args.volume_gb, "--volume-gb", int)
     images = assignments(args.image, "--image")
@@ -86,7 +100,7 @@ def resolve_run(args):
                        if step in steps and step not in instances)
     if missing:
         raise ValueError("Required launch choices: " + ", ".join(missing)
-                         + ". See vla run --help and vla cells --details.")
+                         + f". See {command_name()} run --help and {command_name()} cells --details.")
     if "FineTune" not in steps and (args.train_steps is not None or args.save_steps is not None):
         raise ValueError("A supplied checkpoint omits training; omit training-only arguments")
     if "SimEval" not in steps and (args.eval_trials is not None or args.eval_seed is not None):
@@ -124,7 +138,8 @@ def resolve_run(args):
         unknown = set(instances.values()) - set(accepted)
         if unknown:
             raise ValueError("The installed SageMaker API does not accept these training instances: "
-                             + ", ".join(sorted(unknown)) + ". See vla cells --details for recommendations.")
+                             + ", ".join(sorted(unknown))
+                             + f". See {command_name()} cells --details for recommendations.")
     if getattr(args, "group", None):
         from .operations import validate_name
         validate_name(args.group)
@@ -176,6 +191,8 @@ def resolve_run(args):
     if cell["simulator"] == "isaac_arena":
         knobs = resolve_runtime(suite, cell["model"], cell["version"])
         params["EvalSimConfig"] = json.dumps(knobs, sort_keys=True)
+        if recording:
+            params["EvalRecordVideo"] = "true"
         for field, key in (
             ("ExpectedEmbodimentTag", "embodiment_tag"), ("ExpectedArenaObject", "object"),
             ("ExpectedArenaEmbodiment", "arena_embodiment"), ("ExpectedPolicyConfig", "policy_config_yaml"),
@@ -203,7 +220,8 @@ def resolve_run(args):
     return {"schema_version": 1, "cell": name, "selection": cell, "mode": args.mode,
             "steps": steps, "parameters": params, "image_overrides": images,
             "checkpoint_s3": args.checkpoint_s3, "local_limits": local_limits,
-            "group": getattr(args, "group", None)}
+            "group": getattr(args, "group", None), "sample": bool(getattr(args, "sample", False)),
+            "configuration": getattr(args, "configuration", {})}
 
 
 def local_parameters(request, declarations):

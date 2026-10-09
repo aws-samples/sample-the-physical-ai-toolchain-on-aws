@@ -97,3 +97,9 @@ variable "dlc_account_id" {
   type        = string
   default     = "763104351884"
 }
+
+variable "sklearn_account_id" {
+  description = "AWS account hosting the SageMaker scikit-learn image used by Validate and the plumbing jobs in us-east-1. This registry differs from the PyTorch DLC registry."
+  type        = string
+  default     = "683313688378"
+}

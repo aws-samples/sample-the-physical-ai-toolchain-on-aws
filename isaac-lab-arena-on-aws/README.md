@@ -2,12 +2,32 @@
 
 Fine-tune a vision-language-action (VLA) model, run it in simulation, check the
 checkpoint and evaluation evidence, and register the result in SageMaker.
-The same `vla` commands run this pipeline on **managed SageMaker** or in
+The same `pai arena` commands run this pipeline on **managed SageMaker** or in
 **SageMaker local mode on your EC2 GPU host**.
+The `vla` compatibility command uses the same backend and saved records;
+existing scripts and the supplementary examples using it continue to work.
 
 The main walkthrough uses **GR00T N1.6 with Isaac Lab Arena**: a GR1 humanoid
 places an item in a fridge and closes the door. Additional cells pair GR00T,
 OpenVLA and MolmoAct2 with LIBERO.
+
+**Start with [notebooks/runbook.ipynb](notebooks/runbook.ipynb).** Edit the `arena`
+section of [`config.json` at the repository root](../config.json), then run its
+cells from setup through teardown. It uses the same `pai arena` commands shown
+below and displays the actual results and, for Arena, the run's recorded video.
+Use a CPU SageMaker AI notebook instance (`notebook-al2023-v1`, `ml.t3.xlarge`,
+150 GiB volume) so the client tools and retained evidence stay in AWS. Clone
+onto its data volume, configure the account and token-file paths, and choose
+Run All. The notebook installs missing client tools without sudo and creates
+its virtual environment. Training and evaluation run on the separate GPU EC2
+host and SageMaker jobs. The supplied notebook remains available for viewing
+results after application teardown; stop that notebook instance when finished.
+
+The bootstrap supports Linux x86_64. A Studio JupyterLab environment can use the
+same setup, but acceptance records name the exact environment actually tested.
+Other clients can run the notebook with the documented tools already installed.
+The committed notebook has no saved execution outputs; see the run's executed
+copy before claiming an end-to-end pass.
 
 - [Pipeline overview](#pipeline-overview)
 - [1. Setting up and running](#1-setting-up-and-running)
@@ -125,17 +145,29 @@ and Arena; the cell table above lists the other choices.
 Start with the [AWS Physical AI Toolchain setup](../README.md#prerequisites)
 and its complete local checkout. Run the commands below on a laptop or other
 **provisioning machine**; it needs no GPU. Arena's requirements are listed below.
-`vla deploy` creates Foundation resources, application buckets and images if
+`pai arena deploy` creates Foundation resources, application buckets and images if
 you are starting with a new account.
 
 | Requirement | What to prepare |
 | --- | --- |
-| Tools | Bash, Git, **Python 3.10–3.12**, AWS CLI v2, **Terraform ≥1.9**, and outbound HTTPS. Use their supported platform installers. |
+| Tools | Bash, Git, **Python 3.11–3.12 for the shared CLI**, AWS CLI v2, **Terraform ≥1.9**, and outbound HTTPS. See the toolchain's [Python setup](../README.md#python-environment). The separate EC2 worker also supports Python 3.10. |
 | Target AWS account | A working provisioning/admin profile able to create infrastructure and grant the runtime roles access. Application deployment is supported in **us-east-1 only**. |
-| Hugging Face token | A read token from [HF settings](https://huggingface.co/settings/tokens), with the [GR00T N1.6 model terms](https://huggingface.co/nvidia/GR00T-N1.6-3B) accepted and access to the [Arena dataset](#prerequisite--huggingface-token-required-for-every-gr00t-run). Store it as `vla-pipeline/hf-token` in target Secrets Manager. |
-| NVIDIA NGC key | A personal key with NGC Catalog access from [NGC API Keys](https://org.ngc.nvidia.com/setup/api-keys), with the required NVIDIA terms accepted. Store it as `vla-pipeline/ngc-token` in target Secrets Manager. |
+| Hugging Face token | A read token from [HF settings](https://huggingface.co/settings/tokens), with the [GR00T N1.6 model terms](https://huggingface.co/nvidia/GR00T-N1.6-3B) accepted and access to the [Arena dataset](#prerequisite--huggingface-token-required-for-every-gr00t-run). Keep it in a private file outside the repository and set `arena.hf_token_file`. |
+| NVIDIA NGC key | A personal key with NGC Catalog access from [NGC API Keys](https://org.ngc.nvidia.com/setup/api-keys), with the required NVIDIA terms accepted. Keep it in a private file outside the repository and set `arena.ngc_token_file`. |
 | Managed execution | SageMaker **Training** GPU quota for both GPU steps, plus CPU Processing quota for Validate. Quota does not guarantee capacity. |
-| Local execution | A running GPU host, NVIDIA drivers, SSM agent, AWS CLI, outbound access and separate mounted scratch storage. Automated preparation supports x86-64 Ubuntu 22.04. See the host setup note below. |
+| Local execution | Use `deploy --create-local-host g6e.8xlarge` to create the GPU EC2 host and prepare it. A supplied host is also supported. Training and evaluation run on that host, not on the machine running the notebook. |
+
+The shared configuration requires the target `account_id`, token-file paths and,
+when using named credentials, `profile`. Defaults select the region, deployment
+name, cells, instances and runtime. Explicit flags override those defaults.
+The CLI checks the real AWS account before provisioning and creates the missing
+deployment-specific Secrets Manager entries from those files. It does not request
+quota increases. NGC registry authentication is checked by CodeBuild; selected
+GR00T model and dataset access is checked before builds start.
+
+The token commands below are an alternative for administrators supplying existing
+Secrets Manager entries. With token files configured, `pai arena deploy` handles
+their creation; do not also create duplicate entries manually.
 
 In a Bash shell, choose the **target** profile and check the account before
 creating anything. Use a Python executable in the supported range if your
@@ -185,17 +217,13 @@ Terraform grants consuming roles access but does not obtain token values.
 [Detailed token setup and errors](#provision-and-check-both-tokens-before-infrastructure)
 are covered later.
 
-**For local execution:** if you do not have a GPU host, install the application
-below and run the first command under [Deploy once](#deploy-once). Its Foundation
-provides the networking used by the [new-host recipe](#select-and-launch-a-new-host).
-Then follow the [manual selection](#select-the-deployment-and-check-identity)
-and [host setup](#prepare-the-ec2-host-and-aws-resources), including that launch
-recipe, before adding the host with `deploy --prepare-host`. Skip the manual
-Terraform and image builds: the CLI deployment already owns those resources.
-The CLI prepares a supplied instance; it does not acquire GPU capacity or
-format/resize disks. A supplied host can be in another region (us-east-2 has
-been used), while S3, ECR, secrets and SageMaker remain in us-east-1.
-Cross-region transfers can incur charges.
+**For local execution:** `--create-local-host` uses the existing GPU DLAMI and
+Terraform host recipe, with no separate CPU controller. Alternatively,
+`--local-host` prepares a running instance you supply; its ownership stays with
+you. A supplied host can be in another region (us-east-2 has been used), while
+S3, ECR, secrets and SageMaker remain in us-east-1. Cross-region transfers can
+incur charges. [Manual host setup](#prepare-the-ec2-host-and-aws-resources)
+remains available for that supplied-host path.
 
 ### Install and discover
 
@@ -203,21 +231,27 @@ From the root of your existing toolchain checkout:
 
 ```bash
 cd isaac-lab-arena-on-aws
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
-vla --help
-vla cells
-vla cells --details
+python -m pip install -e .. -e .
+pai arena --help
+pai arena cells
+pai arena cells --details
 ```
 
-Discovery is offline: it needs no deployment or GPU. `vla cells --details`
+This installs both the parent toolchain CLI and the Arena backend in one
+environment. Arena reads the root configuration's `arena` section; other
+components' settings remain independent. Reconnecting uses the saved
+deployment's account, region and images.
+
+Discovery is offline: it needs no deployment or GPU. `pai arena cells --details`
 shows declared instances, disk sizes and episode counts, not measured minimum
-requirements. `vla run --help` and `vla deploy --help` list their arguments.
+requirements. `pai arena run --help` and `pai arena deploy --help` list their arguments.
 
 All following commands run **from this component directory on the provisioning
-machine**, with its virtual environment active. Keep the clone at a clean,
-committed revision. After reconnecting, return here and run
+machine**, with its virtual environment active. Keep runtime/build inputs at a
+clean, committed revision. Notebook outputs and the root configuration may
+change; resolved configuration is recorded with each run. After reconnecting, return here and run
 `source .venv/bin/activate`; restore `TARGET_PROFILE` when a command needs it.
 Saved deployment records retain the selected profile, images and host.
 
@@ -237,36 +271,66 @@ Create Foundation and Arena infrastructure, build the required images and
 save their immutable digests. No training starts during deployment:
 
 ```bash
-vla deploy --name arena-review --profile "$TARGET_PROFILE" --region us-east-1 \
-  --cell gr00t-n16-arena --yes
+pai arena deploy --create-local-host g6e.8xlarge --yes
+pai arena status arena-notebook
 ```
 
-**For local execution as well**, use this alternative instead, with the host
-from setup. Replace `INSTANCE_ID` and `HOST_REGION` with its actual values:
+These commands use `arena.deployment_name` (default `arena-notebook`), credentials,
+token files and `prepare_cells` from `config.json`. Use the configured name in
+`status`. Cold setup takes hours: a recorded Arena-only setup took 2h11m;
+building all families adds work. Shared images are built once. Status checks
+published images, the GPU host and current disk reserves before training.
 
-```bash
-vla deploy --name arena-review --profile "$TARGET_PROFILE" --region us-east-1 \
-  --cell gr00t-n16-arena \
-  --local-host INSTANCE_ID --host-region HOST_REGION \
-  --scratch-root /opt/dlami/nvme/vla-tests --yes
-```
+For managed-only use, omit `--create-local-host`. For a supplied host, replace it
+with `--local-host INSTANCE_ID --host-region HOST_REGION`; that host will not be
+deleted by deployment teardown.
 
 Choose one deployment command and wait for `Ready`. If preparation is
 interrupted, continue the same operation with
-`vla deploy --name arena-review --resume --yes`.
+`pai arena deploy --resume --yes`.
 If infrastructure/images already exist, follow
 [reuse an existing deployment](#reuse-an-existing-deployment-or-host) instead.
+
+With the shared configuration set, the ordinary short-run commands are:
+
+```bash
+pai arena run --cell gr00t-n16-arena --mode local --sample --run-id my-local-sample --wait
+pai arena report my-local-sample --output-dir local-dev/my-local-sample --include-video
+pai arena run --cell gr00t-n16-arena --mode managed --sample --run-id my-managed-sample \
+  --instance FineTune=ml.g6e.12xlarge --instance SimEval=ml.g6e.12xlarge --wait
+pai arena report my-managed-sample --output-dir local-dev/my-managed-sample --include-video
+```
+
+`--sample` supplies 200 training steps, three trials and threshold zero.
+Explicit budgets override those values. It runs the full graph unless you
+explicitly provide a checkpoint or a stopping step. The longer examples below
+show every choice explicitly; replace `arena-review` with your saved deployment.
+
+After inspecting the results, preserve the evidence and remove owned resources:
+
+```bash
+pai arena destroy arena-notebook --remove-evidence --yes
+pai arena status arena-notebook
+```
+
+Destroy includes all recorded runs under that deployment, including optional
+experiments. Verified evidence is retained locally before its temporary AWS
+archive is removed. Supplied hosts, shared image repositories and pre-existing
+model package groups retain their original ownership. A model package group
+created here is also retained if another execution has added packages to it.
+SageMaker job history and shared TrainingJobs/ProcessingJobs log groups remain;
+stopping jobs and removing their pipeline does not erase that history.
 
 #### Run the full pipeline on managed SageMaker
 
 Submit FineTune → SimEval → Validate → SuccessGate → RegisterModel:
 
 ```bash
-vla run --deployment arena-review --mode managed --cell gr00t-n16-arena \
+pai arena run --deployment arena-review --mode managed --cell gr00t-n16-arena \
   --instance FineTune=ml.g6e.8xlarge --instance SimEval=ml.g6e.8xlarge \
   --train-steps 200 --eval-trials 3 --eval-seed 100 --threshold 0 \
   --max-runtime-seconds 21600 --run-id arena-managed-01
-vla status arena-managed-01 --follow
+pai arena status arena-managed-01 --follow
 ```
 
 The result is checked evidence and a model package in PendingManualApproval.
@@ -278,10 +342,10 @@ After host preparation, submit FineTune → SimEval → Validate → SuccessGate
 from the same provisioning machine:
 
 ```bash
-vla run --deployment arena-review --mode local --cell gr00t-n16-arena \
+pai arena run --deployment arena-review --mode local --cell gr00t-n16-arena \
   --train-steps 200 --eval-trials 3 --eval-seed 100 --threshold 0 \
   --max-runtime-seconds 21600 --run-id arena-local-01
-vla status arena-local-01 --follow
+pai arena status arena-local-01 --follow
 ```
 
 The result is verified development evidence in S3 and saved run diagnostics.
@@ -292,10 +356,10 @@ The host runs the containers; your laptop follows them through SSM.
 Produce a checkpoint on the prepared host without running simulation:
 
 ```bash
-vla run --deployment arena-review --mode local --cell gr00t-n16-arena \
+pai arena run --deployment arena-review --mode local --cell gr00t-n16-arena \
   --through FineTune --train-steps 200 --max-runtime-seconds 21600 \
   --run-id arena-train-01
-vla status arena-train-01 --follow
+pai arena status arena-train-01 --follow
 ```
 
 The status output and saved `job-outputs.json` identify the checkpoint URI
@@ -307,11 +371,11 @@ Skip training and run SimEval → Validate → SuccessGate on EC2. Replace the S
 URI with the compatible checkpoint produced above:
 
 ```bash
-vla run --deployment arena-review --mode local --cell gr00t-n16-arena \
+pai arena run --deployment arena-review --mode local --cell gr00t-n16-arena \
   --checkpoint-s3 s3://YOUR_VERSIONED_BUCKET/path/model.tar.gz \
   --eval-trials 3 --eval-seed 100 --threshold 0 --max-runtime-seconds 21600 \
   --run-id arena-checkpoint-01
-vla status arena-checkpoint-01 --follow
+pai arena status arena-checkpoint-01 --follow
 ```
 
 For the managed equivalent, use `--mode managed` and add
@@ -324,20 +388,26 @@ all supported stopping points and checkpoint requirements.
 
 | Task | Command |
 | --- | --- |
-| List saved operations | `vla status` |
-| Reconnect to the same local run | `vla status arena-local-01 --follow` |
-| Follow deployment preparation | `vla status arena-review --follow` |
-| Resume interrupted deployment | `vla deploy --name arena-review --resume --yes` |
-| Cancel a managed execution | `vla stop arena-managed-01` |
+| List saved operations | `pai arena status` |
+| Reconnect to the same local run | `pai arena status arena-local-01 --follow` |
+| Follow deployment preparation | `pai arena status arena-review --follow` |
+| Resume interrupted deployment | `pai arena deploy --name arena-review --resume --yes` |
+| Cancel a managed execution | `pai arena stop arena-managed-01` |
+| Inspect a run's cleanup scope | `pai arena cleanup arena-local-01` |
+| Finish that run and remove accepted local containers | `pai arena cleanup arena-local-01 --yes` |
 
 Ctrl-C stops watching without cancelling the run. A completed sample should
 report both successful requested steps and independent verification, followed
 by the robot outcome. For example, “workflow verified; 1 of 3 episodes
 succeeded” proves the pipeline worked, not that the policy is production-ready.
-After a local run, [open its host for cleanup](#reach-the-host-from-a-cli-run),
-then [retain results and clean up](#archive-an-accepted-local-run),
-then [finish the session](#finish-a-local-session); the host is not stopped
-automatically.
+After verification, `cleanup --yes` archives successful local evidence, checks
+the S3 readback and removes that run's stopped containers. A run launched over
+SSM uses the same connection for cleanup; an interactive host shell is optional.
+Failed or cancelled runs are stopped with diagnostics retained. Host, caches,
+working files, S3 output and managed registrations remain. See the
+[archive and storage instructions](#archive-an-accepted-local-run) before
+reclaiming working files, then [finish the session](#finish-a-local-session).
+The host is not stopped automatically.
 
 The next tables list the available commands and arguments. Longer explanations
 and manual procedures are in [Supplementary information](#2-supplementary-information).
@@ -348,35 +418,43 @@ and manual procedures are in [Supplementary information](#2-supplementary-inform
 
 | Command | Purpose |
 | --- | --- |
-| `vla cells [--cell NAME] [--details]` | List available cells, or inspect one cell's declared hardware and task counts. |
-| `vla deploy --name NAME ...` | Prepare infrastructure/images and optionally a host; alternatively select existing resources. |
-| `vla run --deployment NAME ...` | Submit one complete or explicitly shortened execution. It never builds images. |
-| `vla status [ID] [--follow]` | List saved operations, inspect one, or follow that same operation. |
-| `vla stop RUN_ID` | Request cancellation of one recorded execution; preserve host and evidence. |
+| `pai arena cells [--cell NAME] [--details]` | List available cells, or inspect one cell's declared hardware and task counts. |
+| `pai arena deploy --name NAME ...` | Prepare infrastructure/images and optionally a host; alternatively select existing resources. |
+| `pai arena run --deployment NAME ...` | Submit one complete or explicitly shortened execution. It never builds images. |
+| `pai arena status [ID] [--follow]` | List saved operations, inspect one, or follow that same operation. |
+| `pai arena stop RUN_ID` | Request cancellation of one recorded execution; preserve host and evidence. |
+| `pai arena cleanup RUN_ID [--yes]` | Show cleanup scope; with `--yes`, stop owned work and archive/remove verified local containers. |
+| `pai arena report RUN_ID [--output-dir DIR] [--include-video]` | Export that independently verified run's evidence, training/evaluation summary and optional actual recordings. No new experiment. |
+| `pai arena destroy DEPLOYMENT [--yes] [--remove-evidence]` | Show teardown scope, or preserve evidence and remove deployment-owned resources. |
 
 Each command accepts `--help`. Put global options **before** the command,
-for example `vla --json cells --details`.
+for example `pai arena --json cells --details`.
 
 | Global option | Meaning |
 | --- | --- |
 | `--state-dir DIRECTORY` | Persistent deployment/run records. Overrides `VLA_STATE_DIR`; otherwise defaults to `~/.local/state/vla`. Reuse the same directory across sessions. |
 | `--json` | Machine-readable output. Managed/SSM followers emit successive JSON records; direct EC2 following retains verifier diagnostics on stderr and emits its final record on stdout. |
-| `--debug` | Print a traceback on command failure, for example `vla --debug status RUN_ID`. Normal errors remain concise. |
+| `--debug` | Print a traceback on command failure, for example `pai arena --debug status RUN_ID`. Normal errors remain concise. |
+| `--config FILE` | Use this shared toolchain configuration instead of the root `config.json`. Put it before the command. |
 
 #### Deployment arguments
 
 | Argument | Meaning |
 | --- | --- |
-| `--name NAME` | Required saved deployment name. Runs select it with `--deployment`. |
+| `--name NAME` | Saved deployment name; defaults to `arena.deployment_name`. Runs select it with `--deployment` or that same default. |
+| `--account-id ACCOUNT` | Expected twelve-digit AWS account; defaults to `arena.account_id`. Credentials must resolve to that account before writes. |
 | `--profile PROFILE` | Target provisioning profile. Omit on a host using its EC2 instance role. |
 | `--region us-east-1` | Application region; default and only supported value. |
-| `--project NAME` | Foundation/SSM namespace; default `physical-ai`, or the saved selection. |
+| `--project NAME` | Foundation/SSM namespace; new configured deployments use their deployment name. Legacy unconfigured commands default to `physical-ai`. Saved selections retain their namespace. |
 | `--environment NAME` | Resource environment suffix; default `dev`. Changing this alone does not isolate the project-wide SSM namespace. |
 | `--cell NAME` | Cell to prepare; repeat for several. Required on a new operation unless cells come from an imported/existing selection. |
 | `--image STEP=ECR_URI` | Select a published image for `FineTune` or `SimEval`; full private ECR URI required, resolved to a digest. Shared images are reused when preparing multiple cells. |
 | `--use-existing` | Check/save existing resources and images. No infrastructure changes, grants, builds or host installation. |
 | `--selection FILE` | Import a schema-version-1 nonsecret selection, including prepared image/host references. |
 | `--local-host INSTANCE_ID` | Supplied GPU instance to prepare or select. Does not acquire capacity. |
+| `--create-local-host TYPE` | Create and prepare an owned `g6e` GPU EC2 instance; omit for managed-only deployment. Cannot combine with a supplied host or existing-selection modes. |
+| `--gpu-zone ZONE` | Optional availability zone for a newly created GPU host. Quotas are checked; capacity is established by the launch. |
+| `--hf-token-file FILE` / `--ngc-token-file FILE` | Private plaintext files outside the checkout. Create missing deployment-specific token secrets; existing secrets remain supplied resources. Default paths come from the Arena configuration. |
 | `--host-region REGION` | That instance's region; may differ from the application region. |
 | `--scratch-root PATH` | Working directory on the host's separate mounted scratch filesystem. |
 | `--development-bucket NAME` | Versioned bucket for local checkpoints and evidence. |
@@ -384,6 +462,7 @@ for example `vla --json cells --details`.
 | `--prepare-host` | Prepare a supplied host from saved/imported resources and published images; no Terraform or image builds. |
 | `--hf-secret-name NAME` / `--ngc-secret-name NAME` | Existing plaintext secrets; default `vla-pipeline/hf-token` / `vla-pipeline/ngc-token`. |
 | `--input-s3-arn ARN` | Additional managed input bucket/object ARN; repeat for the input locations that need access. |
+| `--existing-ecr-repo NAME` | For a new project, reference a supplied `vla/gr00t`, `vla/openvla`, `vla/molmoact2` or `vla/isaac-arena` repository. Repeat for each; its lifecycle stays with its existing owner. |
 | `--plan` | Save/display preparation plans without applying infrastructure, building images or changing the host. |
 | `--yes` | Approve the displayed plans noninteractively. Without it, applicable phases request confirmation. |
 | `--resume` | Continue the recorded preparation using its saved choices and source. Do not supply new cells, images, host settings or provisioning choices. |
@@ -397,26 +476,30 @@ provider lock; do not upgrade it simply to follow the walkthrough.
 
 The full graph is the default: four local steps, five managed steps.
 Choose a cell, mode, budgets and managed GPU instances explicitly.
+The shared configuration can supply the cell, deployment, hardware and runtime;
+`--sample` can supply the short-run budgets.
 
 | Argument | Meaning |
 | --- | --- |
-| `--deployment NAME` | Required saved deployment, including profile, resources, images and optional host. |
+| `--deployment NAME` | Saved deployment, including profile, resources, images and optional host. Defaults to `arena.deployment_name`. |
 | `--mode local` / `--mode managed` | Required executor choice. Local uses the prepared host; managed allocates SageMaker jobs. |
-| `--cell NAME` | One supported cell from the table above or `vla cells`. |
+| `--sample` | Real 200-step training, three trials and threshold zero for selected steps. Explicit budgets win; an explicit checkpoint still skips training. |
+| `--record-video` / `--no-record-video` | Enable/disable Arena rollout recording. Config `arena.run.record_video` accepts `true`, `false` or `"auto"` (Arena only). Without a preference, recording is off. Unsupported cells reject an explicit recording request. |
+| `--cell NAME` | One supported cell from the table above or `pai arena cells`. |
 | `--model NAME`, `--model-version n16\|n17`, `--simulator isaac_arena\|libero`, `--suite NAME` | Alternative to `--cell`: provide model, simulator and suite, plus version for GR00T. Must match an exposed cell; do not combine with `--cell`. |
-| `--instance STEP=TYPE` | Required for each selected managed GPU step, e.g. `FineTune=ml.g6e.8xlarge`. Repeat for SimEval. Rejected in local mode. |
+| `--instance STEP=TYPE` | Managed GPU choice, e.g. `FineTune=ml.g6e.8xlarge`. Repeat for SimEval; omitted choices come from `arena.managed`. Rejected in local mode. |
 | `--volume-gb STEP=GB` | Optional per-GPU-step requested volume override; otherwise uses the cell declaration. Does not resize local disks or enlarge fixed instance storage. |
 | `--image STEP=ECR_URI` | Optional per-GPU-step published-image override; otherwise uses the deployment's saved digest. No build occurs. |
-| `--train-steps N` | Required when FineTune runs; positive training budget. |
-| `--eval-trials N` | Required when SimEval runs; positive episode count. **Total for Arena, per task for LIBERO** (ten spatial tasks). OpenVLA allows at most 50 per task. |
+| `--train-steps N` | Positive training budget when FineTune runs; `--sample` defaults to 200. |
+| `--eval-trials N` | Positive episode count when SimEval runs; `--sample` defaults to three. **Total for Arena, per task for LIBERO** (ten spatial tasks). OpenVLA allows at most 50 per task. |
 | `--eval-seed N` | Evaluation seed; defaults to 100 for Arena and 1000 for LIBERO. |
-| `--threshold RATE` | Required when SuccessGate runs; finite rate from 0 to 1. Zero is a workflow check, not a model-quality bar. |
-| `--max-runtime-seconds N` | Required positive deadline for each selected GPU job. Separate from the watcher allowance. |
+| `--threshold RATE` | Finite rate from 0 to 1 when SuccessGate runs; `--sample` defaults to zero. Zero is a workflow check, not a model-quality bar. |
+| `--max-runtime-seconds N` | Positive deadline for each selected GPU job; can come from `arena.run`. Separate from the watcher allowance. |
 | `--save-steps N` | Training checkpoint interval; default 1,000,000. N1.6 requires it to be at least the training budget (final checkpoint only). |
 | `--checkpoint-s3 URI` | Use an existing versioned `s3://bucket/key` checkpoint and omit FineTune. |
 | `--through STEP` | Stop after FineTune, SimEval, Validate, SuccessGate or RegisterModel, including preceding dependencies. RegisterModel requires managed mode. |
 | `--run-id ID` | Optional explicit run identifier; existing IDs are rejected to prevent duplicate submission. |
-| `--group NAME` | Label independent runs for `vla status --group NAME`. Does not launch a campaign itself. |
+| `--group NAME` | Label independent runs for `pai arena status --group NAME`. Does not launch a campaign itself. |
 | `--dry-run` | Resolve the request and perform AWS prerequisite reads without submitting work or making AWS writes. |
 | `--offline` | Only with `--dry-run`: use saved selection without AWS reads. Does not prove prerequisites are ready. |
 | `--wait` | Follow after submitting. Ctrl-C stops watching without cancelling. |
@@ -439,6 +522,14 @@ assignments to omitted steps are rejected.
 | `status --group NAME` | List runs with this label; do not combine with an ID. |
 | `status ID --follow --watch-timeout-seconds N` | Change the positive following allowance; default 86,400 seconds. |
 | `stop RUN_ID` | Request cancellation of that run. Does not stop the EC2 host or erase evidence. |
+| `cleanup RUN_ID` | Show what cleanup removes and retains, without changing resources. |
+| `cleanup RUN_ID --yes` | Apply the saved run's cleanup. Active work is stopped first; successful local containers are removed only after evidence archive/readback. |
+| `cleanup RUN_ID --yes --timeout-seconds N` | Local/managed cleanup allowance, default 3,600 seconds. Remote SSM cleanup has its own 3,600-second worker allowance. |
+| `report RUN_ID --output-dir DIRECTORY` | Export the exact run's verified results. The directory cannot belong to another run. |
+| `report RUN_ID --include-video` | Include recordings from the run's versioned SimEval artifact; unsupported simulators report that recording is unavailable. |
+| `destroy DEPLOYMENT` | Show owned resources and runs without deleting them. |
+| `destroy DEPLOYMENT --yes` | Archive evidence, remove owned resources, and independently check removal. The AWS archive remains unless explicitly removed. |
+| `destroy DEPLOYMENT --yes --remove-evidence` | First verify a complete local archive, then remove the temporary AWS archive. Repeating the same command resumes incomplete teardown. Local results remain. |
 
 **That completes the setup and command guide.** The rest of this README is
 supplementary reference; you do not need to read it sequentially to run a sample.
@@ -486,6 +577,17 @@ Fresh preparation checks token access, applies the existing Foundation and Arena
 Terraform modules, builds the selected images with CodeBuild, then optionally
 prepares the host. The Arena base precedes its connector. Build IDs, image
 digests, logs and completed phases are saved as they become available.
+If another deployment owns the fixed `vla/*` image repositories, create a
+separately named project and add `--existing-ecr-repo REPOSITORY` for each
+existing repository. Accepted names are `vla/gr00t`, `vla/openvla`,
+`vla/molmoact2` and `vla/isaac-arena`. The CLI checks those repositories and
+references them through Terraform data sources; it does not import them or
+change their lifecycle policies. The new project's roles, buckets, network and
+Foundation image repositories remain separately owned. Unlisted collisions
+still stop deployment. The builder can publish new image tags to the selected
+existing repositories; supply published `--image` choices to reuse images.
+Resume uses the saved ownership choices; do not pass new repository selections.
+
 In a fresh account, `--plan` stops at the Foundation dependency boundary if
 the component cannot yet be planned; `--resume --yes` continues from there.
 
@@ -561,6 +663,11 @@ vla deploy --name arena-review --prepare-host \
   --local-host INSTANCE_ID --host-region HOST_REGION \
   --scratch-root /opt/dlami/nvme/vla-tests --yes
 ```
+
+Host setup briefly retries the initial source download while its new role
+permission propagates. Persistent denials retain the original S3 error; inspect
+the selected runtime role before `deploy --resume`. Download integrity checks
+remain required.
 
 For a manually prepared EC2 host, restore the
 [host selection](#clone-and-install-on-ec2) and register it from that host:
@@ -2190,6 +2297,15 @@ sudo .venv/bin/python scripts/local/verify_run.py \
   --run-dir "local-dev/runs/$RUN_ID"
 ```
 
+The independent dataset lookup requests only the commit ID and retries temporary
+Hugging Face queue or rate-limit responses (HTTP 429) within a five-minute
+allowance, reporting each wait. If that allowance is exhausted, verification
+remains incomplete. After the service recovers, run
+the same verifier command on the GPU host against the completed run; training
+does not need to restart. Preserve its containers, journal and failed
+verification log until verification succeeds. Then refresh the saved run's
+status so observers pick up the new proof.
+
 Require the verifier to exit zero and create
 `local-dev/runs/$RUN_ID/independent-verification.json` with `status: Succeeded`.
 It independently checks:
@@ -2281,6 +2397,12 @@ your existing `RUN_ID` and `VLA_SCRATCH_ROOT`.
 
 **Optional cleanup:** Save your debugging logs and run records to S3, then
 remove the completed run's stopped containers to reclaim disk space.
+
+For a CLI-launched run, `pai arena cleanup RUN_ID --yes` performs the archive
+and container-removal operation below, including over SSM. Repeat that same
+command if its completion reply was interrupted; recorded removal intent
+allows it to reconcile containers already removed. The manual commands remain
+useful for runs launched directly with the lower-level scripts.
 
 This is not required to train, evaluate or inspect results. For either Arena
 or LIBERO, run these commands **in the EC2 component directory**, after
@@ -4360,8 +4482,11 @@ correctly.
   dev bucket; it does not assume those managed roles or establish their trust boundary.
 - **Terraform state is local** (no remote backend) — fine for a sample/dev deploy;
   configure a remote backend for shared/production use.
-- **ECR teardown is guarded.** `terraform destroy` refuses the ECR repos
-  (`prevent_destroy = true`). Retaining ECR alone does not make destruction safe:
+- **ECR teardown is guarded.** Direct `terraform destroy` refuses the ECR repos
+  (`prevent_destroy = true`). `pai arena destroy --yes` removes that protection
+  only in its recorded deployment directory, after archiving evidence and
+  checking that its newly owned repositories are empty. Supplied repositories
+  remain outside deletion scope. Retaining ECR alone does not make destruction safe:
   registered packages also depend on the versioned evidence buckets. Review
   [resource ownership and retention](#resource-ownership-and-permanent-teardown) before
   decommissioning; deployment acceptance does not require teardown.
@@ -4408,7 +4533,12 @@ component state or apply an empty state over resources already managed elsewhere
 
 #### Retaining images and evidence
 
-Component ECR repositories have `prevent_destroy = true`. A reviewed plan can
+Component ECR repositories have `prevent_destroy = true`. The CLI's owned-resource
+teardown uses a local Terraform override after archiving evidence and retiring
+its images. It refuses pre-existing repositories, nonempty repositories and
+forced image deletion. The shipped Terraform protection remains intact.
+
+For manual lifecycle management, a reviewed plan can
 retain them under another owner, including by removing their repository and
 lifecycle-policy addresses from this state. Record that transfer and update the
 declarations before any later apply, which would otherwise try to recreate them.
