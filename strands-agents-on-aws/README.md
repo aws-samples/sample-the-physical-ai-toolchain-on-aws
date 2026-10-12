@@ -3,7 +3,7 @@
 The **Agentic AI Orchestration Layer** at the center of the Physical AI flywheel.
 
 Where the other toolchain components each own one stage — [Cosmos](../cosmos-on-aws/)
-generates data, [Isaac GR00T](../gr00t-training-on-aws/) and
+generates data, [Isaac GR00T](../isaac-gr00t-on-aws/) and
 [Isaac Lab](../isaac-lab-on-aws/) train policies, [Isaac Sim](../isaac-sim-on-aws/)
 validates them — **[strands-robots](https://github.com/strands-labs/robots)** is the
 natural-language control plane that ties them together and drives the robot at the
@@ -33,7 +33,7 @@ provides that layer. It is the connective tissue between the compute-heavy stage
 | Flywheel stage | Toolchain component | How strands-robots connects |
 |----------------|--------------------|------------------------------|
 | Synthetic Data Generation | [cosmos-on-aws](../cosmos-on-aws/) | Agent scripts scene prompts and curates generated episodes |
-| Model Training | [gr00t-training-on-aws](../gr00t-training-on-aws/), [isaac-lab-on-aws](../isaac-lab-on-aws/) | `train_policy` tool launches LeRobot / GR00T fine-tunes on demos the agent recorded |
+| Model Training | [isaac-gr00t-on-aws](../isaac-gr00t-on-aws/), [isaac-lab-on-aws](../isaac-lab-on-aws/) | `train_policy` tool launches LeRobot / GR00T fine-tunes on demos the agent recorded |
 | SIL Simulation | [isaac-sim-on-aws](../isaac-sim-on-aws/) | `Robot()` sim twin runs a candidate policy for regression gating before hardware |
 | Sim-to-Real / HIL | *Edge (Jetson)* | Same policy interface runs on the physical arm; mesh coordinates a fleet |
 
