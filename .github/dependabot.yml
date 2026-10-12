@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /cdk
+    schedule:
+      interval: weekly
+    groups:
+      # aws-cdk-lib can raise the cloud assembly schema version beyond what the
+      # locked aws-cdk CLI can read, so the CLI and library must move together.
+      aws-cdk:
+        applies-to: version-updates
+        patterns:
+          - aws-cdk
+          - aws-cdk-lib
