@@ -7,7 +7,10 @@
 # Builds in AWS CodeBuild → ECR (NEVER locally). Same DLC base + GR00T pin as the
 # training image (containers/gr00t-training) so a checkpoint trained there loads
 # here without SDK drift.
-FROM 763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-inference:2.5.1-gpu-py311-cu124-ubuntu22.04-sagemaker
+# DLC images are published in every region; pull from the build region so the
+# CodeBuild role's region-scoped ECR grant covers it.
+ARG DLC_REGION=us-west-2
+FROM 763104351884.dkr.ecr.${DLC_REGION}.amazonaws.com/pytorch-inference:2.5.1-gpu-py311-cu124-ubuntu22.04-sagemaker
 
 ENV DEBIAN_FRONTEND=noninteractive
 
