@@ -5,7 +5,12 @@
 
 driver:
   enabled: true
-  version: "580.126.16"
+  # 580.126.16 (the GPU Operator v25.10.1 default) fails to build its kernel
+  # modules on the current Canonical Ubuntu Noble 24.04 EKS AMI, whose kernel is
+  # 7.0.0-1014-aws: "nvidia-uvm kernel module failed to build" -> every
+  # GPU pod stays at Init:0/1 and nvidia.com/gpu is never advertised.
+  # 615.71.09 is a 2026 branch that compiles against the 7.0 kernel.
+  version: "615.71.09"
 
 # DCGM exporter ships GPU metrics (utilization, memory, temperature, power).
 # The pod carries prometheus.io/scrape annotations on port 9400, so the AWS

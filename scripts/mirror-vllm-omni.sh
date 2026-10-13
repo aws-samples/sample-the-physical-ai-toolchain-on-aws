@@ -4,7 +4,11 @@
 # delete the project after the image is pushed.
 set -euo pipefail
 
-REGION="${AWS_REGION:-us-east-1}"
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region || true)}}"
+if [ -z "$REGION" ]; then
+  echo "ERROR: no region. Set AWS_REGION (the foundation stack's region) and re-run." >&2
+  exit 1
+fi
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 REPO="vllm-omni"

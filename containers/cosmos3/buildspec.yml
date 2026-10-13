@@ -32,13 +32,12 @@ phases:
   build:
     commands:
       - 'echo "Cloning ${COSMOS3_REPO}@${COSMOS3_REF}..."'
-      - git clone --depth 1 --branch "$COSMOS3_REF" "$COSMOS3_REPO" cosmos3-src
-      - cd cosmos3-src
+      # fetch + checkout (not clone --branch) so COSMOS3_REF can be a commit SHA.
+      - git init cosmos3-src && cd cosmos3-src && git remote add origin "$COSMOS3_REPO"
+      - git fetch --depth 1 origin "$COSMOS3_REF" && git checkout FETCH_HEAD
       - git lfs pull || true
-      # Same gotcha as Transfer 2.5: the repo pins .python-version=3.13 but the
-      # locked CUDA/flash-attn wheels target cp310 (pyproject is just ">=3.10").
-      # Pin uv's interpreter to 3.10 so the wheels resolve.
-      - echo "3.10" > .python-version
+      # Use the repo's own .python-version (3.13): the default CUDA 13 base selects
+      # the cu130 dependency group, which requires Python 3.13.
       - echo "Building Cosmos 3 image from source..."
       - docker build -t cosmos3 .
       - docker tag cosmos3:latest "$ECR_REPO_URI:latest"

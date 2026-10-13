@@ -35,6 +35,12 @@ PROFILE_NAME="physical-ai-dev-cosmos-profile"
 SG_NAME="cosmos-test-sg"
 NGC_SECRET="physical-ai/ngc-api-key"
 HF_SECRET="physical-ai/hf-token"
+# Secrets live in the Foundation region, which can differ from the cheapest Capacity Block region.
+SECRETS_REGION="${SECRETS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region || true)}}}"
+if [ -z "$SECRETS_REGION" ]; then
+  echo "ERROR: set SECRETS_REGION (or AWS_REGION) to the Foundation stack region." >&2
+  exit 1
+fi
 
 DRY_RUN=false
 STATUS_ONLY=false
@@ -193,7 +199,7 @@ echo "  ✓ SSM online"
 
 echo "  NGC login + NIM pull (~20 min)..."
 aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-  --parameters '{"commands":["aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key --region us-east-1 --query SecretString --output text | docker login nvcr.io --username \\$oauthtoken --password-stdin && docker pull nvcr.io/nim/nvidia/cosmos-transfer2.5-2b:latest"]}' \
+  --parameters '{"commands":["aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key --region '"$SECRETS_REGION"' --query SecretString --output text | docker login nvcr.io --username \\$oauthtoken --password-stdin && docker pull nvcr.io/nim/nvidia/cosmos-transfer2.5-2b:latest"]}' \
   --timeout-seconds 1800 --region "$BEST_REGION" > /dev/null
 
 echo "  Waiting for pull to complete..."
@@ -201,7 +207,7 @@ sleep 1200  # 20 min for 56 GB pull
 
 echo "  Starting NIM server..."
 aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
-  --parameters '{"commands":["NGC_KEY=$(aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key --region us-east-1 --query SecretString --output text) && HF_TOKEN=$(aws secretsmanager get-secret-value --secret-id physical-ai/hf-token --region us-east-1 --query SecretString --output text) && docker run -d --name cosmos-transfer-nim --gpus all --ipc=host --shm-size=64g -p 8000:8000 -e NGC_API_KEY=$NGC_KEY -e HF_TOKEN=$HF_TOKEN nvcr.io/nim/nvidia/cosmos-transfer2.5-2b:latest"]}' \
+  --parameters '{"commands":["NGC_KEY=$(aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key --region '"$SECRETS_REGION"' --query SecretString --output text) && HF_TOKEN=$(aws secretsmanager get-secret-value --secret-id physical-ai/hf-token --region '"$SECRETS_REGION"' --query SecretString --output text) && docker run -d --name cosmos-transfer-nim --gpus all --ipc=host --shm-size=64g -p 8000:8000 -e NGC_API_KEY=$NGC_KEY -e HF_TOKEN=$HF_TOKEN nvcr.io/nim/nvidia/cosmos-transfer2.5-2b:latest"]}' \
   --region "$BEST_REGION" > /dev/null
 
 # --- Step 7: Wait for ready ---
