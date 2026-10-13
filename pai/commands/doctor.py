@@ -118,26 +118,27 @@ def doctor():
             ssm.get_parameter(Name="/physical-ai/datasets-bucket")
             helpers.pass_msg("Foundation infrastructure detected (SSM parameters present)")
         except Exception:
-            # Fall back to checking CFN stack
-            try:
-                cfn_client = boto3.client("cloudformation", region_name=region)
-                stack_name = "physical-ai-foundation"
-                response = cfn_client.describe_stacks(StackName=stack_name)
-                stacks = response.get("Stacks", [])
+            # Fall back to checking CFN stacks: the CDK stack (pai deploy foundation),
+            # then the CloudFormation bootstrap stack (workshop/bootstrap.cfn.yaml).
+            cfn_client = boto3.client("cloudformation", region_name=region)
+            env = config.get("environment", "dev")
+            found = None
+            for stack_name in (f"PhysicalAi-{env}-Foundation", "physical-ai-foundation"):
+                try:
+                    stacks = cfn_client.describe_stacks(StackName=stack_name).get("Stacks", [])
+                except ClientError:
+                    continue
                 if stacks and "COMPLETE" in stacks[0].get("StackStatus", ""):
-                    helpers.pass_msg(f"Foundation stack exists: {stack_name}")
-                else:
-                    all_pass = False
-                    helpers.fail_msg("Foundation infrastructure not found")
-                    helpers.info("        Remediation: Deploy foundation:")
-                    helpers.info("          aws cloudformation deploy --template-file workshop/bootstrap.cfn.yaml \\")
-                    helpers.info("            --stack-name physical-ai-foundation --capabilities CAPABILITY_NAMED_IAM")
-            except ClientError:
+                    found = stack_name
+                    break
+            if found:
+                helpers.pass_msg(f"Foundation stack exists: {found}")
+            else:
                 all_pass = False
                 helpers.fail_msg("Foundation infrastructure not found")
-                helpers.info("        Remediation: Deploy foundation:")
-                helpers.info("          aws cloudformation deploy --template-file workshop/bootstrap.cfn.yaml \\")
-                helpers.info("            --stack-name physical-ai-foundation --capabilities CAPABILITY_NAMED_IAM")
+                helpers.info("        Remediation: Deploy foundation: pai deploy foundation")
+                helpers.info("          (or the CloudFormation path: aws cloudformation deploy --template-file workshop/bootstrap.cfn.yaml \\")
+                helpers.info("            --stack-name physical-ai-foundation --capabilities CAPABILITY_NAMED_IAM)")
     else:
         helpers.warn("        Skipping (region check failed)")
 
