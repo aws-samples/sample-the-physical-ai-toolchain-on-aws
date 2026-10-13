@@ -16,12 +16,12 @@ phases:
       - echo "Logging in to target ECR registry $REGISTRY..."
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
       - echo "Logging in to the AWS DLC ECR account (763104351884)..."
-      - aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 763104351884.dkr.ecr.us-west-2.amazonaws.com
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin 763104351884.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
   build:
     commands:
       - echo "Building gr00t-inference image..."
       - cd containers/gr00t-inference
-      - docker build --platform linux/amd64 -t gr00t-inference .
+      - docker build --platform linux/amd64 --build-arg DLC_REGION=$AWS_DEFAULT_REGION -t gr00t-inference .
       - docker tag gr00t-inference:latest "$ECR_REPO_URI:latest"
   post_build:
     commands:
