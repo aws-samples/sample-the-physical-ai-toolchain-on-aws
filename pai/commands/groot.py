@@ -23,6 +23,17 @@ import click
 from pai import cfn, config, helpers
 
 STACK_NAME = "PhysicalAi-dev-Foundation"
+HF_SECRET_NAME = "physical-ai/hf-token"
+
+
+def _hf_token_from_secret(region: str) -> str:
+    """Read the optional HF token secret (Lab 0); "" if it's absent or unreadable."""
+    import boto3
+    try:
+        sm = boto3.client("secretsmanager", region_name=region)
+        return sm.get_secret_value(SecretId=HF_SECRET_NAME)["SecretString"].strip()
+    except Exception:
+        return ""
 
 
 @click.group()
@@ -205,11 +216,22 @@ def launch(dataset_prefix, max_steps, batch_size, instance_type, dry_run):
     helpers.info(f"  Image:    {image}")
 
     # HF_TOKEN is forwarded to the pipeline at execute time; never echo it.
+    # The env var wins; otherwise fall back to the optional Secrets Manager secret
+    # from Lab 0, so a new terminal doesn't silently lose the token.
     hf_token = os.environ.get("HF_TOKEN", "")
+    hf_source = "env"
+    if not hf_token and not dry_run:
+        hf_token = _hf_token_from_secret(region)
+        hf_source = HF_SECRET_NAME
+        if hf_token:
+            os.environ["HF_TOKEN"] = hf_token  # pipeline.execute_pipeline reads it from env
     if hf_token:
-        helpers.info("  HF_TOKEN: <redacted> (passed to the pipeline at execute time)")
+        helpers.info(f"  HF_TOKEN: <redacted> (from {hf_source}; passed to the pipeline at execute time)")
+    elif dry_run:
+        helpers.info(f"  HF_TOKEN: not in env; a real launch also checks {HF_SECRET_NAME}")
     else:
-        helpers.warn("  HF_TOKEN: not set — base-model download runs unauthenticated (rate-limit-prone)")
+        helpers.warn(f"  HF_TOKEN: not set (env or {HF_SECRET_NAME}) — base-model download runs "
+                     "unauthenticated (rate-limit-prone)")
 
     if dry_run:
         helpers.info("\n[2/2] [dry-run] Would create/update pipeline 'groot-finetune-pipeline' then execute:")
