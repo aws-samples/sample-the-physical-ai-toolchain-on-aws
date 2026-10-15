@@ -20,7 +20,7 @@ SCRIPT="$HERE/../event-provision.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/test-event-provision.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 STUBS="$WORK/stubs"
-mkdir -p "$STUBS"
+mkdir "$STUBS"
 
 ACCOUNT=123456789012
 VPC=vpc-0aaaaaaaaaaaaaaa0
@@ -32,6 +32,9 @@ SG=sg-0ddddddddddddddd3
 DATA=physical-ai-data-$ACCOUNT
 FOUNDATION=physical-ai-dev-datasets-$ACCOUNT
 CENTRAL=s3://central-weights-$ACCOUNT/cosmos3/
+PRESIGNED='https://central.example/cosmos3-nano.tar?X-Amz-Signature=test'
+ARCHIVE_SHA=3c2d3d2030ab8968d27cb1f586ef53918d8ae04dbd9fa55895b52414b46413e0
+ARCHIVE_SHA_PREFIX=3c2d3d2030ab8968
 TAB="$(printf '\t')"
 SUBNET_ROWS="$(printf '%s\n' \
   "${SUBNET_B}${TAB}${VPC}${TAB}us-east-2b${TAB}use2-az2" \
@@ -114,13 +117,27 @@ EOF
 cat > "$STUBS/curl" <<'EOF'
 #!/bin/bash
 printf 'curl %s\n' "$*" >> "$STUB_LOG"
-echo "curl stub: must never be called" >&2
-exit 99
+out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) shift; out="${1:-}" ;;
+  esac
+  shift || true
+done
+[ -n "$out" ] && printf 'archive-stub' > "$out"
+exit "${STUB_CURL_RC:-0}"
 EOF
-chmod +x "$STUBS/aws" "$STUBS/terraform" "$STUBS/kubectl" "$STUBS/curl"
+
+cat > "$STUBS/sha256sum" <<'EOF'
+#!/bin/bash
+printf 'sha256sum %s\n' "$*" >> "$STUB_LOG"
+if [ "${1:-}" = "-c" ]; then cat >/dev/null; exit 0; fi
+printf '%s  %s\n' "${STUB_SHA256:-${CENTRAL_WEIGHTS_SHA256:-stub}}" "${1:-file}"
+EOF
+chmod +x "$STUBS/aws" "$STUBS/terraform" "$STUBS/kubectl" "$STUBS/curl" "$STUBS/sha256sum"
 
 # Guard: under the case PATH every tool must resolve to its stub, never a real binary.
-for tool in aws terraform kubectl curl; do
+for tool in aws terraform kubectl curl sha256sum; do
   resolved="$(PATH="$STUBS:/usr/bin:/bin" command -v "$tool")"
   [ "$resolved" = "$STUBS/$tool" ] || { echo "stub guard: $tool resolves to $resolved" >&2; exit 2; }
 done
@@ -136,7 +153,7 @@ BASH_BIN=/bin/bash
 run_case() {
   CASE_NAME="$1"; shift
   CASE_DIR="$WORK/case-$CASE_NAME"
-  mkdir -p "$CASE_DIR"
+  mkdir "$CASE_DIR"
   TF="$(mktemp -d "$CASE_DIR/tf.XXXXXX")"
   OUT="$CASE_DIR/stdout"; ERR="$CASE_DIR/stderr"; LOG="$CASE_DIR/stub.log"
   TFV="$TF/terraform.tfvars"
@@ -229,10 +246,46 @@ expect "extra buckets = both" tfvar "$TFV" eks_pod_extra_s3_buckets "[\"$DATA\",
 expect "source logged" has "$OUT" "(source: SSM /physical-ai/datasets-bucket)"
 finish "b   datasets-bucket param present -> its value used and granted"
 
+
+# (c2) presigned archive -> verified, relayed to participant S3, then extracted on node
+run_case c2 "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" "DATA_BUCKET=$DATA"
+expect "exit 0" rc_is 0
+expect "URL absent from stdout" hasnt "$OUT" "$PRESIGNED"
+expect "presigned archive downloaded" has "$LOG" "curl --fail --location --silent --show-error"
+expect "archive relayed to DATA_BUCKET" has "$LOG" "aws s3 cp /tmp/cosmos3-nano-${ARCHIVE_SHA_PREFIX}.tar s3://$DATA/cosmos3-assets/archives/cosmos3-nano.tar"
+expect "staging Job reads archive" has "$LOG.stdin" "s3://$DATA/cosmos3-assets/archives/cosmos3-nano.tar"
+expect "staging Job checks archive" has "$LOG.stdin" "$ARCHIVE_SHA  /models/cosmos3-nano.tar"
+expect "no HF secret lookup" hasnt "$LOG" "secretsmanager get-secret-value"
+expect "no Kubernetes HF Secret" hasnt "$LOG" "kubectl create secret generic hf-token"
+finish "c2  presigned archive -> verify, relay, extract without HF token"
+
+# (c3) presigned archive without checksum -> fatal before Terraform or download
+run_case c3 "CENTRAL_WEIGHTS_URL=$PRESIGNED" "DATA_BUCKET=$DATA"
+expect "exit 1" rc_is 1
+expect "checksum required" has "$ERR" "CENTRAL_WEIGHTS_SHA256 must be 64 hexadecimal characters"
+expect "no terraform init" hasnt "$LOG" "terraform init"
+expect "no download" hasnt "$LOG" "curl "
+finish "c3  presigned archive without checksum -> exit 1"
+
+# (c4) direct S3 and presigned URL together -> rejected as ambiguous
+run_case c4 "CENTRAL_WEIGHTS_S3=$CENTRAL" "CENTRAL_WEIGHTS_URL=$PRESIGNED" \
+  "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" "DATA_BUCKET=$DATA"
+expect "exit 1" rc_is 1
+expect "one source required" has "$ERR" "set only one of CENTRAL_WEIGHTS_S3 or CENTRAL_WEIGHTS_URL"
+expect "no terraform init" hasnt "$LOG" "terraform init"
+finish "c4  both weight sources -> exit 1"
+
+# (c5) downloaded bytes do not match expected checksum -> never uploaded
+run_case c5 "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" \
+  "STUB_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "DATA_BUCKET=$DATA"
+expect "exit 1" rc_is 1
+expect "checksum mismatch" has "$ERR" "Cosmos weights archive checksum mismatch"
+expect "archive not uploaded" hasnt "$LOG" "aws s3 cp /tmp/cosmos3-nano-"
+finish "c5  checksum mismatch -> exit 1 before participant upload"
 # (c) relay requested with no bucket -> fatal before Terraform
 run_case c "CENTRAL_WEIGHTS_S3=$CENTRAL"
 expect "exit 1" rc_is 1
-expect "ERROR on stderr" has "$ERR" "ERROR: CENTRAL_WEIGHTS_S3 is set but there is no bucket to relay into"
+expect "ERROR on stderr" has "$ERR" "ERROR: a central weight source is set but there is no relay bucket"
 expect "no terraform init" hasnt "$LOG" "terraform init"
 finish "c   relay requested, no param, no DATA_BUCKET -> exit 1"
 

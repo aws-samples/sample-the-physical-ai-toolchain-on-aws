@@ -31,7 +31,10 @@
 #   WORKSTATION_ROLE_ARN  IAM role granted EKS cluster-admin, so the workshop
 #                       workstation can run kubectl and `terraform plan` (the Helm
 #                       provider must reach the Kubernetes API to refresh state).
-#   CENTRAL_WEIGHTS_S3  Central S3 prefix with Cosmos 3 Nano weights (optional)
+#   CENTRAL_WEIGHTS_S3  Central S3 prefix with unpacked Cosmos 3 Nano weights (optional)
+#   CENTRAL_WEIGHTS_URL Presigned HTTPS URL for a Cosmos 3 Nano tar archive (optional;
+#                       mutually exclusive with CENTRAL_WEIGHTS_S3)
+#   CENTRAL_WEIGHTS_SHA256  Required SHA-256 for CENTRAL_WEIGHTS_URL
 #   COSMOS_IMAGE_URI    ECR image for vllm-omni cosmos3; also warms the node's image cache
 #   DATA_BUCKET         Workshop data bucket (optional). The pod IRSA policy grants it,
 #                       and CENTRAL_WEIGHTS_S3 is relayed into it when the account has no
@@ -70,6 +73,8 @@ GPU_AZ="${GPU_AZ:-}"
 GPU_CR_ID="${GPU_CR_ID:-}"
 GPU_DESIRED_SIZE="${GPU_DESIRED_SIZE:-1}"
 CENTRAL_WEIGHTS_S3="${CENTRAL_WEIGHTS_S3:-}"
+CENTRAL_WEIGHTS_URL="${CENTRAL_WEIGHTS_URL:-}"
+CENTRAL_WEIGHTS_SHA256="${CENTRAL_WEIGHTS_SHA256:-}"
 COSMOS_IMAGE_URI="${COSMOS_IMAGE_URI:-}"
 WORKSTATION_ROLE_ARN="${WORKSTATION_ROLE_ARN:-}"
 VPC_ID="${VPC_ID:-}"
@@ -77,9 +82,10 @@ EKS_NODE_SUBNET_IDS="${EKS_NODE_SUBNET_IDS:-}"
 EKS_CONTROL_PLANE_SUBNET_IDS="${EKS_CONTROL_PLANE_SUBNET_IDS:-}"
 EKS_API_INGRESS_SG_IDS="${EKS_API_INGRESS_SG_IDS:-}"
 DATA_BUCKET="${DATA_BUCKET:-}"
-# Resolved in section 2 only when CENTRAL_WEIGHTS_S3 is set; "" keeps the staging Job
+# Resolved in section 2 when either weight source is set. Empty keeps the staging Job
 # heredoc safe under set -u when only COSMOS_IMAGE_URI is set.
 WEIGHTS_BUCKET=""
+WEIGHTS_ARCHIVE_KEY=""
 ENABLE_IMAGE_BUILDS="${ENABLE_IMAGE_BUILDS:-false}"
 POD_GRANT_FOUNDATION_BUCKET="${POD_GRANT_FOUNDATION_BUCKET:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -115,6 +121,15 @@ case "$POD_GRANT_FOUNDATION_BUCKET" in
   ''|true|false) ;;
   *) die "POD_GRANT_FOUNDATION_BUCKET must be empty, true or false, got '$POD_GRANT_FOUNDATION_BUCKET'" ;;
 esac
+if [ -n "$CENTRAL_WEIGHTS_S3" ] && [ -n "$CENTRAL_WEIGHTS_URL" ]; then
+  die "set only one of CENTRAL_WEIGHTS_S3 or CENTRAL_WEIGHTS_URL"
+fi
+if [ -n "$CENTRAL_WEIGHTS_URL" ] && ! [[ "$CENTRAL_WEIGHTS_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  die "CENTRAL_WEIGHTS_SHA256 must be 64 hexadecimal characters when CENTRAL_WEIGHTS_URL is set"
+fi
+if [ -z "$CENTRAL_WEIGHTS_URL" ] && [ -n "$CENTRAL_WEIGHTS_SHA256" ]; then
+  die "CENTRAL_WEIGHTS_SHA256 requires CENTRAL_WEIGHTS_URL"
+fi
 
 #-----------------------------------------------------------------------------------
 # 1. Tooling
@@ -309,12 +324,12 @@ if [ -n "${PARTICIPANT_ROLE_NAME:-}" ]; then
   fi
 fi
 
-# Weights bucket: where section 4 relays CENTRAL_WEIGHTS_S3 to and where the staging Job
-# reads from. Resolved here, before the tfvars, because the pod IRSA policy must grant it.
-# An existing /physical-ai/datasets-bucket parameter (a Foundation account) wins;
-# otherwise the stack's DATA_BUCKET. The SSM read sits inside an `if`, so a missing
+# Weights bucket: where section 4 relays either configured weight source and where the
+# staging Job reads from. Resolved here, before the tfvars, because the pod IRSA policy
+# must grant it. An existing /physical-ai/datasets-bucket parameter (a Foundation account)
+# wins; otherwise the stack's DATA_BUCKET. The SSM read sits inside an `if`, so a missing
 # parameter - the normal case in a workshop account - cannot abort the script under set -e.
-if [ -n "$CENTRAL_WEIGHTS_S3" ]; then
+if [ -n "$CENTRAL_WEIGHTS_S3" ] || [ -n "$CENTRAL_WEIGHTS_URL" ]; then
   if SSM_BUCKET="$(aws ssm get-parameter --name /physical-ai/datasets-bucket \
        --region "$AWS_REGION_NAME" --query Parameter.Value --output text 2>/dev/null)" \
      && [ -n "$SSM_BUCKET" ] && [ "$SSM_BUCKET" != None ]; then
@@ -324,7 +339,7 @@ if [ -n "$CENTRAL_WEIGHTS_S3" ]; then
     WEIGHTS_BUCKET="$DATA_BUCKET"
     WEIGHTS_SOURCE="DATA_BUCKET"
   else
-    die "CENTRAL_WEIGHTS_S3 is set but there is no bucket to relay into: /physical-ai/datasets-bucket does not exist and DATA_BUCKET is unset"
+    die "a central weight source is set but there is no relay bucket: /physical-ai/datasets-bucket does not exist and DATA_BUCKET is unset"
   fi
   log "Weights bucket: ${WEIGHTS_BUCKET} (source: ${WEIGHTS_SOURCE})"
 fi
@@ -432,20 +447,17 @@ kubectl annotate serviceaccount cosmos3-generator -n default \
 log "ServiceAccount cosmos3-generator -> ${IRSA_ROLE}"
 
 #-----------------------------------------------------------------------------------
-# 3b. hf-token Secret.
+# 3b. Optional hf-token Secret.
 #
-# The generation Job declares HF_TOKEN with a secretKeyRef, and Kubernetes refuses to
-# create the container when the referenced Secret is absent - the pod sits in
-# CreateContainerConfigError. That happens even when the model is served from staged
-# node-local weights and the token is never read, so the Secret has to exist either way.
-#
-# Created empty when Secrets Manager has no token: that is enough to let the pod start
-# on the staged-weights path, and the Hugging Face fallback then fails with a clear 401
-# rather than an opaque scheduling error.
+# The generation Job's secretKeyRef is optional. Create the Secret only when neither
+# central weight source is configured and runtime Hugging Face fallback may be needed.
+# Central staging deliberately skips both the Secrets Manager read and Kubernetes Secret.
 #-----------------------------------------------------------------------------------
-HF_TOKEN_VALUE="$(aws secretsmanager get-secret-value --secret-id physical-ai/hf-token \
-  --region "$AWS_REGION_NAME" --query SecretString --output text 2>/dev/null \
-  | python3 -c "
+HF_TOKEN_VALUE=""
+if [ -z "$CENTRAL_WEIGHTS_S3" ] && [ -z "$CENTRAL_WEIGHTS_URL" ]; then
+  HF_TOKEN_VALUE="$(aws secretsmanager get-secret-value --secret-id physical-ai/hf-token \
+    --region "$AWS_REGION_NAME" --query SecretString --output text 2>/dev/null \
+    | python3 -c "
 import sys, json
 s = sys.stdin.read().strip()
 if not s:
@@ -457,6 +469,7 @@ else:
     except Exception:
         print(s)
 " 2>/dev/null || echo '')"
+fi
 
 #-----------------------------------------------------------------------------------
 # 3c. Cluster-scoped read access for the "cosmos3-viewers" group.
@@ -499,34 +512,52 @@ subjects:
 EOF
 log "ClusterRole cosmos3-cluster-viewer bound to group cosmos3-viewers (node read for the console)"
 
-kubectl create secret generic hf-token -n default \
-  --from-literal=token="${HF_TOKEN_VALUE}" \
-  --dry-run=client -o yaml | kubectl apply -f -
-if [ -n "$HF_TOKEN_VALUE" ]; then
-  log "Secret hf-token created (${#HF_TOKEN_VALUE} chars from Secrets Manager)"
+if [ -z "$CENTRAL_WEIGHTS_S3" ] && [ -z "$CENTRAL_WEIGHTS_URL" ]; then
+  kubectl create secret generic hf-token -n default \
+    --from-literal=token="${HF_TOKEN_VALUE}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  if [ -n "$HF_TOKEN_VALUE" ]; then
+    log "Secret hf-token created (${#HF_TOKEN_VALUE} chars from Secrets Manager)"
+  else
+    log "Secret hf-token created EMPTY - no physical-ai/hf-token in Secrets Manager. Hugging Face downloads will not work."
+  fi
 else
-  log "Secret hf-token created EMPTY - no physical-ai/hf-token in Secrets Manager. Staged weights will work; Hugging Face downloads will not."
+  log "Central weights configured - skipping Hugging Face token lookup and Kubernetes Secret creation"
 fi
 
-if [ -z "$CENTRAL_WEIGHTS_S3" ] && [ -z "$COSMOS_IMAGE_URI" ]; then
-  log "No central artifacts configured (CENTRAL_WEIGHTS_S3 / COSMOS_IMAGE_URI) - skipping staging"
+if [ -z "$CENTRAL_WEIGHTS_S3" ] && [ -z "$CENTRAL_WEIGHTS_URL" ] && [ -z "$COSMOS_IMAGE_URI" ]; then
+  log "No central artifacts configured (CENTRAL_WEIGHTS_S3 / CENTRAL_WEIGHTS_URL / COSMOS_IMAGE_URI) - skipping staging"
   log "Pre-provisioning complete (cluster only)"
   exit 0
 fi
 
 #-----------------------------------------------------------------------------------
-# 4. Relay weights: central account -> this account's weights bucket (WEIGHTS_BUCKET,
-#    resolved above).
+# 4. Relay weights into this account's weights bucket.
 #
-# The pod reads from this account's bucket rather than the central one because the pod
-# IRSA policy grants WEIGHTS_BUCKET explicitly through eks_pod_extra_s3_buckets - no
-# cross-account access required, and no participant ever needs Hugging Face credentials
-# or a gated-model license.
+# A direct S3 prefix is synced as unpacked files. A presigned URL is downloaded once by
+# CodeBuild, verified before upload, and stored as an archive in participant S3. The URL
+# is never logged or passed into Kubernetes.
 #-----------------------------------------------------------------------------------
 if [ -n "$CENTRAL_WEIGHTS_S3" ]; then
-  log "Relaying weights from ${CENTRAL_WEIGHTS_S3} to s3://${WEIGHTS_BUCKET}/cosmos3-assets/weights/"
+  log "Relaying unpacked weights from ${CENTRAL_WEIGHTS_S3} to s3://${WEIGHTS_BUCKET}/cosmos3-assets/weights/"
   aws s3 sync "$CENTRAL_WEIGHTS_S3" \
     "s3://${WEIGHTS_BUCKET}/cosmos3-assets/weights/" --only-show-errors
+elif [ -n "$CENTRAL_WEIGHTS_URL" ]; then
+  SHA_PREFIX="$(printf '%s' "$CENTRAL_WEIGHTS_SHA256" | cut -c1-16)"
+  WEIGHTS_ARCHIVE_KEY="cosmos3-assets/archives/cosmos3-nano.tar"
+  ARCHIVE_TMP="/tmp/cosmos3-nano-${SHA_PREFIX}.tar"
+  log "Downloading the presigned Cosmos weights archive (URL redacted)"
+  curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+    --connect-timeout 30 --output "$ARCHIVE_TMP" "$CENTRAL_WEIGHTS_URL" \
+    || die "presigned Cosmos weights download failed"
+  ACTUAL_SHA256="$(sha256sum "$ARCHIVE_TMP" | awk '{print $1}')"
+  EXPECTED_SHA256="$(printf '%s' "$CENTRAL_WEIGHTS_SHA256" | tr '[:upper:]' '[:lower:]')"
+  [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] \
+    || die "Cosmos weights archive checksum mismatch: expected ${EXPECTED_SHA256}, got ${ACTUAL_SHA256}"
+  log "Archive checksum passed; relaying it to s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY}"
+  aws s3 cp "$ARCHIVE_TMP" "s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY}" \
+    --only-show-errors
+  rm -f "$ARCHIVE_TMP"
 fi
 
 #-----------------------------------------------------------------------------------
@@ -572,11 +603,31 @@ spec:
             - |
               set -euo pipefail
               command -v aws >/dev/null 2>&1 || pip install -q awscli
-              mkdir -p /models/cosmos3-nano
-              if [ -n "${CENTRAL_WEIGHTS_S3}" ]; then
-                echo "Copying weights to node-local disk..."
+              mkdir -p /models
+              if [ -n "${WEIGHTS_ARCHIVE_KEY}" ]; then
+                echo "Copying the verified weights archive from participant S3..."
+                aws s3 cp "s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY}" \
+                  /models/cosmos3-nano.tar --only-show-errors
+                echo "${CENTRAL_WEIGHTS_SHA256}  /models/cosmos3-nano.tar" | sha256sum -c -
+                rm -rf /models/cosmos3-nano.next
+                mkdir -p /models/cosmos3-nano.next
+                tar -xf /models/cosmos3-nano.tar -C /models/cosmos3-nano.next
+                test -s /models/cosmos3-nano.next/config.json
+                test -s /models/cosmos3-nano.next/model.safetensors.index.json
+                test -s /models/cosmos3-nano.next/transformer/diffusion_pytorch_model.safetensors.index.json
+                test -s /models/cosmos3-nano.next/vae/diffusion_pytorch_model.safetensors
+                rm -rf /models/cosmos3-nano
+                mv /models/cosmos3-nano.next /models/cosmos3-nano
+                rm -f /models/cosmos3-nano.tar
+                echo "Archive extracted and validated."
+                du -sh /models/cosmos3-nano
+              elif [ -n "${CENTRAL_WEIGHTS_S3}" ]; then
+                mkdir -p /models/cosmos3-nano
+                echo "Copying unpacked weights to node-local disk..."
                 aws s3 sync "s3://${WEIGHTS_BUCKET}/cosmos3-assets/weights/" \
                   /models/cosmos3-nano/ --only-show-errors
+                test -s /models/cosmos3-nano/config.json
+                test -s /models/cosmos3-nano/model.safetensors.index.json
                 du -sh /models/cosmos3-nano
               fi
               nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true

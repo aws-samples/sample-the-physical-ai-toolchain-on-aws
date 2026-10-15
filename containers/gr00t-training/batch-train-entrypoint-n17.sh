@@ -20,9 +20,15 @@
 #                         on adds ~1.15B trainable params and needs 4 GPUs.
 #   HF_TOKEN            - HuggingFace token for model download (optional)
 #   HF_TOKEN_SECRET_ID  - Secrets Manager secret id/ARN holding the token. Used
-#                         only when HF_TOKEN is unset; resolved with the Batch
-#                         instance role. Preferred over a plaintext HF_TOKEN in
-#                         the job definition.
+#                         only when local model archives are absent and HF_TOKEN is unset.
+#   GROOT_BASE_MODEL_ARCHIVE_S3_URI - participant-S3 GR00T N1.7 tar archive
+#   GROOT_BASE_MODEL_SHA256         - SHA-256 for that archive
+#   COSMOS_REASON2_ARCHIVE_S3_URI   - participant-S3 Cosmos Reason2 tar archive
+#   COSMOS_REASON2_SHA256           - SHA-256 for that archive
+#
+# Event accounts set all four archive variables. The entrypoint verifies and extracts
+# both models, rewrites GR00T's nested backbone reference to the local Reason2 directory,
+# and enables Hugging Face/Transformers offline mode.
 #
 # NOTE: the base model nvidia/GR00T-N1.7-3B is NOT gated on HuggingFace
 # (the hub API reports gated:false), so a missing/unresolvable token is a
@@ -45,6 +51,84 @@ EMBODIMENT_CONFIG="${EMBODIMENT_CONFIG:-ur3}"
 MODALITY_CONFIG_PATH="${MODALITY_CONFIG_PATH:-}"
 TUNE_VISUAL="${TUNE_VISUAL:-0}"
 SECRET_ID="${HF_TOKEN_SECRET_ID:-}"
+GROOT_BASE_MODEL_ARCHIVE_S3_URI="${GROOT_BASE_MODEL_ARCHIVE_S3_URI:-}"
+GROOT_BASE_MODEL_SHA256="${GROOT_BASE_MODEL_SHA256:-}"
+COSMOS_REASON2_ARCHIVE_S3_URI="${COSMOS_REASON2_ARCHIVE_S3_URI:-}"
+COSMOS_REASON2_SHA256="${COSMOS_REASON2_SHA256:-}"
+LOCAL_MODEL_ROOT="/opt/ml/input/models"
+
+# --- Prepare participant-S3 model archives for offline event training ---
+materialize_model_archive() {  # label uri sha destination required-file
+    label="$1"; uri="$2"; expected="$3"; destination="$4"; required="$5"
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] \
+      || { echo "ERROR: ${label} SHA-256 must be 64 hexadecimal characters" >&2; exit 1; }
+    expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+    mkdir -p "$LOCAL_MODEL_ROOT"
+    archive="${LOCAL_MODEL_ROOT}/$(basename "$destination").tar"
+    next="${destination}.next"
+    echo "Downloading ${label} from participant S3: ${uri}"
+    aws s3 cp "$uri" "$archive" --region "${AWS_DEFAULT_REGION:-us-east-2}" --only-show-errors
+    printf '%s  %s\n' "$expected" "$archive" | sha256sum -c -
+    rm -rf "$next"
+    mkdir -p "$next"
+    tar -xf "$archive" -C "$next"
+    [ -s "$next/$required" ] || { echo "ERROR: ${label} archive lacks ${required}" >&2; exit 1; }
+    rm -rf "$destination"
+    mv "$next" "$destination"
+    rm -f "$archive"
+    echo "  ${label}: ready at ${destination}"
+}
+
+ARCHIVE_SETTINGS_PRESENT="${GROOT_BASE_MODEL_ARCHIVE_S3_URI}${GROOT_BASE_MODEL_SHA256}${COSMOS_REASON2_ARCHIVE_S3_URI}${COSMOS_REASON2_SHA256}"
+if [ -n "$ARCHIVE_SETTINGS_PRESENT" ]; then
+    [ -n "$GROOT_BASE_MODEL_ARCHIVE_S3_URI" ] && [ -n "$GROOT_BASE_MODEL_SHA256" ] \
+      && [ -n "$COSMOS_REASON2_ARCHIVE_S3_URI" ] && [ -n "$COSMOS_REASON2_SHA256" ] \
+      || { echo "ERROR: all four GR00T/Reason2 archive settings are required together" >&2; exit 1; }
+
+    GROOT_LOCAL_DIR="${LOCAL_MODEL_ROOT}/GR00T-N1.7-3B"
+    REASON2_LOCAL_DIR="${LOCAL_MODEL_ROOT}/Cosmos-Reason2-2B"
+    materialize_model_archive "GR00T N1.7" "$GROOT_BASE_MODEL_ARCHIVE_S3_URI" \
+      "$GROOT_BASE_MODEL_SHA256" "$GROOT_LOCAL_DIR" "config.json"
+    materialize_model_archive "Cosmos Reason2" "$COSMOS_REASON2_ARCHIVE_S3_URI" \
+      "$COSMOS_REASON2_SHA256" "$REASON2_LOCAL_DIR" "model.safetensors"
+
+    python3 - "$GROOT_LOCAL_DIR" "$REASON2_LOCAL_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+reason = sys.argv[2]
+source = "nvidia/Cosmos-Reason2-2B"
+
+def rewrite(value):
+    if isinstance(value, dict):
+        return {key: rewrite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [rewrite(item) for item in value]
+    if isinstance(value, str):
+        return value.replace(source, reason)
+    return value
+
+changed = 0
+for path in root.rglob("*.json"):
+    try:
+        original = json.loads(path.read_text())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        continue
+    updated = rewrite(original)
+    if updated != original:
+        path.write_text(json.dumps(updated, indent=2) + "\n")
+        changed += 1
+if changed == 0:
+    raise SystemExit("No Cosmos Reason2 references were found in the GR00T snapshot")
+print(f"Rewrote Cosmos Reason2 to local path in {changed} GR00T JSON files")
+PY
+
+    BASE_MODEL="$GROOT_LOCAL_DIR"
+    export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+    echo "Offline model preparation: PASS"
+fi
 
 # --- Download dataset from S3 ---
 if [ -n "$DATASET_S3_URI" ]; then
@@ -81,7 +165,7 @@ mkdir -p "$OUTPUT_DIR"
 
 # --- Resolve the HuggingFace token from Secrets Manager if not passed directly ---
 # The value is assigned, never printed; only "resolved / not resolved" is logged.
-if [ -z "${HF_TOKEN:-}" ] && [ -n "$SECRET_ID" ]; then
+if [ -z "$ARCHIVE_SETTINGS_PRESENT" ] && [ -z "${HF_TOKEN:-}" ] && [ -n "$SECRET_ID" ]; then
     echo "Resolving the HuggingFace token from Secrets Manager..."
     # `|| true`-style fallback: the base model is not gated, so a failed lookup
     # must not kill the job under `set -e`.
@@ -124,6 +208,38 @@ echo "Launching GR00T N1.7 training..."
 python3 /opt/ml/code/train_entrypoint.py
 
 echo "Training complete."
+
+# Keep checkpoint metadata portable. Isaac Sim rewrites this canonical identifier to its
+# participant-local Reason2 directory immediately before offline policy loading.
+if [ -n "$ARCHIVE_SETTINGS_PRESENT" ]; then
+    python3 - "$OUTPUT_DIR" "$REASON2_LOCAL_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+local_reason = sys.argv[2]
+canonical = "nvidia/Cosmos-Reason2-2B"
+
+def rewrite(value):
+    if isinstance(value, dict):
+        return {key: rewrite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [rewrite(item) for item in value]
+    if isinstance(value, str):
+        return value.replace(local_reason, canonical)
+    return value
+
+for path in root.rglob("*.json"):
+    try:
+        original = json.loads(path.read_text())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        continue
+    updated = rewrite(original)
+    if updated != original:
+        path.write_text(json.dumps(updated, indent=2) + "\n")
+PY
+fi
 
 # --- Upload checkpoints to S3 ---
 if [ -n "${CHECKPOINT_BUCKET:-}" ]; then

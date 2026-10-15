@@ -104,6 +104,9 @@ spec:
                  && [ -n "$(ls -A "$LOCAL_MODEL_DIR" 2>/dev/null)" ]; then
                 echo "=== Using node-local staged weights: $LOCAL_MODEL_DIR ==="
                 MODEL_ID="$LOCAL_MODEL_DIR"
+              elif [ "${REQUIRE_LOCAL_WEIGHTS:-false}" = "true" ]; then
+                echo "ERROR: staged Cosmos weights are required at ${LOCAL_MODEL_DIR:-<unset>}; Hugging Face fallback is disabled" >&2
+                exit 1
               else
                 echo "=== No staged weights at ${LOCAL_MODEL_DIR:-<unset>} - falling back to Hugging Face (${MODEL_ID}) ==="
               fi
@@ -228,6 +231,8 @@ spec:
             # the top of this file. Must be kept in sync with
             # resources.requests/limits below.
             - { name: COSMOS_MODEL, value: "super" }
+            # Set true in event manifests after central weight staging is configured.
+            - { name: REQUIRE_LOCAL_WEIGHTS, value: "false" }
             # <REGION> and <DATASETS_BUCKET> are account-specific — replace
             # both before applying (see note at the top of this file).
             - { name: AWS_REGION, value: "<REGION>" }
