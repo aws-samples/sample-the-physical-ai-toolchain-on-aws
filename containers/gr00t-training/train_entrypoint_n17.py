@@ -25,6 +25,9 @@ from pathlib import Path
 
 # SageMaker conventions
 MODEL_DIR = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
+# SageMaker uploads this dir as a separate, small output.tar.gz next to model.tar.gz,
+# so the metadata can be read without fetching the model.
+OUTPUT_DATA_DIR = os.environ.get("SM_OUTPUT_DATA_DIR", "/opt/ml/output/data")
 CHANNEL_TRAINING = os.environ.get("SM_CHANNEL_TRAINING", "/opt/ml/input/data/training")
 FAILURE_FILE = "/opt/ml/output/failure"
 HYPERPARAMS_FILE = "/opt/ml/input/config/hyperparameters.json"
@@ -237,9 +240,35 @@ def main():
         "min_vram": "48 GB",
         "action_horizon": 16,
     }
-    with open(Path(MODEL_DIR) / "training_metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+    write_json_outputs("training_metadata.json", metadata, Path(MODEL_DIR))
+    prune_trainer_checkpoints(Path(MODEL_DIR))
     print("\n  Metadata saved. Done.", flush=True)
+
+
+def write_json_outputs(name: str, data: dict, model_dir: Path) -> None:
+    """Write `name` into the model dir (packed into model.tar.gz) and OUTPUT_DATA_DIR."""
+    for d in (model_dir, Path(OUTPUT_DATA_DIR)):
+        d.mkdir(parents=True, exist_ok=True)  # OUTPUT_DATA_DIR isn't uploaded on Batch; harmless there
+        with open(d / name, "w") as f:
+            json.dump(data, f, indent=2)
+
+
+def prune_trainer_checkpoints(model_dir: Path) -> None:
+    """Drop launch_finetune.py's resumable checkpoint-*/ dirs from the deployable model dir.
+
+    They hold a duplicate of the weights plus optimizer state that serving never
+    reads. Only prune when the final model is at the root, so a run that saved
+    nothing else keeps its checkpoints.
+    """
+    import shutil
+
+    if not ((model_dir / "config.json").exists() and any(model_dir.glob("*.safetensors"))):
+        print("  No final model at the model dir root; keeping trainer checkpoints.", flush=True)
+        return
+    for ckpt in sorted(model_dir.glob("checkpoint-*")):
+        if ckpt.is_dir():
+            shutil.rmtree(ckpt)
+            print(f"  Removed trainer checkpoint (not needed for serving): {ckpt.name}", flush=True)
 
 
 if __name__ == "__main__":
