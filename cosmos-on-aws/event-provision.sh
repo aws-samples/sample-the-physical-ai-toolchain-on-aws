@@ -572,7 +572,10 @@ fi
 # Running the real Cosmos image here is what warms the kubelet image cache, so the
 # 30 GB pre-pull and the weight copy are the same operation.
 #-----------------------------------------------------------------------------------
-STAGE_IMAGE="${COSMOS_IMAGE_URI:-public.ecr.aws/aws-cli/aws-cli:latest}"
+# The official aws-cli image supports only direct `aws` execution; its shell and
+# archive utilities are not a stable interface. Use AL2023 for the default staging
+# path and install the two packages this Job requires before downloading 35 GiB.
+STAGE_IMAGE="${COSMOS_IMAGE_URI:-public.ecr.aws/amazonlinux/amazonlinux:2023}"
 log "Staging with image ${STAGE_IMAGE}"
 
 kubectl delete job cosmos3-staging -n default --ignore-not-found
@@ -583,7 +586,7 @@ metadata:
   name: cosmos3-staging
   namespace: default
 spec:
-  backoffLimit: 2
+  backoffLimit: 0
   template:
     spec:
       restartPolicy: Never
@@ -602,7 +605,18 @@ spec:
           args:
             - |
               set -euo pipefail
-              command -v aws >/dev/null 2>&1 || pip install -q awscli
+              if command -v dnf >/dev/null 2>&1; then
+                dnf install -y --setopt=install_weak_deps=False awscli-2 tar
+                dnf clean all
+              elif ! command -v aws >/dev/null 2>&1; then
+                pip install -q awscli
+              fi
+              for tool in aws sha256sum tar; do
+                command -v "\$tool" >/dev/null 2>&1 || {
+                  echo "Required staging tool is unavailable: \$tool" >&2
+                  exit 1
+                }
+              done
               mkdir -p /models
               if [ -n "${WEIGHTS_ARCHIVE_KEY}" ]; then
                 echo "Copying the verified weights archive from participant S3..."
@@ -646,8 +660,20 @@ if kubectl wait --for=condition=complete --timeout=45m job/cosmos3-staging -n de
   kubectl logs job/cosmos3-staging -n default --tail=10 || true
   log "Pre-provisioning complete - account is event-ready"
 else
-  log "ERROR: staging Job did not complete; recent logs:"
-  kubectl logs job/cosmos3-staging -n default --tail=50 || true
-  kubectl describe job cosmos3-staging -n default | tail -20 || true
+  log "ERROR: staging Job did not complete; preserving pod diagnostics in CodeBuild logs:"
+  pods="$(kubectl get pods -n default -l job-name=cosmos3-staging -o name)"
+  if [ -z "$pods" ]; then
+    log "No staging pods remain; Job diagnostics follow"
+  else
+    for pod in $pods; do
+      log "Diagnostics for ${pod}"
+      kubectl get "$pod" -n default \
+        -o jsonpath='{.status.phase}{" | reason="}{.status.containerStatuses[0].state.terminated.reason}{" | exit="}{.status.containerStatuses[0].state.terminated.exitCode}{"\n"}' \
+        || true
+      kubectl logs "$pod" -n default --all-containers=true --tail=200 || true
+      kubectl describe "$pod" -n default | tail -40 || true
+    done
+  fi
+  kubectl describe job cosmos3-staging -n default | tail -30 || true
   exit 1
 fi
