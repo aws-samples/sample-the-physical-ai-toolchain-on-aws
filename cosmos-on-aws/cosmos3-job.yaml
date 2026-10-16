@@ -91,15 +91,46 @@ spec:
                   ;;
               esac
 
+              # --- Ensure the AWS CLI is available before model-cache recovery ---
+              # The image has python3/pip3 but not the unzip utility required by the
+              # official installer, so use the pure-Python package.
+              if ! command -v aws >/dev/null 2>&1; then
+                echo "=== Installing AWS CLI (via pip) ==="
+                pip3 install --quiet awscli
+              fi
+
+              # --- Restore the node-local cache after Cluster Autoscaler replacement ---
+              # /models is a hostPath on the GPU node. Scaling the node group to zero
+              # deletes that disk, so a later Job must recover the verified participant-S3
+              # archive before REQUIRE_LOCAL_WEIGHTS is evaluated.
+              if [ -n "${LOCAL_MODEL_DIR:-}" ] \
+                 && { [ ! -d "$LOCAL_MODEL_DIR" ] \
+                      || [ -z "$(ls -A "$LOCAL_MODEL_DIR" 2>/dev/null)" ]; } \
+                 && [ -n "${COSMOS_ARCHIVE_S3_URI:-}" ]; then
+                [ -n "${COSMOS_ARCHIVE_SHA256:-}" ] || {
+                  echo "ERROR: COSMOS_ARCHIVE_SHA256 is required with COSMOS_ARCHIVE_S3_URI" >&2
+                  exit 1
+                }
+                ARCHIVE=/models/cosmos3-nano.tar
+                NEXT_DIR=/models/cosmos3-nano.next
+                echo "=== Restoring Cosmos weights from participant S3 ==="
+                aws s3 cp "$COSMOS_ARCHIVE_S3_URI" "$ARCHIVE" \
+                  --region "$AWS_REGION" --only-show-errors
+                printf '%s  %s\n' "$COSMOS_ARCHIVE_SHA256" "$ARCHIVE" | sha256sum -c -
+                rm -rf "$NEXT_DIR"
+                mkdir -p "$NEXT_DIR"
+                tar -xf "$ARCHIVE" -C "$NEXT_DIR"
+                test -s "$NEXT_DIR/config.json"
+                test -s "$NEXT_DIR/model.safetensors.index.json"
+                test -s "$NEXT_DIR/transformer/diffusion_pytorch_model.safetensors.index.json"
+                test -s "$NEXT_DIR/vae/diffusion_pytorch_model.safetensors"
+                rm -rf "$LOCAL_MODEL_DIR"
+                mv "$NEXT_DIR" "$LOCAL_MODEL_DIR"
+                rm -f "$ARCHIVE"
+                echo "=== Restored and verified Cosmos weights ==="
+              fi
+
               # --- Prefer node-local staged weights over a gated HF download ---
-              # event-provision.sh stages weights onto the node's disk (hostPath
-              # /opt/cosmos3, mounted here at /models). Serving straight from that
-              # directory skips the ~33 GB gated Hugging Face download, so participants
-              # need neither an HF token nor an accepted model licence.
-              #
-              # Falling back to the Hugging Face repo id keeps the path that is actually
-              # validated end-to-end (measured on g6e.4xlarge: 7m44s to ready, 11m22s to
-              # generate) working unchanged when nothing has been staged.
               if [ -n "${LOCAL_MODEL_DIR:-}" ] && [ -d "$LOCAL_MODEL_DIR" ] \
                  && [ -n "$(ls -A "$LOCAL_MODEL_DIR" 2>/dev/null)" ]; then
                 echo "=== Using node-local staged weights: $LOCAL_MODEL_DIR ==="
@@ -115,16 +146,6 @@ spec:
               # passed to `vllm serve`, so deriving this from the Hugging Face id would
               # make the readiness grep below never match a local-path launch.
               MODEL_SHORT_NAME=$(basename "$MODEL_ID")
-
-              # --- Ensure the AWS CLI is available (image doesn't ship it) ---
-              # Installed via pip instead of the official zip installer — the
-              # image has python3/pip3 but not `unzip`, which the zip
-              # installer requires. pip's awscli is pure-Python, no unzip
-              # needed, and is fast enough here (a few seconds).
-              if ! command -v aws >/dev/null 2>&1; then
-                echo "=== Installing AWS CLI (via pip) ==="
-                pip3 install --quiet awscli
-              fi
 
               # --- Start the server in the background ---
               echo "=== Starting vLLM-Omni ${MODEL_ID} ==="
@@ -233,6 +254,10 @@ spec:
             - { name: COSMOS_MODEL, value: "super" }
             # Set true in event manifests after central weight staging is configured.
             - { name: REQUIRE_LOCAL_WEIGHTS, value: "false" }
+            # Optional recovery source for a new autoscaled GPU node. Event manifests
+            # populate these from Cosmos3ArchiveS3Uri and Cosmos3ArchiveSha256 outputs.
+            - { name: COSMOS_ARCHIVE_S3_URI, value: "" }
+            - { name: COSMOS_ARCHIVE_SHA256, value: "" }
             # <REGION> and <DATASETS_BUCKET> are account-specific — replace
             # both before applying (see note at the top of this file).
             - { name: AWS_REGION, value: "<REGION>" }
@@ -272,11 +297,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
-        # hostPath rather than a PVC: eks.tf builds the cluster in the Foundation VPC
-        # and installs only aws-ebs-csi-driver (no EFS), and the GPU node group is a
-        # single node, so node-local disk is both sufficient and the fastest option.
-        # DirectoryOrCreate keeps the pod schedulable on a node that was never staged,
-        # in which case the Hugging Face fallback above takes over.
+        # hostPath keeps repeated Jobs fast while a GPU node remains alive. If Cluster
+        # Autoscaler replaces the node, the container restores the verified archive from
+        # participant S3 before starting Cosmos.
         - name: models
           hostPath:
             path: /opt/cosmos3

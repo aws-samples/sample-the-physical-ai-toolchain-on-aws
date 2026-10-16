@@ -337,7 +337,7 @@ module "cosmos3_eks" {
       instance_types = [var.eks_gpu_node_instance_type]
       # Capacity Block nodes must use CAPACITY_BLOCK capacity type.
       capacity_type = local.eks_gpu_capacity_block_specified ? "CAPACITY_BLOCK" : "ON_DEMAND"
-      ami_type      = "AL2_x86_64_GPU"
+      ami_type      = "AL2023_x86_64_NVIDIA"
 
       min_size     = 0
       max_size     = 1
