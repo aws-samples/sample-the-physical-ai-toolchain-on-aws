@@ -653,6 +653,13 @@ spec:
                 rm -rf /models/cosmos3-nano /models/hf-cache
                 mv /models/cosmos3-nano.next /models/cosmos3-nano
                 mv /models/hf-cache.next /models/hf-cache
+                mkdir -p \
+                  /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs \
+                  /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs
+                printf '%s\n' cf03c0395fac8c4de386c0bdab12cc4fc8d66362 \
+                  > /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs/main
+                printf '%s\n' d6d4bfa899a71454a700907664f3e88f503950cf \
+                  > /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs/main
                 rm -f /models/cosmos3-nano.tar
                 echo "Runtime bundle extracted; model and guardrail caches validated."
                 du -sh /models/cosmos3-nano /models/hf-cache

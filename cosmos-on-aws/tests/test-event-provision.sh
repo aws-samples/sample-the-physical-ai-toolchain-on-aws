@@ -288,6 +288,8 @@ expect "staging Job checks archive" has "$LOG.stdin" "$ARCHIVE_SHA  /models/cosm
 expect "staging Job validates Cosmos-1.0-Guardrail" has "$LOG.stdin" "models--nvidia--Cosmos-1.0-Guardrail/snapshots/cf03c0395fac8c4de386c0bdab12cc4fc8d66362/config.json"
 expect "staging Job validates Cosmos-Guardrail1" has "$LOG.stdin" "models--nvidia--Cosmos-Guardrail1/snapshots/d6d4bfa899a71454a700907664f3e88f503950cf/video_content_safety_filter/safety_filter.pt"
 expect "staging Job installs guardrail HF cache" has "$LOG.stdin" "mv /models/hf-cache.next /models/hf-cache"
+expect "staging Job pins Cosmos-1.0-Guardrail main ref" has "$LOG.stdin" "models--nvidia--Cosmos-1.0-Guardrail/refs/main"
+expect "staging Job pins Cosmos-Guardrail1 main ref" has "$LOG.stdin" "models--nvidia--Cosmos-Guardrail1/refs/main"
 expect "no HF secret lookup" hasnt "$LOG" "secretsmanager get-secret-value"
 expect "no Kubernetes HF Secret" hasnt "$LOG" "kubectl create secret generic hf-token"
 finish "c2  presigned archive -> verify, relay, extract without HF token"
