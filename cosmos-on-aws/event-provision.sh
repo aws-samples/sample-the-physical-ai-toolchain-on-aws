@@ -630,11 +630,16 @@ spec:
                 test -s /models/cosmos3-nano.next/model.safetensors.index.json
                 test -s /models/cosmos3-nano.next/transformer/diffusion_pytorch_model.safetensors.index.json
                 test -s /models/cosmos3-nano.next/vae/diffusion_pytorch_model.safetensors
-                rm -rf /models/cosmos3-nano
+                test -s /models/cosmos3-nano.next/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/snapshots/cf03c0395fac8c4de386c0bdab12cc4fc8d66362/config.json
+                test -s /models/cosmos3-nano.next/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/snapshots/d6d4bfa899a71454a700907664f3e88f503950cf/video_content_safety_filter/safety_filter.pt
+                rm -rf /models/hf-cache.next
+                mv /models/cosmos3-nano.next/hf-cache /models/hf-cache.next
+                rm -rf /models/cosmos3-nano /models/hf-cache
                 mv /models/cosmos3-nano.next /models/cosmos3-nano
+                mv /models/hf-cache.next /models/hf-cache
                 rm -f /models/cosmos3-nano.tar
-                echo "Archive extracted and validated."
-                du -sh /models/cosmos3-nano
+                echo "Runtime bundle extracted; model and guardrail caches validated."
+                du -sh /models/cosmos3-nano /models/hf-cache
               elif [ -n "${CENTRAL_WEIGHTS_S3}" ]; then
                 mkdir -p /models/cosmos3-nano
                 echo "Copying unpacked weights to node-local disk..."
