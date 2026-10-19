@@ -151,9 +151,9 @@ spec:
                 mkdir -p \
                   /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs \
                   /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs
-                printf '%s\n' "$COSMOS_GUARDRAIL_REVISION" \
+                printf '%s' "$COSMOS_GUARDRAIL_REVISION" \
                   > /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs/main
-                printf '%s\n' "$COSMOS_GUARDRAIL1_REVISION" \
+                printf '%s' "$COSMOS_GUARDRAIL1_REVISION" \
                   > /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs/main
                 echo "=== Pinned offline guardrail refs/main materialized ==="
               fi
