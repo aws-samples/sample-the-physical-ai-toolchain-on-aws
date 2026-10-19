@@ -207,10 +207,22 @@ spec:
                 exit 1
               fi
 
-              # --- Download the reference video from S3 ---
-              REF_LOCAL=/workspace/io/reference.mp4
+              # --- Download and normalize the reference video from S3 ---
+              # Workshop Studio packages the source clip as AV1. OpenCV in the Cosmos
+              # image attempts an unavailable hardware AV1 decoder and returns 0 frames,
+              # so use ffmpeg's software decoder to create an H.264 inference copy.
+              REF_SOURCE=/workspace/io/reference-source.mp4
+              REF_LOCAL=/workspace/io/reference-h264.mp4
               echo "=== Downloading reference video: ${INPUT_S3_URI} ==="
-              aws s3 cp "${INPUT_S3_URI}" "$REF_LOCAL" --region "${AWS_REGION}"
+              aws s3 cp "${INPUT_S3_URI}" "$REF_SOURCE" --region "${AWS_REGION}"
+              command -v ffmpeg >/dev/null 2>&1 || {
+                echo "ERROR: ffmpeg is required to normalize the workshop input video" >&2
+                exit 1
+              }
+              ffmpeg -hide_banner -loglevel error -y -i "$REF_SOURCE" \
+                -an -c:v libx264 -pix_fmt yuv420p "$REF_LOCAL"
+              test -s "$REF_LOCAL"
+              echo "=== Reference video normalized to H.264 for Cosmos ==="
 
               # --- Generate ---
               # Uses the ASYNC job API (POST /v1/videos + poll + /content),
@@ -266,7 +278,7 @@ spec:
               # --- Upload result (+ original reference) to S3 ---
               echo "=== Uploading to ${OUTPUT_S3_PREFIX} ==="
               aws s3 cp "$OUT_LOCAL" "${OUTPUT_S3_PREFIX}/${OUTPUT_FILENAME}" --region "${AWS_REGION}"
-              aws s3 cp "$REF_LOCAL" "${OUTPUT_S3_PREFIX}/${REFERENCE_FILENAME}" --region "${AWS_REGION}"
+              aws s3 cp "$REF_SOURCE" "${OUTPUT_S3_PREFIX}/${REFERENCE_FILENAME}" --region "${AWS_REGION}"
 
               echo "=== Done. Shutting down server. ==="
               kill "$SERVER_PID" 2>/dev/null || true
