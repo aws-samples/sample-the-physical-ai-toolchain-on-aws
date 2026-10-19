@@ -56,7 +56,15 @@ case "$1 ${2:-}" in
       *) echo "arn:aws:sts::123456789012:assumed-role/TerraformBuildRole/s" ;;
     esac ;;
   "iam get-role")
-    echo "An error occurred (NoSuchEntity) when calling the GetRole operation" >&2; exit 254 ;;
+    if [ -n "${STUB_CONFIGURED_PARTICIPANT_ARN:-}" ]; then
+      echo "$STUB_CONFIGURED_PARTICIPANT_ARN"
+    else
+      echo "An error occurred (NoSuchEntity) when calling the GetRole operation" >&2
+      exit 254
+    fi ;;
+  "iam list-roles")
+    [ -n "${STUB_PARTICIPANT_CANDIDATES:-}" ] && echo "$STUB_PARTICIPANT_CANDIDATES"
+    exit 0 ;;
   "ec2 describe-subnets")
     shift 2
     ids=""; collecting=0
@@ -246,6 +254,23 @@ expect "extra buckets = both" tfvar "$TFV" eks_pod_extra_s3_buckets "[\"$DATA\",
 expect "source logged" has "$OUT" "(source: SSM /physical-ai/datasets-bucket)"
 finish "b   datasets-bucket param present -> its value used and granted"
 
+
+# (b2) configured participant role missing -> exactly one participant-named role is auto-detected
+PARTICIPANT_CANDIDATE="arn:aws:iam::$ACCOUNT:role/gtc-participant-role"
+run_case b2 "${WORKSHOP_ENV[@]}" "PARTICIPANT_ROLE_NAME=WSParticipantRole" \
+  "STUB_PARTICIPANT_CANDIDATES=$PARTICIPANT_CANDIDATE"
+expect "exit 0" rc_is 0
+expect "single participant role mapped for view" tfvar "$TFV" eks_view_principal_arns "[\"$PARTICIPANT_CANDIDATE\"]"
+expect "auto-detection logged" has "$OUT" "auto-detected $PARTICIPANT_CANDIDATE"
+finish "b2  missing configured participant role -> one candidate auto-detected"
+
+# (b3) multiple participant-named roles -> do not guess
+run_case b3 "${WORKSHOP_ENV[@]}" "PARTICIPANT_ROLE_NAME=WSParticipantRole" \
+  "STUB_PARTICIPANT_CANDIDATES=arn:aws:iam::$ACCOUNT:role/event-participant arn:aws:iam::$ACCOUNT:role/gtc-participant-role"
+expect "exit 0" rc_is 0
+expect "ambiguous candidates not mapped" tfvar "$TFV" eks_view_principal_arns "[]"
+expect "ambiguity logged" has "$OUT" "multiple participant-role candidates exist"
+finish "b3  multiple participant roles -> no access-entry guess"
 
 # (c2) presigned archive -> verified, relayed to participant S3, then extracted on node
 run_case c2 "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" "DATA_BUCKET=$DATA"

@@ -310,17 +310,33 @@ fi
 log "Cluster admins: ${ADMIN_ARNS}"
 
 # Read-only cluster access for the workshop participant role, so the EKS console's
-# Resources tab can show Jobs, pods and logs. Resolved by name and skipped silently when
-# the role does not exist, which is the normal case outside an AWS-hosted event (for
-# example a bring-your-own-account run, where the operator is already an admin).
+# Resources tab can show Jobs, pods and logs. Resolve the configured name first. Event
+# platforms do not use one universal role name, so if that name is absent, accept exactly
+# one IAM role whose name contains "participant". Never guess when several match.
 VIEW_ARNS="[]"
 if [ -n "${PARTICIPANT_ROLE_NAME:-}" ]; then
+  PARTICIPANT_ARN=""
   if PARTICIPANT_ARN="$(aws iam get-role --role-name "${PARTICIPANT_ROLE_NAME}" \
        --query 'Role.Arn' --output text 2>/dev/null)" && [ -n "$PARTICIPANT_ARN" ]; then
+    log "Resolved configured participant role: ${PARTICIPANT_ARN}"
+  else
+    PARTICIPANT_ARN=""
+    PARTICIPANT_CANDIDATES="$(aws iam list-roles \
+      --query 'Roles[?contains(RoleName, `participant`) || contains(RoleName, `Participant`)].Arn' \
+      --output text 2>/dev/null || true)"
+    set -- $PARTICIPANT_CANDIDATES
+    if [ "$#" -eq 1 ] && [ "$1" != None ]; then
+      PARTICIPANT_ARN="$1"
+      log "Configured participant role '${PARTICIPANT_ROLE_NAME}' not found; auto-detected ${PARTICIPANT_ARN}"
+    elif [ "$#" -gt 1 ]; then
+      log "Configured participant role '${PARTICIPANT_ROLE_NAME}' not found; multiple participant-role candidates exist, so console view access was not guessed"
+    else
+      log "Participant role '${PARTICIPANT_ROLE_NAME}' not found - skipping console view access"
+    fi
+  fi
+  if [ -n "$PARTICIPANT_ARN" ]; then
     VIEW_ARNS="[\"${PARTICIPANT_ARN}\"]"
     log "Participant role granted read-only cluster access: ${PARTICIPANT_ARN}"
-  else
-    log "Participant role '${PARTICIPANT_ROLE_NAME}' not found - skipping console view access"
   fi
 fi
 
