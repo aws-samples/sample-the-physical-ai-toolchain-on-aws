@@ -648,6 +648,8 @@ spec:
                 test -s /models/cosmos3-nano.next/vae/diffusion_pytorch_model.safetensors
                 test -s /models/cosmos3-nano.next/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/snapshots/cf03c0395fac8c4de386c0bdab12cc4fc8d66362/config.json
                 test -s /models/cosmos3-nano.next/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/snapshots/d6d4bfa899a71454a700907664f3e88f503950cf/video_content_safety_filter/safety_filter.pt
+                test -s /models/cosmos3-nano.next/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/snapshots/fada3b2f655b89601929198343c94cd2f64d93cc/config.json
+                test -s /models/cosmos3-nano.next/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/snapshots/fada3b2f655b89601929198343c94cd2f64d93cc/model.safetensors
                 rm -rf /models/hf-cache.next
                 mv /models/cosmos3-nano.next/hf-cache /models/hf-cache.next
                 rm -rf /models/cosmos3-nano /models/hf-cache
@@ -655,11 +657,14 @@ spec:
                 mv /models/hf-cache.next /models/hf-cache
                 mkdir -p \
                   /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs \
-                  /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs
+                  /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs \
+                  /models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/refs
                 printf '%s' cf03c0395fac8c4de386c0bdab12cc4fc8d66362 \
                   > /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs/main
                 printf '%s' d6d4bfa899a71454a700907664f3e88f503950cf \
                   > /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs/main
+                printf '%s' fada3b2f655b89601929198343c94cd2f64d93cc \
+                  > /models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/refs/main
                 rm -f /models/cosmos3-nano.tar
                 echo "Runtime bundle extracted; model and guardrail caches validated."
                 du -sh /models/cosmos3-nano /models/hf-cache
