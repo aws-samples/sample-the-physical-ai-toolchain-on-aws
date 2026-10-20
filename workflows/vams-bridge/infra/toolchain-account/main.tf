@@ -243,6 +243,13 @@ data "aws_iam_policy_document" "lambda" {
     resources = ["*"]
   }
   statement {
+    # The SageMaker Pipeline takes the token as its plain HFToken parameter, so ReadManifest reads
+    # the secret at submit time (absent secret => unauthenticated download of the ungated base).
+    sid       = "ReadHfTokenForPipelineParameter"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["arn:${local.partition}:secretsmanager:${var.aws_region}:${local.account_id}:secret:${var.hf_token_secret_id}-*"]
+  }
+  statement {
     sid     = "ReadJobLogTail"
     actions = ["logs:GetLogEvents", "logs:DescribeLogStreams"]
     resources = [
