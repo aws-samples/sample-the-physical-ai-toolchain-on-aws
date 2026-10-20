@@ -186,9 +186,7 @@
         "Jobs.$": "States.Array($.submitted.jobId)"
       },
       "ResultSelector": {
-        "status.$": "$.Jobs[0].Status",
-        "statusReason.$": "$.Jobs[0].StatusReason",
-        "logStreamName.$": "$.Jobs[0].Container.LogStreamName"
+        "status.$": "$.Jobs[0].Status"
       },
       "ResultPath": "$.job",
       "Retry": [
@@ -211,7 +209,8 @@
           "Next": "StopJobThenFail"
         }
       ],
-      "Next": "Heartbeat"
+      "Next": "Heartbeat",
+      "Comment": "Select only fields present in every job state: a reason or log-stream field is absent while the job runs, and a missing JSONPath in ResultSelector is an uncatchable States.Runtime. Collect reads the reason and the log stream itself once the job is final."
     },
     "Heartbeat": {
       "Type": "Task",
