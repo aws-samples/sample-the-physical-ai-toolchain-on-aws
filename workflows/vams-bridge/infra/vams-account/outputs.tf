@@ -15,11 +15,13 @@ output "bridge_log_group_name" {
 output "vams_orchestration_bus_arn" {
   description = "Read from SSM; pass to the toolchain-account root as vams_orchestration_bus_arn."
   value       = data.aws_ssm_parameter.orchestration_bus_arn.value
+  sensitive   = true # SSM parameter values are sensitive in the AWS provider; read with terraform output -raw
 }
 
 output "vams_workflow_execution_role_arn" {
   description = "Read from SSM; pass to the toolchain-account root as vams_workflow_execution_role_arn in direct mode (VAMS 2.7+)."
   value       = data.aws_ssm_parameter.workflow_execution_role_arn.value
+  sensitive   = true # SSM parameter values are sensitive in the AWS provider; read with terraform output -raw
 }
 
 output "relay_role_arn" {

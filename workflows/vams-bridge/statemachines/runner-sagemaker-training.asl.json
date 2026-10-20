@@ -1,5 +1,5 @@
 {
-  "Comment": "VAMS bridge runner: SageMaker Training Job. Input is the VAMS EventBridge event; $.detail.body carries TaskToken, inputManifestS3Location, inputConfigurationS3Location. Every VAMS callback runs as the VAMS-account control role via Credentials.RoleArn. Placeholders ${...} are substituted by Terraform (templatefile).",
+  "Comment": "VAMS bridge runner: SageMaker Training Job. Input is the VAMS EventBridge event; $.detail.body carries TaskToken, inputManifestS3Location, inputConfigurationS3Location. Every VAMS callback runs as the VAMS-account control role via Credentials.RoleArn. Dollar-brace placeholders are substituted by Terraform (templatefile) (templatefile).",
   "StartAt": "ReadManifest",
   "States": {
     "ReadManifest": {

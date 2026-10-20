@@ -13,7 +13,7 @@
         }
     },
     "systemConfig": {
-        "inputFileArity": "many",
+        "inputFileArity": "multi",
         "assetScope": {
             "wholeAsset": true
         },
