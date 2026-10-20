@@ -7,17 +7,23 @@
 # Everything about the VAMS deployment is read from the SSM parameters VAMS publishes under
 # var.vams_resource_param_prefix (VAMS 2.7+, GitHub awslabs/visual-asset-management-system#398).
 #
-# Status: skeleton. Registration is declared as a null_resource invoking the VAMS import Lambda via
-# the AWS CLI; a TODO notes the alternative of an aws_lambda_invocation data source.
+# Status: resources declared and validated (terraform validate); not yet deployed.
 
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
 locals {
-  name_prefix = "pai-vams-bridge"
   partition   = data.aws_partition.current.partition
   account_id  = data.aws_caller_identity.current.account_id
-  common_tags = merge(var.tags, { Module = "vams-bridge" })
+  common_tags = merge(var.tags, { Environment = var.environment, Module = "vams-bridge" })
+
+  # Fixed names shared with ../toolchain-account (same `environment`); see the note there.
+  name_prefix               = "pai-vams-bridge-${var.environment}"
+  control_role_name         = "pai-vams-bridge-control-${var.environment}"
+  data_role_name            = "pai-vams-bridge-data-${var.environment}"
+  bridge_log_group          = "/aws/vendedlogs/Pipelines/pai-vams-bridge-${var.environment}"
+  toolchain_runner_role_arn = "arn:${local.partition}:iam::${var.toolchain_account_id}:role/pai-vams-bridge-runner-${var.environment}"
+  toolchain_bridge_bus_arn  = "arn:${local.partition}:events:${var.toolchain_region}:${var.toolchain_account_id}:event-bus/${local.name_prefix}"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -53,17 +59,17 @@ data "aws_iam_policy_document" "cross_account_trust" {
     actions = ["sts:AssumeRole"]
     principals {
       type        = "AWS"
-      identifiers = [var.toolchain_runner_role_arn]
+      identifiers = ["arn:${local.partition}:iam::${var.toolchain_account_id}:root"]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = [local.toolchain_runner_role_arn]
     }
     condition {
       test     = "StringEquals"
       variable = "sts:ExternalId"
       values   = [var.vams_role_external_id]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "aws:PrincipalAccount"
-      values   = [var.toolchain_account_id]
     }
   }
 }
@@ -73,7 +79,7 @@ data "aws_iam_policy_document" "cross_account_trust" {
 # is scoped to the orchestration bus; PutLogEvents to the bridge log group only.
 # ---------------------------------------------------------------------------------------------
 resource "aws_iam_role" "control" {
-  name_prefix          = "${local.name_prefix}-control-"
+  name                 = local.control_role_name
   assume_role_policy   = data.aws_iam_policy_document.cross_account_trust.json
   max_session_duration = 3600
   tags                 = local.common_tags
@@ -110,31 +116,60 @@ resource "aws_iam_role_policy" "control" {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Data role: read the manifest/config/inputs, write ONLY under the run's output prefixes. The exact
-# bucket set is deployment-specific; declare it through var-driven statements.
-# TODO: take the VAMS asset bucket names from the VAMS buckets SSM parameters / a variable and scope
-#       to <bucket>/<baseAssetsPrefix>pipelines/* for writes.
+# Data role: read the manifest/config/inputs, write ONLY under the run's output prefixes.
+# An input file is any file of the asset, so reads are bucket-wide on the listed asset buckets;
+# writes are confined to the VAMS run layout <baseAssetsPrefix>pipelines/<pipeline>/<job>/output/.
 # ---------------------------------------------------------------------------------------------
 resource "aws_iam_role" "data" {
-  name_prefix          = "${local.name_prefix}-data-"
+  name                 = local.data_role_name
   assume_role_policy   = data.aws_iam_policy_document.cross_account_trust.json
   max_session_duration = 3600
   tags                 = local.common_tags
 }
 
+locals {
+  asset_bucket_arns = [for b in var.vams_asset_bucket_names : "arn:${local.partition}:s3:::${b}"]
+  asset_object_arns = [for b in var.vams_asset_bucket_names : "arn:${local.partition}:s3:::${b}/*"]
+  run_output_arns = flatten([for b in var.vams_asset_bucket_names : [
+    "arn:${local.partition}:s3:::${b}/pipelines/*/output/*",
+    "arn:${local.partition}:s3:::${b}/*/pipelines/*/output/*",
+  ]])
+}
+
 data "aws_iam_policy_document" "data" {
   statement {
-    sid       = "ReadManifestAndConfig"
-    actions   = ["s3:GetObject"]
-    resources = ["arn:${local.partition}:s3:::*/pipelines/*/input/*"] # TODO: name the asset buckets
+    sid       = "ReadInputsManifestAndConfig"
+    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
+    resources = local.asset_object_arns
+  }
+  statement {
+    sid       = "ListRunPrefixes"
+    actions   = ["s3:ListBucket"]
+    resources = local.asset_bucket_arns
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["pipelines/*", "*/pipelines/*"]
+    }
   }
   statement {
     sid       = "WriteRunOutputs"
-    actions   = ["s3:PutObject", "s3:AbortMultipartUpload"]
-    resources = ["arn:${local.partition}:s3:::*/pipelines/*/output/*"] # TODO: name the asset buckets
+    actions   = ["s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
+    resources = local.run_output_arns
   }
-  # TODO: kms:Decrypt / kms:GenerateDataKey on the VAMS CMK when the deployment uses one
-  #       (useKmsCmkEncryption.enabled); key ARN from the VAMS stack outputs.
+  dynamic "statement" {
+    for_each = var.vams_kms_key_arn == "" ? [] : [var.vams_kms_key_arn]
+    content {
+      sid       = "VamsCmk"
+      actions   = ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+      resources = [statement.value]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["s3.${var.aws_region}.amazonaws.com"]
+      }
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "data" {
@@ -147,19 +182,19 @@ resource "aws_iam_role_policy" "data" {
 # in VAMS's default executionLogReadPrefixes.
 # ---------------------------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "bridge" {
-  name              = "/aws/vendedlogs/Pipelines/${local.name_prefix}"
+  name              = local.bridge_log_group
   retention_in_days = 365
   tags              = local.common_tags
 }
 
 # ---------------------------------------------------------------------------------------------
-# Relay (VAMS 2.6.x only). The VAMS workflow role may put to a bus in its own account whose name
-# contains the VAMS deployment name; this rule forwards to the toolchain bus.
-# TODO: the bus name must contain the VAMS deployment name — take it as a variable.
+# Relay (VAMS 2.6.x only). The 2.6.x workflow role may put to a bus in its own account whose name
+# carries the VAMS deployment name; this rule forwards everything from the pai.* source to the
+# toolchain bus. Not created in direct mode.
 # ---------------------------------------------------------------------------------------------
 resource "aws_cloudwatch_event_bus" "relay" {
   count = var.vams_relay ? 1 : 0
-  name  = "vams-${local.name_prefix}-relay" # TODO: "<vamsName>-pai-bridge"
+  name  = "${var.vams_deployment_name}-pai-bridge-relay"
   tags  = local.common_tags
 }
 
@@ -184,8 +219,8 @@ resource "aws_iam_role_policy" "relay" {
   count = var.vams_relay ? 1 : 0
   role  = aws_iam_role.relay[0].id
   policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = "events:PutEvents", Resource = var.toolchain_bridge_bus_arn }]
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = "events:PutEvents", Resource = local.toolchain_bridge_bus_arn }]
   })
 }
 
@@ -200,27 +235,28 @@ resource "aws_cloudwatch_event_target" "relay" {
   count          = var.vams_relay ? 1 : 0
   rule           = aws_cloudwatch_event_rule.relay[0].name
   event_bus_name = aws_cloudwatch_event_bus.relay[0].name
-  arn            = var.toolchain_bridge_bus_arn
+  arn            = local.toolchain_bridge_bus_arn
   role_arn       = aws_iam_role.relay[0].arn
 }
 
 # ---------------------------------------------------------------------------------------------
 # vamsSchema registration: upload each bundle to the VAMS artefacts bucket under vamsSchema/pai-<id>/
-# and invoke the VAMS import Lambda directly (no RequestType => register-and-return). The payload
-# shape is the same ResourceProperties the VAMS CDK construct passes: bundleS3Keys (S3 keys of the
-# uploaded files), resourceOverrides and idOverrides as JSON strings. Idempotent: a re-run
-# overwrites the definition and clears the archived flag.
-# TODO: replace the local-exec with aws_lambda_invocation once the payload is final; the CLI form is
-#       kept here so the exact request shape is visible for review.
+# and invoke the VAMS import Lambda directly (no RequestType => register-and-return). The payload is
+# the ResourceProperties shape the VAMS CDK construct passes: bundleS3Keys (S3 keys of the uploaded
+# files), resourceOverrides and idOverrides as JSON strings. Idempotent: a re-run overwrites the
+# definition and clears the archived flag. The invocation fails the apply when the Lambda raises.
 # ---------------------------------------------------------------------------------------------
 locals {
-  bus_arn_for_vams = var.vams_relay ? aws_cloudwatch_event_bus.relay[0].arn : var.toolchain_bridge_bus_arn
+  bus_arn_for_vams = var.vams_relay ? aws_cloudwatch_event_bus.relay[0].arn : local.toolchain_bridge_bus_arn
   schema_root      = "${path.module}/../../vamsSchema"
-  bundle_keys = { for c in var.components : c => {
-    pipeline  = "vamsSchema/pai-${c}/pipeline.json"
-    workflow  = fileexists("${local.schema_root}/${c}/workflow.json") ? "vamsSchema/pai-${c}/workflow.json" : null
-    templates = [for t in fileset("${local.schema_root}/${c}/templates", "*.json") : "vamsSchema/pai-${c}/templates/${t}"]
-  } }
+  bundle_keys = { for c in var.components : c => merge(
+    { pipeline = "vamsSchema/pai-${c}/pipeline.json" },
+    fileexists("${local.schema_root}/${c}/workflow.json") ? { workflow = "vamsSchema/pai-${c}/workflow.json" } : {},
+    { templates = [for t in fileset("${local.schema_root}/${c}/templates", "*.json") : "vamsSchema/pai-${c}/templates/${t}"] },
+  ) }
+  schema_hashes = { for c in var.components : c => sha256(join("", [
+    for p in sort(fileset("${local.schema_root}/${c}", "**")) : filesha256("${local.schema_root}/${c}/${p}")
+  ])) }
 }
 
 resource "aws_s3_object" "vams_schema" {
@@ -234,29 +270,19 @@ resource "aws_s3_object" "vams_schema" {
   etag   = filemd5("${local.schema_root}/${each.value.component}/${each.value.path}")
 }
 
-resource "null_resource" "register" {
-  for_each = toset(var.components)
+resource "aws_lambda_invocation" "register" {
+  for_each      = toset(var.components)
+  function_name = data.aws_ssm_parameter.import_function_name.value
+
+  input = jsonencode({
+    bundleS3Keys      = jsonencode(local.bundle_keys[each.key])
+    resourceOverrides = jsonencode({ eventBridgeBusArn = local.bus_arn_for_vams })
+    idOverrides       = jsonencode({ pipelineId = "pai-${each.key}", workflowId = "pai-${each.key}" })
+  })
 
   triggers = {
-    schema_hash = sha256(join("", [for p in fileset("${local.schema_root}/${each.key}", "**") :
-      filesha256("${local.schema_root}/${each.key}/${p}")]))
-    bus_arn = local.bus_arn_for_vams
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      mkdir -p ${path.module}/.build && \
-      aws lambda invoke --region ${var.aws_region} \
-        --function-name ${data.aws_ssm_parameter.import_function_name.value} \
-        --cli-binary-format raw-in-base64-out \
-        --payload '${jsonencode({
-          bundleS3Keys      = jsonencode({ for k, v in local.bundle_keys[each.key] : k => v if v != null })
-          resourceOverrides = jsonencode({ eventBridgeBusArn = local.bus_arn_for_vams })
-          idOverrides       = jsonencode({ pipelineId = "pai-${each.key}", workflowId = "pai-${each.key}" })
-        })}' \
-        ${path.module}/.build/register-${each.key}.json && \
-      python3 -c "import json,sys; r=json.load(open('${path.module}/.build/register-${each.key}.json')); sys.exit(1 if r.get('errorMessage') or r.get('statusCode') != 200 else 0)"
-    EOT
+    schema_hash = local.schema_hashes[each.key]
+    bus_arn     = local.bus_arn_for_vams
   }
 
   depends_on = [aws_s3_object.vams_schema]

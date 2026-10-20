@@ -4,12 +4,13 @@ output "bridge_bus_arn" {
 }
 
 output "runner_role_arn" {
-  description = "Runner execution role. Its name prefix is the externalPipelineBridges[].roleArnPattern the VAMS deployment lists."
+  description = "Runner execution role (fixed name pai-vams-bridge-runner-<environment>). The vams-account root derives this same ARN from toolchain_account_id + environment."
   value       = aws_iam_role.runner.arn
 }
 
 output "runner_role_arn_pattern" {
-  value = "arn:${local.partition}:iam::${local.account_id}:role/${local.name_prefix}-runner-*"
+  description = "externalPipelineBridges[].roleArnPattern for the VAMS config.json."
+  value       = "arn:${local.partition}:iam::${local.account_id}:role/pai-vams-bridge-runner-*"
 }
 
 output "runner_state_machine_arns" {
@@ -17,10 +18,10 @@ output "runner_state_machine_arns" {
 }
 
 output "vams_config_snippet" {
-  description = "Paste into the VAMS deployment's config.json (VAMS 2.7+ direct mode)."
+  description = "Paste into the VAMS deployment's config.json under app.pipelines.externalPipelineBridges (VAMS 2.7+ direct mode)."
   value = jsonencode({
     accountId      = local.account_id
-    roleArnPattern = "arn:${local.partition}:iam::${local.account_id}:role/${local.name_prefix}-runner-*"
+    roleArnPattern = "arn:${local.partition}:iam::${local.account_id}:role/pai-vams-bridge-runner-*"
     invokeTargets  = [aws_cloudwatch_event_bus.bridge.arn]
   })
 }

@@ -16,7 +16,7 @@ variable "environment" {
 }
 
 variable "vams_account_id" {
-  description = "AWS account id of the VAMS deployment. Used only to scope the bridge bus resource policy to the VAMS workflow role."
+  description = "AWS account id of the VAMS deployment. Scopes the bridge bus policy and derives the ARNs of the two VAMS-account roles (fixed names, see locals)."
   type        = string
   validation {
     condition     = can(regex("^[0-9]{12}$", var.vams_account_id))
@@ -24,8 +24,13 @@ variable "vams_account_id" {
   }
 }
 
+variable "vams_region" {
+  description = "Region of the VAMS deployment (derives the bridge log group ARN the runner registers with VAMS)."
+  type        = string
+}
+
 variable "vams_workflow_execution_role_arn" {
-  description = "VAMS workflow state-machine role ARN (SSM <vams prefix>/integration/workflowExecutionRoleArn). The only VAMS principal allowed to put events on the bridge bus (direct mode, VAMS 2.7+)."
+  description = "VAMS workflow state-machine role ARN (SSM <vams prefix>/integration/workflowExecutionRoleArn). The only VAMS principal allowed to put events on the bridge bus (direct mode, VAMS 2.7+). In relay mode pass the vams-account root's relay_role_arn output instead."
   type        = string
 }
 
@@ -34,29 +39,10 @@ variable "vams_orchestration_bus_arn" {
   type        = string
 }
 
-variable "vams_control_role_arn" {
-  description = "Output of the vams-account root: the VAMS-account role the runner assumes for every callback."
-  type        = string
-}
-
-variable "vams_data_role_arn" {
-  description = "Output of the vams-account root: the VAMS-account role ReadManifest/Collect assume to read inputs and write outputs."
-  type        = string
-}
-
 variable "vams_role_external_id" {
-  description = "ExternalId both VAMS-account roles require. Generate once (e.g. a UUID), store in this account's Secrets Manager, pass to both roots."
+  description = "ExternalId both VAMS-account roles require. Generate once (e.g. a UUID), store in this account's Secrets Manager, pass the same value to both roots."
   type        = string
   sensitive   = true
-}
-
-variable "vams_bridge_log_group_name" {
-  description = "Output of the vams-account root: the VAMS-account log group Collect ships job log tails to (/aws/vendedlogs/Pipelines/pai-<component>)."
-  type        = string
-}
-
-variable "vams_bridge_log_group_arn" {
-  type = string
 }
 
 variable "sagemaker_pipeline_name" {

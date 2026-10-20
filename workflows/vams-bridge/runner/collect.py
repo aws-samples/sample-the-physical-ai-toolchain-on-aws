@@ -17,7 +17,9 @@ Rules this follows (from the VAMS bridge contract):
   it is NOT returned, because the SendTaskSuccess output lands in the durable execution record.
 * The summary returned is outcome only: counts and identifiers, no job stdout.
 
-Status: skeleton. S3 copy and log shipping are marked TODO; the metadata envelope is complete.
+Status: implemented. The copy streams each object through this function (two principals, so no
+managed CopyObject); a single invocation is bounded by the Lambda timeout, so a run whose artefacts
+exceed what 15 minutes can move needs a pre-arranged output location instead.
 """
 from __future__ import annotations
 
@@ -27,12 +29,14 @@ import os
 import time
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 
 LOGGER = logging.getLogger("vams-bridge.collect")
 LOGGER.setLevel(logging.INFO)
 
 RETRY_CONFIG = Config(retries={"max_attempts": 5, "mode": "adaptive"})
+TRANSFER_CONFIG = TransferConfig(multipart_chunksize=64 * 1024 * 1024, max_concurrency=4)
 
 VAMS_DATA_ROLE_ARN = os.environ["VAMS_DATA_ROLE_ARN"]
 VAMS_CONTROL_ROLE_ARN = os.environ["VAMS_CONTROL_ROLE_ARN"]
@@ -86,15 +90,42 @@ def _job_outputs(event: dict) -> tuple[list[str], dict]:
 
 
 def _copy_outputs(uris: list[str], dest_prefix: str, vams_session) -> int:
-    """Copy each output object (or every object under a prefix) to dest_prefix, preserving the
-    path relative to the job's output root. Returns the object count.
+    """Copy each output object, or every object under an output prefix, to dest_prefix, preserving
+    the path relative to the job's output root. Source objects are read with this function's own
+    role (toolchain buckets); destination writes use the VAMS data role. Returns the object count.
 
-    TODO: implement with the VAMS data role (write) reading from this account's buckets; stream
-    through this function for cross-account copies the destination role cannot read.
+    Two principals, so no managed CopyObject: each object is streamed through this function with a
+    multipart upload. The reserved basename asset.metadata.json is never written from here, because
+    VAMS would read it as the asset-level metadata envelope that _write_metadata_envelope owns.
     """
+    own_s3 = boto3.client("s3", config=RETRY_CONFIG)
+    dst_s3 = vams_session.client("s3", config=RETRY_CONFIG)
+    dst_bucket, dst_root = _split(dest_prefix)
+    dst_root = dst_root.rstrip("/") + "/"
+    copied = 0
+
+    def put(src_bucket, src_key, rel):
+        nonlocal copied
+        if rel.rsplit("/", 1)[-1] == "asset.metadata.json":
+            LOGGER.warning("skipping %s: reserved basename", rel)
+            return
+        body = own_s3.get_object(Bucket=src_bucket, Key=src_key)["Body"]
+        dst_s3.upload_fileobj(body, dst_bucket, dst_root + rel, Config=TRANSFER_CONFIG)
+        copied += 1
+
     for uri in uris:
-        LOGGER.info("copy %s -> %s", uri, dest_prefix)
-    return len(uris)
+        bucket, key = _split(uri)
+        if uri.endswith("/"):
+            root = key
+            for page in own_s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=root):
+                for obj in page.get("Contents", []):
+                    if obj["Key"].endswith("/"):
+                        continue
+                    put(bucket, obj["Key"], obj["Key"][len(root):])
+        else:
+            put(bucket, key, key.rsplit("/", 1)[-1])
+    LOGGER.info("copied %d objects to %s", copied, dest_prefix)
+    return copied
 
 
 def _write_metadata_envelope(meta: dict, metadata_prefix: str, vams_session) -> None:
@@ -110,14 +141,46 @@ def _write_metadata_envelope(meta: dict, metadata_prefix: str, vams_session) -> 
         Body=json.dumps(envelope).encode("utf-8"), ContentType="application/json")
 
 
-def _ship_log_tail(event: dict, vams_session) -> None:
-    """Copy the last LOG_TAIL_MAX_EVENTS lines of the job's CloudWatch stream into the VAMS-account
-    bridge log group, stream = the VAMS pipelineExecutionId (what RegisterRunner advertised).
+def _source_log_streams(event: dict, meta: dict) -> list[tuple[str, str]]:
+    """(logGroupName, logStreamName) pairs holding the finished job's output, per engine."""
+    engine = event["engine"]
+    if engine == "batch":
+        job = batch.describe_jobs(jobs=[event["jobId"]])["jobs"]
+        stream = (job[0].get("container") or {}).get("logStreamName") if job else None
+        return [("/aws/batch/job", stream)] if stream else []
+    job_name = meta.get("trainingJobName") or event["resolved"]["jobName"]
+    streams = logs.describe_log_streams(logGroupName="/aws/sagemaker/TrainingJobs",
+                                        logStreamNamePrefix=f"{job_name}/", limit=10)["logStreams"]
+    return [("/aws/sagemaker/TrainingJobs", s["logStreamName"]) for s in streams]
 
-    TODO: resolve the source stream per engine (/aws/sagemaker/TrainingJobs/<jobName>/..., or the
-    Batch job's Container.LogStreamName) and PutLogEvents under the control role.
-    """
-    LOGGER.info("ship log tail for %s", event["resolved"]["pipelineExecutionId"])
+
+def _ship_log_tail(event: dict, meta: dict, vams_session) -> int:
+    """Copy the last LOG_TAIL_MAX_EVENTS events of the job's CloudWatch stream(s) into the
+    VAMS-account bridge log group, stream = the VAMS pipelineExecutionId (the location RegisterRunner
+    advertised to VAMS). The tail is for an operator reading the execution in VAMS; it is never
+    returned in the task output. Returns the event count written."""
+    pipeline_execution_id = event["resolved"]["pipelineExecutionId"]
+    events = []
+    for group, stream in _source_log_streams(event, meta):
+        page = logs.get_log_events(logGroupName=group, logStreamName=stream,
+                                   limit=LOG_TAIL_MAX_EVENTS, startFromHead=False)
+        for ev in page.get("events", []):
+            events.append({"timestamp": ev["timestamp"], "message": f"[{stream}] {ev['message']}"})
+    events.sort(key=lambda e: e["timestamp"])
+    events = events[-LOG_TAIL_MAX_EVENTS:]
+    if not events:
+        events = [{"timestamp": int(time.time() * 1000),
+                   "message": "vams-bridge: no job log events were found to copy"}]
+
+    vams_logs = vams_session.client("logs", config=RETRY_CONFIG)
+    try:
+        vams_logs.create_log_stream(logGroupName=VAMS_BRIDGE_LOG_GROUP, logStreamName=pipeline_execution_id)
+    except vams_logs.exceptions.ResourceAlreadyExistsException:
+        pass
+    # <= LOG_TAIL_MAX_EVENTS events and far under the 1 MiB batch limit, so one call.
+    vams_logs.put_log_events(logGroupName=VAMS_BRIDGE_LOG_GROUP, logStreamName=pipeline_execution_id,
+                             logEvents=events)
+    return len(events)
 
 
 def _split(s3_uri: str) -> tuple[str, str]:
@@ -134,7 +197,7 @@ def lambda_handler(event, context):
     uris, meta = _job_outputs(event)
     copied = _copy_outputs(uris, resolved["outputS3AssetFilesPath"], data)
     _write_metadata_envelope(meta, resolved["outputS3AssetMetadataPath"], data)
-    _ship_log_tail(event, control)
+    log_events = _ship_log_tail(event, meta, control)
 
     # Outcome only. No job stdout, no ARNs with account ids beyond what VAMS already stores.
     return {
@@ -143,5 +206,6 @@ def lambda_handler(event, context):
         "jobName": resolved["jobName"],
         "filesWritten": copied,
         "metadataKeys": sorted(f"pai_{k}" for k in meta),
+        "logEventsShipped": log_events,
         "completedAt": int(time.time()),
     }

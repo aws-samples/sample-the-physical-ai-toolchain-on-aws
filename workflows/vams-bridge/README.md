@@ -7,11 +7,10 @@ VAMS owns the datasets, checkpoints and reports as versioned assets and decides 
 *where* it runs. Nothing toolchain-specific is added to VAMS, and no toolchain compute runs in the
 VAMS account.
 
-> **Status: skeleton.** Proposal and design discussion:
+> **Status: implemented, not yet deployed.** Proposal and design discussion:
 > [issue #36](https://github.com/aws-samples/sample-the-physical-ai-toolchain-on-aws/issues/36).
-> The runner state machines, the Lambda stubs and the GR00T bundle are complete enough to read and
-> review; the Terraform roots declare every resource but several bodies are marked `TODO`. Nothing
-> here has been deployed yet.
+> Both Terraform roots pass `terraform validate`; the Lambda pre-flight checks have offline tests
+> (`python3 -m unittest discover -s runner/tests`). The first live run is still ahead.
 
 ## How it works
 
@@ -84,24 +83,41 @@ both modes.
 
 ## Deploy order
 
-1. **Toolchain account** — `terraform -chdir=infra/toolchain-account apply`. Outputs the bridge bus
-   ARN and the runner execution role ARN.
-2. **VAMS account** — `terraform -chdir=infra/vams-account apply` with those two outputs. Reads the
-   VAMS integration surface from SSM (`<vams prefix>/integration/*`,
-   `<vams prefix>/lambdaFunctions/importGlobalPipelineWorkflow`), creates the roles and log group,
-   and registers `vamsSchema/*` by invoking the VAMS import Lambda — the pipeline, its templates and
-   a runnable workflow appear in VAMS at the end of the apply.
-3. **VAMS 2.7+ only** — add the bridge to the VAMS deployment's `config.json` and redeploy VAMS:
+The two roots share an `environment` value and derive each other's resource names from it, so
+neither consumes the other's outputs and they can be applied in either order. Generate one
+ExternalId (any UUID) and pass the same value to both as `vams_role_external_id`.
+
+1. **VAMS account** — `terraform -chdir=infra/vams-account apply`. Inputs: `aws_region`,
+   `vams_resource_param_prefix` (the VAMS SSM prefix `/<name>-<baseStackName>/resourceNames`),
+   `toolchain_account_id`, `toolchain_region`, `vams_asset_bucket_names`, optional
+   `vams_kms_key_arn`, `vams_relay` + `vams_deployment_name` for VAMS 2.6.x. Reads the VAMS
+   integration surface from SSM (`<prefix>/integration/*`,
+   `<prefix>/lambdaFunctions/importGlobalPipelineWorkflow`, `<prefix>/s3Buckets/artefacts`),
+   creates the two roles and the log group, uploads `vamsSchema/*` to the VAMS artefacts bucket and
+   registers it through the VAMS import Lambda. The pipeline, its templates and a runnable workflow
+   exist in VAMS at the end of the apply; the outputs include the two SSM values the next root needs.
+2. **Toolchain account** — `terraform -chdir=infra/toolchain-account apply`. Inputs: `aws_region`,
+   `vams_account_id`, `vams_region`, `vams_orchestration_bus_arn` and
+   `vams_workflow_execution_role_arn` (both from step 1's outputs; in relay mode pass
+   `relay_role_arn` for the second), the Foundation's `sagemaker_execution_role_arn`,
+   `batch_job_queue_arn`, `batch_job_definition_name`, `datasets_bucket`, `checkpoints_bucket`.
+3. **VAMS 2.7+ only** — add the bridge to the VAMS deployment's `config.json` and redeploy VAMS.
+   Step 2's `vams_config_snippet` output is the exact entry:
 
    ```json
    "externalPipelineBridges": [{
      "accountId": "<toolchain account>",
      "roleArnPattern": "arn:aws:iam::<toolchain account>:role/pai-vams-bridge-runner-*",
-     "invokeTargets": ["arn:aws:events:<region>:<toolchain account>:event-bus/pai-vams-bridge"]
+     "invokeTargets": ["arn:aws:events:<region>:<toolchain account>:event-bus/pai-vams-bridge-<environment>"]
    }]
    ```
 
 Verify: `vamscli pipeline get -d GLOBAL -p pai-gr00t-finetune --json-output`.
+
+Limits worth knowing before the first run: ReadManifest streams the dataset into the Foundation
+datasets bucket inside one Lambda invocation and rejects the run if the copy cannot finish in time,
+so a dataset beyond what 15 minutes can move needs a pre-staged copy; Collect moves the artefacts
+back the same way.
 
 ## Components (planned order)
 
