@@ -1,0 +1,360 @@
+{
+  "Comment": "VAMS bridge runner: SageMaker Pipeline. Input is the VAMS EventBridge event; $.detail.body carries TaskToken, inputManifestS3Location, inputConfigurationS3Location. Every VAMS callback runs as the VAMS-account control role via Credentials.RoleArn. Placeholders ${...} are substituted by Terraform (templatefile).",
+  "StartAt": "ReadManifest",
+  "States": {
+    "ReadManifest": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${read_manifest_function_arn}",
+        "Payload": {
+          "body.$": "$.detail.body",
+          "engine": "sagemaker-pipeline",
+          "runnerExecutionArn.$": "$$.Execution.Id"
+        }
+      },
+      "ResultSelector": {
+        "job.$": "$.Payload"
+      },
+      "ResultPath": "$.resolved",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "RegisterRunner"
+    },
+    "RegisterRunner": {
+      "Type": "Task",
+      "Comment": "Tell VAMS which runner execution owns this step so abort and the execution-detail view can see it. The only event the VAMS bus policy admits from the bridge: detail-type pipeline.execution.register on this execution's own source.",
+      "Resource": "arn:${partition}:states:::aws-sdk:eventbridge:putEvents",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "Entries": [
+          {
+            "EventBusName": "${vams_orchestration_bus_arn}",
+            "Source.$": "$.resolved.job.orchestrationEventPrefix",
+            "DetailType": "pipeline.execution.register",
+            "Detail": {
+              "pipelineExecutionId.$": "$.resolved.job.pipelineExecutionId",
+              "subExecution": {
+                "resourceType": "stepFunctionsExecution",
+                "stateMachineArn.$": "$$.StateMachine.Id",
+                "executionArn.$": "$$.Execution.Id",
+                "label": "PAI Toolchain GR00T runner"
+              },
+              "logs": [
+                {
+                  "logGroupArn": "${runner_log_group_arn}",
+                  "logGroupName": "${runner_log_group_name}",
+                  "logStreamName": "",
+                  "logStreamPrefix": "",
+                  "sourceType": "stateMachine",
+                  "label": "runner state machine"
+                },
+                {
+                  "logGroupArn": "${vams_bridge_log_group_arn}",
+                  "logGroupName": "${vams_bridge_log_group_name}",
+                  "logStreamName.$": "$.resolved.job.pipelineExecutionId",
+                  "logStreamPrefix": "",
+                  "sourceType": "custom",
+                  "label": "job log tail (copied into the VAMS account)"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.registerError",
+          "Next": "Submit",
+          "Comment": "Registration is best-effort; the run proceeds without it."
+        }
+      ],
+      "Next": "Submit"
+    },
+    "Submit": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::aws-sdk:sagemaker:startPipelineExecution",
+      "Parameters": {
+        "PipelineName": "${sagemaker_pipeline_name}",
+        "ClientRequestToken.$": "$.resolved.job.idempotencyToken",
+        "PipelineExecutionDisplayName.$": "$.resolved.job.jobName",
+        "PipelineParameters.$": "$.resolved.job.pipelineParameters"
+      },
+      "ResultSelector": {
+        "pipelineExecutionArn.$": "$.PipelineExecutionArn"
+      },
+      "ResultPath": "$.submitted",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "RegisterJob"
+    },
+    "RegisterJob": {
+      "Type": "Task",
+      "Comment": "Re-register with the job itself as an abortable sub-execution (VAMS 2.7+: the Abort button calls StopPipelineExecution; the handler merges by location) and the job's own log group (readable from VAMS once cross-account log reads land).",
+      "Resource": "arn:${partition}:states:::aws-sdk:eventbridge:putEvents",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "Entries": [
+          {
+            "EventBusName": "${vams_orchestration_bus_arn}",
+            "Source.$": "$.resolved.job.orchestrationEventPrefix",
+            "DetailType": "pipeline.execution.register",
+            "Detail": {
+              "pipelineExecutionId.$": "$.resolved.job.pipelineExecutionId",
+              "subExecution": {
+                "resourceType": "sageMakerPipelineExecution",
+                "pipelineExecutionArn.$": "$.submitted.pipelineExecutionArn",
+                "stageName": "Train",
+                "label": "groot-finetune-pipeline execution"
+              },
+              "logs": [
+                {
+                  "logGroupArn": "arn:${partition}:logs:${region}:${account_id}:log-group:/aws/sagemaker/TrainingJobs",
+                  "logGroupName": "/aws/sagemaker/TrainingJobs",
+                  "logStreamName": "",
+                  "logStreamPrefix.$": "$.resolved.job.jobName",
+                  "stageName": "Train",
+                  "sourceType": "custom",
+                  "label": "Train container (toolchain account)"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.registerError",
+          "Next": "Wait"
+        }
+      ],
+      "Next": "Wait"
+    },
+    "Wait": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "Describe"
+    },
+    "Describe": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::aws-sdk:sagemaker:describePipelineExecution",
+      "Parameters": {
+        "PipelineExecutionArn.$": "$.submitted.pipelineExecutionArn"
+      },
+      "ResultSelector": {
+        "status.$": "$.PipelineExecutionStatus",
+        "failureReason.$": "$.FailureReason"
+      },
+      "ResultPath": "$.job",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "SageMaker.ThrottlingException",
+            "SageMaker.InternalFailure"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "StopJobThenFail"
+        }
+      ],
+      "Next": "Heartbeat"
+    },
+    "Heartbeat": {
+      "Type": "Task",
+      "Comment": "A rejected heartbeat (TaskTimedOut / TaskDoesNotExist) means VAMS aborted or timed out the step. Stop the job and fail; do not retry.",
+      "Resource": "arn:${partition}:states:::aws-sdk:sfn:sendTaskHeartbeat",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "TaskToken.$": "$.detail.body.TaskToken"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.heartbeatError",
+          "Next": "StopJobThenFail"
+        }
+      ],
+      "Next": "IsDone"
+    },
+    "IsDone": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.job.status",
+          "StringEquals": "Succeeded",
+          "Next": "Collect"
+        },
+        {
+          "Variable": "$.job.status",
+          "StringEquals": "Failed",
+          "Next": "NotifyFailure"
+        },
+        {
+          "Variable": "$.job.status",
+          "StringEquals": "Stopped",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Default": "Wait"
+    },
+    "StopJobThenFail": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::aws-sdk:sagemaker:stopPipelineExecution",
+      "Parameters": {
+        "PipelineExecutionArn.$": "$.submitted.pipelineExecutionArn",
+        "ClientRequestToken.$": "$$.Execution.Name"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.stopError",
+          "Next": "AbortedByVams"
+        }
+      ],
+      "Next": "AbortedByVams"
+    },
+    "AbortedByVams": {
+      "Type": "Fail",
+      "Comment": "VAMS already recorded the abort/timeout; no callback is possible on a rejected token.",
+      "Error": "VamsAbortedOrTimedOut",
+      "Cause": "The VAMS task token was rejected during heartbeat; the job was stopped."
+    },
+    "Collect": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${collect_function_arn}",
+        "Payload": {
+          "resolved.$": "$.resolved.job",
+          "engine": "sagemaker-pipeline",
+          "pipelineExecutionArn.$": "$.submitted.pipelineExecutionArn"
+        }
+      },
+      "ResultSelector": {
+        "summary.$": "$.Payload"
+      },
+      "ResultPath": "$.collected",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "NotifySuccess"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Comment": "Report the outcome, never the job's output: the output lands in the VAMS execution record.",
+      "Resource": "arn:${partition}:states:::aws-sdk:sfn:sendTaskSuccess",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "TaskToken.$": "$.detail.body.TaskToken",
+        "Output.$": "States.JsonToString($.collected.summary)"
+      },
+      "ResultPath": null,
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Comment": "Cause is bounded to a short classification; details stay in this account's logs.",
+      "Resource": "arn:${partition}:states:::aws-sdk:sfn:sendTaskFailure",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "TaskToken.$": "$.detail.body.TaskToken",
+        "Error": "PaiToolchainJobFailed",
+        "Cause.$": "States.Format('GR00T fine-tune did not complete. See the toolchain account runner execution {}.', $$.Execution.Id)"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Failed",
+          "Comment": "Token already consumed or expired; VAMS has the outcome."
+        }
+      ],
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "Error": "PaiToolchainJobFailed"
+    }
+  }
+}

@@ -1,0 +1,147 @@
+"""Collect: runs after the job SUCCEEDED. Moves results onto the VAMS asset and returns the
+outcome summary the runner hands to SendTaskSuccess.
+
+Input::
+
+    {"resolved": <ReadManifest output>, "engine": "...",
+     "pipelineExecutionArn" | "trainingJobArn" | "jobId": "..."}
+
+Rules this follows (from the VAMS bridge contract):
+
+* Files go to ``outputS3AssetFilesPath`` keeping their relative path; VAMS versions them onto the
+  asset. Do NOT create a per-job folder here: the workflow's
+  ``defaultOutputFileBaseExecutionPathExtension`` (``/{{jobName}}/``) already separates runs.
+* Metrics and the model-registry reference go to ``outputS3AssetMetadataPath/asset.metadata.json``
+  as the VAMS metadata envelope. ``asset.metadata.json`` is a reserved basename.
+* The job's log TAIL is copied into the VAMS-account bridge log group (readable in VAMS today);
+  it is NOT returned, because the SendTaskSuccess output lands in the durable execution record.
+* The summary returned is outcome only: counts and identifiers, no job stdout.
+
+Status: skeleton. S3 copy and log shipping are marked TODO; the metadata envelope is complete.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+
+import boto3
+from botocore.config import Config
+
+LOGGER = logging.getLogger("vams-bridge.collect")
+LOGGER.setLevel(logging.INFO)
+
+RETRY_CONFIG = Config(retries={"max_attempts": 5, "mode": "adaptive"})
+
+VAMS_DATA_ROLE_ARN = os.environ["VAMS_DATA_ROLE_ARN"]
+VAMS_CONTROL_ROLE_ARN = os.environ["VAMS_CONTROL_ROLE_ARN"]
+VAMS_ROLE_EXTERNAL_ID = os.environ["VAMS_ROLE_EXTERNAL_ID"]
+CHECKPOINTS_BUCKET = os.environ["CHECKPOINTS_BUCKET"]
+VAMS_BRIDGE_LOG_GROUP = os.environ["VAMS_BRIDGE_LOG_GROUP"]   # /aws/vendedlogs/Pipelines/pai-<component>
+LOG_TAIL_MAX_EVENTS = int(os.environ.get("LOG_TAIL_MAX_EVENTS", "200"))
+
+sagemaker = boto3.client("sagemaker", config=RETRY_CONFIG)
+batch = boto3.client("batch", config=RETRY_CONFIG)
+logs = boto3.client("logs", config=RETRY_CONFIG)
+
+
+def _assume(role_arn: str, session_name: str):
+    creds = boto3.client("sts", config=RETRY_CONFIG).assume_role(
+        RoleArn=role_arn, RoleSessionName=session_name,
+        ExternalId=VAMS_ROLE_EXTERNAL_ID, DurationSeconds=900)["Credentials"]
+    return boto3.Session(aws_access_key_id=creds["AccessKeyId"],
+                         aws_secret_access_key=creds["SecretAccessKey"],
+                         aws_session_token=creds["SessionToken"])
+
+
+def _job_outputs(event: dict) -> tuple[list[str], dict]:
+    """Return (list of s3:// URIs to copy, metadata dict) for the finished job."""
+    engine = event["engine"]
+    resolved = event["resolved"]
+    if engine == "sagemaker-pipeline":
+        arn = event["pipelineExecutionArn"]
+        steps = sagemaker.list_pipeline_execution_steps(PipelineExecutionArn=arn)["PipelineExecutionSteps"]
+        meta = {"pipelineExecutionArn": arn}
+        uris = []
+        for step in steps:
+            md = step.get("Metadata", {})
+            if "TrainingJob" in md:
+                tj = sagemaker.describe_training_job(
+                    TrainingJobName=md["TrainingJob"]["Arn"].split("/")[-1])
+                uris.append(tj["ModelArtifacts"]["S3ModelArtifacts"])
+                meta["trainingJobName"] = tj["TrainingJobName"]
+                meta["trainingSeconds"] = tj.get("TrainingTimeInSeconds")
+            if "RegisterModel" in md:
+                meta["modelPackageArn"] = md["RegisterModel"]["Arn"]
+        return uris, meta
+    if engine == "sagemaker-training":
+        tj = sagemaker.describe_training_job(TrainingJobName=resolved["jobName"])
+        return [tj["ModelArtifacts"]["S3ModelArtifacts"]], {
+            "trainingJobArn": tj["TrainingJobArn"], "trainingSeconds": tj.get("TrainingTimeInSeconds")}
+    if engine == "batch":
+        prefix = f"s3://{CHECKPOINTS_BUCKET}/vams/{resolved['jobName']}/"
+        return [prefix], {"batchJobId": event["jobId"]}
+    raise ValueError(f"unknown engine {engine}")
+
+
+def _copy_outputs(uris: list[str], dest_prefix: str, vams_session) -> int:
+    """Copy each output object (or every object under a prefix) to dest_prefix, preserving the
+    path relative to the job's output root. Returns the object count.
+
+    TODO: implement with the VAMS data role (write) reading from this account's buckets; stream
+    through this function for cross-account copies the destination role cannot read.
+    """
+    for uri in uris:
+        LOGGER.info("copy %s -> %s", uri, dest_prefix)
+    return len(uris)
+
+
+def _write_metadata_envelope(meta: dict, metadata_prefix: str, vams_session) -> None:
+    envelope = {
+        "type": "metadata",
+        "updateType": "update",
+        "metadata": [{"metadataKey": f"pai_{k}", "metadataValue": json.dumps(v) if not isinstance(v, str) else v}
+                     for k, v in meta.items() if v is not None],
+    }
+    bucket, key = _split(metadata_prefix)
+    vams_session.client("s3", config=RETRY_CONFIG).put_object(
+        Bucket=bucket, Key=f"{key.rstrip('/')}/asset.metadata.json",
+        Body=json.dumps(envelope).encode("utf-8"), ContentType="application/json")
+
+
+def _ship_log_tail(event: dict, vams_session) -> None:
+    """Copy the last LOG_TAIL_MAX_EVENTS lines of the job's CloudWatch stream into the VAMS-account
+    bridge log group, stream = the VAMS pipelineExecutionId (what RegisterRunner advertised).
+
+    TODO: resolve the source stream per engine (/aws/sagemaker/TrainingJobs/<jobName>/..., or the
+    Batch job's Container.LogStreamName) and PutLogEvents under the control role.
+    """
+    LOGGER.info("ship log tail for %s", event["resolved"]["pipelineExecutionId"])
+
+
+def _split(s3_uri: str) -> tuple[str, str]:
+    without = s3_uri[len("s3://"):]
+    bucket, _, key = without.partition("/")
+    return bucket, key
+
+
+def lambda_handler(event, context):
+    resolved = event["resolved"]
+    data = _assume(VAMS_DATA_ROLE_ARN, "pai-vams-bridge-collect")
+    control = _assume(VAMS_CONTROL_ROLE_ARN, "pai-vams-bridge-collect-logs")
+
+    uris, meta = _job_outputs(event)
+    copied = _copy_outputs(uris, resolved["outputS3AssetFilesPath"], data)
+    _write_metadata_envelope(meta, resolved["outputS3AssetMetadataPath"], data)
+    _ship_log_tail(event, control)
+
+    # Outcome only. No job stdout, no ARNs with account ids beyond what VAMS already stores.
+    return {
+        "status": "SUCCEEDED",
+        "engine": event["engine"],
+        "jobName": resolved["jobName"],
+        "filesWritten": copied,
+        "metadataKeys": sorted(f"pai_{k}" for k in meta),
+        "completedAt": int(time.time()),
+    }
