@@ -94,6 +94,47 @@ def _copy_one(src_client, src_bucket, src_key, version_id, dst_client, dst_bucke
     return int(obj.get("ContentLength") or 0)
 
 
+def _expand_folder_entries(entries: list, list_keys) -> list:
+    """Replace every whole-asset ('/') or folder entry (S3 key ending in '/') with one entry per
+    object under that prefix, keeping the asset-relative path. A whole-asset selection reaches the
+    manifest as a single entry whose key is the asset's root prefix, which is not an object.
+    `list_keys(entry)` yields the full keys under `entry['key']`; folder markers are skipped and
+    the current version of each object is read (a prefix cannot name a version)."""
+    expanded: list = []
+    for entry in entries:
+        key = entry["key"]
+        if not key.endswith("/"):
+            expanded.append(entry)
+            continue
+        rel_root = entry.get("relativePath") or "/"
+        rel_root = "/" if rel_root in ("", "/") else rel_root.rstrip("/") + "/"
+        count = 0
+        for full_key in list_keys(entry):
+            if full_key.endswith("/") or not full_key.startswith(key):
+                continue
+            child = dict(entry)
+            child["key"] = full_key
+            child["relativePath"] = rel_root + full_key[len(key):]
+            child["versionId"] = ""
+            expanded.append(child)
+            count += 1
+        if count == 0:
+            raise ValueError(f"The selected folder '{rel_root}' holds no files")
+    return expanded
+
+
+def _list_keys_under(vams_session, clients):
+    """Lister for _expand_folder_entries: the current objects under an entry's prefix in its own
+    bucket, read with the data role (s3:ListBucket is granted on the asset buckets)."""
+    def list_keys(entry):
+        client = _vams_client_for(vams_session, entry.get("bucketRegion", ""), clients)
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=entry["bucket"], Prefix=entry["key"]):
+            for obj in page.get("Contents", []):
+                yield obj["Key"]
+    return list_keys
+
+
 def _stage_inputs(resolved: dict, dataset_prefix: str, vams_session, deadline_ms) -> set[str]:
     """Copy every manifest input file from the VAMS asset bucket into
     s3://DATASETS_BUCKET/<dataset_prefix>/dataset/<relativePath>, preserving the asset-relative path
@@ -110,6 +151,7 @@ def _stage_inputs(resolved: dict, dataset_prefix: str, vams_session, deadline_ms
 
     own_s3 = boto3.client("s3", config=RETRY_CONFIG)
     clients: dict = {}
+    entries = _expand_folder_entries(entries, _list_keys_under(vams_session, clients))
     staged: set[str] = set()
     total = 0
 
