@@ -29,7 +29,10 @@
             "type": "enum",
             "required": false,
             "default": "nvidia/GR00T-N1.5-3B",
-            "enumValues": ["nvidia/GR00T-N1.5-3B", "nvidia/GR00T-N1.6-3B"],
+            "enumValues": [
+                "nvidia/GR00T-N1.5-3B",
+                "nvidia/GR00T-N1.6-3B"
+            ],
             "label": "Base model",
             "description": "Hugging Face model id the container fine-tunes from."
         },
@@ -38,7 +41,11 @@
             "type": "enum",
             "required": false,
             "default": "ml.g5.12xlarge",
-            "enumValues": ["ml.g5.12xlarge", "ml.g6e.12xlarge", "ml.p4d.24xlarge"],
+            "enumValues": [
+                "ml.g5.12xlarge",
+                "ml.g6e.12xlarge",
+                "ml.p4d.24xlarge"
+            ],
             "label": "Training instance type",
             "description": "SageMaker training instance. Quota for the instance family must exist in the toolchain account."
         }

@@ -38,8 +38,13 @@ VAMS versions the results onto the asset
   `Credentials.RoleArn` — no Lambda ever handles the task token.
 - Input staging and output copy run as the VAMS-account **data role**, scoped to the input asset
   prefixes (read) and the run's output prefix (write).
-- Both roles trust only the runner's execution role, with `sts:ExternalId` and an
-  `aws:PrincipalArn` condition.
+- Both roles trust only the runner's execution role (assumed through a task state's
+  `Credentials.RoleArn`, which carries no ExternalId, so the caller is pinned by `aws:PrincipalArn`)
+  and the runner Lambdas' role (which passes `sts:ExternalId`).
+- The runner is chosen by the VAMS pipeline's EventBridge detail-type, so each engine is its own
+  VAMS pipeline (`pai-gr00t-finetune` → SageMaker Pipeline, `pai-gr00t-finetune-batch` → AWS Batch);
+  a template's `engine` must match the pipeline it is registered on, and ReadManifest rejects a
+  mismatch before any compute starts.
 - A rejected heartbeat means VAMS aborted or timed out the step; the runner stops the job and fails.
 - Job names derive from the VAMS pipeline-execution id, so an at-least-once event delivery cannot
   start a second job.
@@ -66,7 +71,8 @@ workflows/vams-bridge/
     runner-sagemaker-training.asl.json
     runner-batch.asl.json
   vamsSchema/
-    gr00t-finetune/         pipeline.json, workflow.json, templates/{sagemaker-pipeline,batch-n17}.json
+    gr00t-finetune/         pipeline.json, workflow.json, templates/sagemaker-pipeline.json
+    gr00t-finetune-batch/   pipeline.json, workflow.json, templates/batch-n17.json
 ```
 
 ## Two connection modes
@@ -123,7 +129,7 @@ back the same way.
 
 | # | Component | Runner | Status |
 |---|---|---|---|
-| 1 | GR00T fine-tune — SageMaker Pipeline template + N1.7 AWS Batch template | `runner-sagemaker-pipeline`, `runner-batch` | bundle in this skeleton |
+| 1 | GR00T fine-tune — `pai-gr00t-finetune` (SageMaker Pipeline) and `pai-gr00t-finetune-batch` (N1.7 AWS Batch) | `runner-sagemaker-pipeline`, `runner-batch` | bundles in this module |
 | 2 | Ingest Zarr → LeRobot v2 (after containerising `convert_zarr_to_lerobot.py`) | `runner-batch` | planned |
 | 3 | Isaac Lab RL — SageMaker and Batch templates | `runner-sagemaker-training`, `runner-batch` | planned |
 | 4 | Arena evaluation, chained after GR00T | `runner-sagemaker-pipeline` | planned |

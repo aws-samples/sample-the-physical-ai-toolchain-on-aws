@@ -20,6 +20,7 @@ locals {
   # ARNs through the account root principal, which survives a role being recreated.
   name_prefix               = "pai-vams-bridge-${var.environment}"
   runner_role_name          = "pai-vams-bridge-runner-${var.environment}"
+  lambda_role_name          = "pai-vams-bridge-lambda-${var.environment}"
   control_role_name         = "pai-vams-bridge-control-${var.environment}"
   data_role_name            = "pai-vams-bridge-data-${var.environment}"
   bridge_log_group          = "/aws/vendedlogs/Pipelines/pai-vams-bridge-${var.environment}"
@@ -160,8 +161,11 @@ data "aws_iam_policy_document" "runner" {
   statement {
     sid     = "BatchSubmit"
     actions = ["batch:SubmitJob", "batch:TagResource"]
+    # SubmitJob names the job definition WITHOUT a revision (the latest active one), which Batch
+    # authorizes against the un-revisioned ARN; the revisioned form covers a pinned submit.
     resources = [
       var.batch_job_queue_arn,
+      "arn:${local.partition}:batch:${var.aws_region}:${local.account_id}:job-definition/${var.batch_job_definition_name}",
       "arn:${local.partition}:batch:${var.aws_region}:${local.account_id}:job-definition/${var.batch_job_definition_name}:*",
     ]
   }
@@ -206,7 +210,7 @@ data "aws_iam_policy_document" "lambda_trust" {
 }
 
 resource "aws_iam_role" "lambda" {
-  name_prefix        = "${local.name_prefix}-lambda-"
+  name               = local.lambda_role_name # fixed: the VAMS roles trust it by ARN
   assume_role_policy = data.aws_iam_policy_document.lambda_trust.json
   tags               = local.common_tags
 }

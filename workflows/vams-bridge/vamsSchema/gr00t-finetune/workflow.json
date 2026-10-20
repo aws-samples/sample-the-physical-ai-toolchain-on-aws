@@ -2,5 +2,28 @@
     "workflowName": "PAI Toolchain - GR00T fine-tune",
     "category": "Training",
     "description": "Fine-tunes GR00T on the LeRobot v2 dataset held on the selected asset and writes the checkpoint, evaluation report and model-registry reference back to it. Each run lands in its own folder.",
-    "defaultOutputFileBaseExecutionPathExtension": "/{{jobName}}/"
+    "systemConfig": {
+        "inputFileArity": "multi",
+        "assetScope": {
+            "crossAssetAllowed": false,
+            "singleAssetOnly": true,
+            "wholeAssetAllowed": true,
+            "folderAllowed": true
+        },
+        "metadataInputs": {
+            "assetMetadata": false,
+            "fileMetadata": false,
+            "fileAttributes": false
+        },
+        "inputFileFilters": {
+            "allow": [],
+            "exclude": []
+        },
+        "concurrencyRestriction": "none",
+        "defaultOutputFileBaseExecutionPathExtension": "/{{jobName}}/",
+        "outputTarget": {
+            "locationType": "asset",
+            "allowOverride": false
+        }
+    }
 }

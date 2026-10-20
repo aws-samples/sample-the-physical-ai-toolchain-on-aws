@@ -68,7 +68,7 @@ variable "vams_kms_key_arn" {
 variable "components" {
   description = "vamsSchema bundles to register, by directory name under ../../vamsSchema"
   type        = list(string)
-  default     = ["gr00t-finetune"]
+  default     = ["gr00t-finetune", "gr00t-finetune-batch"]
 }
 
 variable "tags" {

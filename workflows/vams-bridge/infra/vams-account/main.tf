@@ -23,6 +23,7 @@ locals {
   data_role_name            = "pai-vams-bridge-data-${var.environment}"
   bridge_log_group          = "/aws/vendedlogs/Pipelines/pai-vams-bridge-${var.environment}"
   toolchain_runner_role_arn = "arn:${local.partition}:iam::${var.toolchain_account_id}:role/pai-vams-bridge-runner-${var.environment}"
+  toolchain_lambda_role_arn = "arn:${local.partition}:iam::${var.toolchain_account_id}:role/pai-vams-bridge-lambda-${var.environment}"
   toolchain_bridge_bus_arn  = "arn:${local.partition}:events:${var.toolchain_region}:${var.toolchain_account_id}:event-bus/${local.name_prefix}"
 }
 
@@ -50,12 +51,35 @@ data "aws_ssm_parameter" "artefacts_bucket" {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Trust: both roles trust exactly the toolchain runner role, with ExternalId, and the toolchain
+# Trust: both roles trust exactly the toolchain runner role (state machines, no ExternalId possible)
+# and the runner Lambdas' role (with ExternalId), and the toolchain
 # account as aws:PrincipalAccount. (ARCC BSC6 least privilege; BSC13 no cross-stage trust — deploy
 # a prod VAMS against a prod toolchain account only.)
 # ---------------------------------------------------------------------------------------------
 data "aws_iam_policy_document" "cross_account_trust" {
+  # The runner Lambdas assume with boto3 and pass the ExternalId.
   statement {
+    sid     = "RunnerLambdas"
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${local.partition}:iam::${var.toolchain_account_id}:root"]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = [local.toolchain_lambda_role_arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "sts:ExternalId"
+      values   = [var.vams_role_external_id]
+    }
+  }
+  # The state machines assume through a task state's Credentials.RoleArn, which carries no
+  # ExternalId; the caller is pinned to the one runner role ARN instead.
+  statement {
+    sid     = "RunnerStateMachines"
     actions = ["sts:AssumeRole"]
     principals {
       type        = "AWS"
@@ -65,11 +89,6 @@ data "aws_iam_policy_document" "cross_account_trust" {
       test     = "ArnEquals"
       variable = "aws:PrincipalArn"
       values   = [local.toolchain_runner_role_arn]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "sts:ExternalId"
-      values   = [var.vams_role_external_id]
     }
   }
 }
@@ -143,14 +162,12 @@ data "aws_iam_policy_document" "data" {
     resources = local.asset_object_arns
   }
   statement {
-    sid       = "ListRunPrefixes"
+    # Listing is bucket-wide: staging a whole-asset or folder selection enumerates the asset's
+    # files, and the role already reads every object above, so a prefix condition here would hide
+    # nothing it cannot fetch.
+    sid       = "ListAssetBuckets"
     actions   = ["s3:ListBucket"]
     resources = local.asset_bucket_arns
-    condition {
-      test     = "StringLike"
-      variable = "s3:prefix"
-      values   = ["pipelines/*", "*/pipelines/*"]
-    }
   }
   statement {
     sid       = "WriteRunOutputs"

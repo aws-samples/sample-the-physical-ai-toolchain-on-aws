@@ -1,7 +1,7 @@
 {
     "pipelineName": "PAI Toolchain - GR00T fine-tune",
     "category": "Training",
-    "description": "Fine-tunes NVIDIA GR00T on a LeRobot v2 dataset held on a VAMS asset, through the Physical AI Toolchain. Two templates: the groot-finetune-pipeline SageMaker Pipeline (registers the model in the groot-models package group) and the N1.7 AWS Batch training job. Runs in the toolchain account; results are written back to the asset.",
+    "description": "Fine-tunes NVIDIA GR00T on a LeRobot v2 dataset held on a VAMS asset, through the Physical AI Toolchain's groot-finetune-pipeline SageMaker Pipeline (registers the model in the groot-models package group). Runs in the toolchain account; results are written back to the asset. The AWS Batch path is the sibling pipeline pai-gr00t-finetune-batch.",
     "executionConfig": {
         "executionType": "EventBridge",
         "waitForCallback": "Enabled",
@@ -25,7 +25,12 @@
         "requireTemplate": true,
         "allowCustomTemplateOverride": false,
         "inputFileFilters": {
-            "allow": ["*.parquet", "*.mp4", "*.json", "*.jsonl"],
+            "allow": [
+                "*.parquet",
+                "*.mp4",
+                "*.json",
+                "*.jsonl"
+            ],
             "exclude": []
         }
     }

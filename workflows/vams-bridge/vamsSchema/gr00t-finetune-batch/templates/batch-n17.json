@@ -2,7 +2,7 @@
     "templateId": "batch-n17",
     "templateName": "AWS Batch (GR00T N1.7)",
     "description": "Runs the N1.7 training container as a single AWS Batch job on the toolchain's GPU compute environment. Every setting travels as a containerOverrides.environment entry, matching training/gr00t/submit_batch_training_n17.py; the job definition is never re-registered.",
-    "isDefault": false,
+    "isDefault": true,
     "configFormat": "json",
     "configBody": "{\"engine\":\"batch\",\"maxSteps\":{{MAX_STEPS}},\"batchSize\":{{BATCH_SIZE}},\"gradAccumSteps\":{{GRAD_ACCUM_STEPS}},\"embodimentConfig\":\"{{EMBODIMENT_CONFIG}}\",\"tuneVisual\":{{TUNE_VISUAL}}}",
     "allowCustomEdit": false,
@@ -37,7 +37,10 @@
             "type": "enum",
             "required": false,
             "default": "ur3",
-            "enumValues": ["ur3", "g1_dex3"],
+            "enumValues": [
+                "ur3",
+                "g1_dex3"
+            ],
             "label": "Embodiment",
             "description": "Modality configuration the N1.7 container loads (ur3 or g1_dex3)."
         },

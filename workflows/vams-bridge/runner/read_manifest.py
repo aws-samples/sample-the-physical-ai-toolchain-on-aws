@@ -222,6 +222,16 @@ def _config(resolved: dict, s3_client) -> dict:
     return body
 
 
+def _check_engine(cfg: dict, engine: str) -> None:
+    """The runner is chosen by the VAMS pipeline's detail-type (one pipeline per engine); a template
+    whose configBody names another engine was registered on the wrong pipeline. Fail before any
+    compute is started rather than run the job on the engine the template did not describe."""
+    declared = cfg.get("engine")
+    if declared and declared != engine:
+        raise ValueError(f"The template's engine '{declared}' does not match this runner ('{engine}'); "
+                         f"register the template on the pipeline whose detail-type routes to '{declared}'")
+
+
 def _hf_token() -> str:
     """The pipeline's HFToken parameter is the plain token (pipeline.py --execute passes it the same
     way from its environment). Read it from Secrets Manager when the secret exists; the N1.6 base
@@ -251,21 +261,23 @@ def _build_sagemaker_pipeline(resolved, cfg, dataset_prefix, job_name):
 
 
 def _build_batch(resolved, cfg, dataset_prefix, job_name):
+    # Environment entries are PascalCase: the state machine passes them to the aws-sdk
+    # batch:submitJob integration, which rejects the SDK's lower-case name/value keys.
     if not BATCH_JOB_DEFINITION:
         raise ValueError("BATCH_JOB_DEFINITION is not configured on this runner")
     # Names are the batch-train-entrypoint-n17.sh contract (the same set submit_batch_training_n17.py
     # sends). CHECKPOINT_PREFIX is a key prefix under CHECKPOINT_BUCKET, not a URI; the entrypoint
     # syncs to s3://$CHECKPOINT_BUCKET/$CHECKPOINT_PREFIX/, which is where Collect reads from.
     env = [
-        {"name": "DATASET_S3_URI", "value": f"s3://{DATASETS_BUCKET}/{dataset_prefix}/dataset/"},
-        {"name": "CHECKPOINT_BUCKET", "value": CHECKPOINTS_BUCKET},
-        {"name": "CHECKPOINT_PREFIX", "value": f"vams/{job_name}"},
-        {"name": "MAX_STEPS", "value": str(int(cfg["maxSteps"]))},
-        {"name": "BATCH_SIZE", "value": str(int(cfg["batchSize"]))},
-        {"name": "GRAD_ACCUM_STEPS", "value": str(int(cfg.get("gradAccumSteps", 8)))},
-        {"name": "EMBODIMENT_CONFIG", "value": str(cfg["embodimentConfig"])},
-        {"name": "TUNE_VISUAL", "value": "1" if cfg.get("tuneVisual") else "0"},
-        {"name": "HF_TOKEN_SECRET_ID", "value": HF_TOKEN_SECRET_ID},
+        {"Name": "DATASET_S3_URI", "Value": f"s3://{DATASETS_BUCKET}/{dataset_prefix}/dataset/"},
+        {"Name": "CHECKPOINT_BUCKET", "Value": CHECKPOINTS_BUCKET},
+        {"Name": "CHECKPOINT_PREFIX", "Value": f"vams/{job_name}"},
+        {"Name": "MAX_STEPS", "Value": str(int(cfg["maxSteps"]))},
+        {"Name": "BATCH_SIZE", "Value": str(int(cfg["batchSize"]))},
+        {"Name": "GRAD_ACCUM_STEPS", "Value": str(int(cfg.get("gradAccumSteps", 8)))},
+        {"Name": "EMBODIMENT_CONFIG", "Value": str(cfg["embodimentConfig"])},
+        {"Name": "TUNE_VISUAL", "Value": "1" if cfg.get("tuneVisual") else "0"},
+        {"Name": "HF_TOKEN_SECRET_ID", "Value": HF_TOKEN_SECRET_ID},
     ]
     # Port of submit_batch_training_n17.py's pre-check: a global batch the job's GPU count cannot
     # divide fails at container startup, after the instance has been provisioned. Refuse it here.
@@ -311,6 +323,8 @@ def lambda_handler(event, context):
     dataset_prefix = f"vams/{job_name}"
 
     cfg = _config(resolved, vams_s3)
+
+    _check_engine(cfg, engine)
     staged = _stage_inputs(resolved, dataset_prefix, session, deadline_ms)
     if engine != "sagemaker-training":
         _validate_lerobot_dataset(dataset_prefix, staged)
