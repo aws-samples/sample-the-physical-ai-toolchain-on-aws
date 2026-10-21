@@ -64,5 +64,30 @@ class SelectDeployable(unittest.TestCase):
         self.assertEqual(keep, ["eval/checkpoint-5/report.json", "model.safetensors"])
 
 
+class RunFolder(unittest.TestCase):
+    """D13: one run's model lands in one folder, with its subfolders beside its weights."""
+    FILES = "s3://assets/pipelines/p/j/output/e1/files/"
+
+    def test_prefix_is_files_path_plus_one_segment(self):
+        self.assertEqual(collect._run_folder_prefix(self.FILES, "pai-batch-abc"),
+                         "s3://assets/pipelines/p/j/output/e1/files/pai-batch-abc/")
+        self.assertEqual(collect._run_folder_prefix(self.FILES.rstrip("/"), "pai-batch-abc"),
+                         "s3://assets/pipelines/p/j/output/e1/files/pai-batch-abc/")
+
+    def test_model_directory_stays_intact_under_the_run_folder(self):
+        root = collect._run_folder_prefix(self.FILES, "pai-batch-abc")
+        keep, _ = collect._select_deployable(RUN7)
+        dests = [root + rel for rel in keep]
+        self.assertTrue(all(d.startswith(root) for d in dests))
+        self.assertIn(root + "processor/processor_config.json", dests)
+        self.assertIn(root + "experiment_cfg/final_model_config.json", dests)
+        self.assertIn(root + "model.safetensors.index.json", dests)
+
+    def test_rejects_a_folder_that_is_not_one_segment(self):
+        for bad in ("", "a/b", ".", ".."):
+            with self.assertRaises(ValueError):
+                collect._run_folder_prefix(self.FILES, bad)
+
+
 if __name__ == "__main__":
     unittest.main()

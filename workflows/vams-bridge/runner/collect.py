@@ -8,9 +8,13 @@ Input::
 
 Rules this follows (from the VAMS bridge contract):
 
-* Files go to ``outputS3AssetFilesPath`` keeping their relative path; VAMS versions them onto the
-  asset. Do NOT create a per-job folder here: the workflow's
-  ``defaultOutputFileBaseExecutionPathExtension`` (``/{{jobName}}/``) already separates runs.
+* Files go to ``outputS3AssetFilesPath/<jobName>/`` keeping their relative path below that run
+  folder; VAMS writes them onto the asset at ``/<jobName>/<relative path>``. The run folder is the
+  toolchain job name, which also names the run's dataset and checkpoint prefixes, so one model
+  directory stays intact and each run stays separate. The workflows set no
+  ``defaultOutputFileBaseExecutionPathExtension``: VAMS inserts that extension immediately before
+  each file's own name, which splits a model's ``processor/`` and ``experiment_cfg/`` subfolders
+  away from its weights, and its ``{{jobName}}`` tag names the workflow step, not the run.
 * Metrics and the model-registry reference go to ``outputS3AssetMetadataPath/asset.metadata.json``
   as the VAMS metadata envelope. ``asset.metadata.json`` is a reserved basename.
 * The job's log TAIL is copied into the VAMS-account bridge log group (readable in VAMS today);
@@ -227,6 +231,14 @@ def _ship_log_tail(event: dict, meta: dict, vams_session) -> int:
     return len(events)
 
 
+def _run_folder_prefix(files_path: str, run_folder: str) -> str:
+    """The destination prefix for one run: ``<outputS3AssetFilesPath>/<run_folder>/``. The folder is
+    a single path segment, so a run can only ever write below its own folder."""
+    if not run_folder or "/" in run_folder or run_folder in (".", ".."):
+        raise ValueError("run folder must be a single non-empty path segment")
+    return f"{files_path.rstrip('/')}/{run_folder}/"
+
+
 def _split(s3_uri: str) -> tuple[str, str]:
     without = s3_uri[len("s3://"):]
     bucket, _, key = without.partition("/")
@@ -239,7 +251,9 @@ def lambda_handler(event, context):
     control = _assume(VAMS_CONTROL_ROLE_ARN, "pai-vams-bridge-collect-logs")
 
     uris, meta = _job_outputs(event)
-    copied = _copy_outputs(uris, resolved["outputS3AssetFilesPath"], data)
+    run_folder = resolved["jobName"]
+    meta["outputFolder"] = f"/{run_folder}/"
+    copied = _copy_outputs(uris, _run_folder_prefix(resolved["outputS3AssetFilesPath"], run_folder), data)
     _write_metadata_envelope(meta, resolved["outputS3AssetMetadataPath"], data)
     log_events = _ship_log_tail(event, meta, control)
 
@@ -249,6 +263,7 @@ def lambda_handler(event, context):
         "engine": event["engine"],
         "jobName": resolved["jobName"],
         "filesWritten": copied,
+        "outputFolder": meta["outputFolder"],
         "metadataKeys": sorted(f"pai_{k}" for k in meta),
         "logEventsShipped": log_events,
         "completedAt": int(time.time()),
