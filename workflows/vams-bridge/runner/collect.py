@@ -18,14 +18,17 @@ Rules this follows (from the VAMS bridge contract):
 * The summary returned is outcome only: counts and identifiers, no job stdout.
 
 Status: implemented. The copy streams each object through this function (two principals, so no
-managed CopyObject); a single invocation is bounded by the Lambda timeout, so a run whose artefacts
-exceed what 15 minutes can move needs a pre-arranged output location instead.
+managed CopyObject); a single invocation is bounded by the Lambda timeout. A Batch job's output is
+reduced to the deployable model first (see _select_deployable): intermediate checkpoint-<N>/
+directories and optimizer/scheduler/RNG state stay in the toolchain checkpoints bucket. A run whose
+deployable model still exceeds what 15 minutes can move needs a pre-arranged output location.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import time
 
 import boto3
@@ -117,15 +120,56 @@ def _copy_outputs(uris: list[str], dest_prefix: str, vams_session) -> int:
         bucket, key = _split(uri)
         if uri.endswith("/"):
             root = key
+            sizes = {}
             for page in own_s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=root):
                 for obj in page.get("Contents", []):
-                    if obj["Key"].endswith("/"):
-                        continue
-                    put(bucket, obj["Key"], obj["Key"][len(root):])
+                    if not obj["Key"].endswith("/"):
+                        sizes[obj["Key"][len(root):]] = obj["Size"]
+            keep, skip = _select_deployable(list(sizes))
+            LOGGER.info("output %s: copying %d objects (%d bytes), leaving %d objects (%d bytes) of "
+                        "training state in place", uri, len(keep), sum(sizes[r] for r in keep),
+                        len(skip), sum(sizes[r] for r in skip))
+            for rel in keep:
+                put(bucket, root + rel, rel)
         else:
             put(bucket, key, key.rsplit("/", 1)[-1])
     LOGGER.info("copied %d objects to %s", copied, dest_prefix)
     return copied
+
+
+_CHECKPOINT_DIR = re.compile(r"^checkpoint-(\d+)/")
+_TRAINING_STATE_FILES = ("optimizer.pt", "scheduler.pt", "scaler.pt")
+
+
+def _select_deployable(rel_keys: list[str]) -> tuple[list[str], list[str]]:
+    """Split a job's output (keys relative to its root) into (copy, leave) lists.
+
+    The copy is the model a consumer loads, not the state needed to resume training. When the root
+    holds a final model (a safetensors shard or index at the top level), every intermediate
+    checkpoint-<N>/ directory is left out: each one duplicates the model shards and adds the
+    optimizer state, which together are about three times the model's size. When the root holds no
+    final model, the highest-numbered checkpoint-<N>/ directory is copied instead. Optimizer,
+    scheduler and RNG state and Python bytecode caches are never copied. Everything left out stays
+    in the toolchain checkpoints bucket, so a run can still be resumed from there.
+    """
+    def is_state(rel: str) -> bool:
+        name = rel.rsplit("/", 1)[-1]
+        return (name in _TRAINING_STATE_FILES or name.startswith("rng_state")
+                or "/__pycache__/" in f"/{rel}" or name.endswith(".pyc"))
+
+    root_has_model = any("/" not in r and r.endswith((".safetensors", ".safetensors.index.json"))
+                         for r in rel_keys)
+    steps = sorted({int(m.group(1)) for r in rel_keys if (m := _CHECKPOINT_DIR.match(r))})
+    kept_dir = None if root_has_model or not steps else f"checkpoint-{steps[-1]}/"
+
+    keep, skip = [], []
+    for rel in sorted(rel_keys):
+        in_checkpoint = _CHECKPOINT_DIR.match(rel) is not None
+        if is_state(rel) or (in_checkpoint and not (kept_dir and rel.startswith(kept_dir))):
+            skip.append(rel)
+        else:
+            keep.append(rel)
+    return keep, skip
 
 
 def _write_metadata_envelope(meta: dict, metadata_prefix: str, vams_session) -> None:
