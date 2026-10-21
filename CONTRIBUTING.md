@@ -4,7 +4,7 @@
 
 ```bash
 git clone <REPO_URL>
-cd aws-physical-ai-toolchain
+cd sample-the-physical-ai-toolchain-on-aws
 ```
 
 > Note: DCV workstation access (port 8443) requires any VPN **disconnected** — VPNs commonly block non-standard ports.

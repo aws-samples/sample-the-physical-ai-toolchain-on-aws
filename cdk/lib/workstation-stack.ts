@@ -307,7 +307,8 @@ export class WorkstationStack extends cdk.Stack {
       'chown $DEFAULT_USER:$DEFAULT_USER /home/$DEFAULT_USER/run-isaac-lab.sh /home/$DEFAULT_USER/run-isaac-sim-gui.sh',
       '',
       'echo "Workstation bootstrap complete" > /var/log/workstation-bootstrap.summary',
-      'echo "DCV URL: https://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):' + dcvPort.toString() + '"',
+      'IMDS_TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")',
+      'echo "DCV URL: https://$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4):' + dcvPort.toString() + '"',
       'echo "Username: $DEFAULT_USER  Password: pai-lab1 (change it with: sudo passwd $DEFAULT_USER)"',
       '',
       'echo "=== Workstation Bootstrap Complete ==="',
@@ -334,6 +335,7 @@ export class WorkstationStack extends cdk.Stack {
       securityGroup: sg,
       role,
       userData,
+      requireImdsv2: true,
       blockDevices: [{
         deviceName: '/dev/sda1',
         volume: ec2.BlockDeviceVolume.ebs(volumeSizeGb, {
