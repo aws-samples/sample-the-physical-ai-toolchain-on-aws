@@ -149,8 +149,9 @@ def build_environment(
         environment.append({"name": "CHECKPOINT_PREFIX", "value": checkpoint_prefix})
     if hf_token_secret_id:
         # Secret *id*, never the value. batch-train resolves it with the instance
-        # role only when HF_TOKEN is unset, and the base model is not gated, so an
-        # unresolvable lookup is a warning rather than a failure.
+        # role only when HF_TOKEN is unset. An unresolvable lookup is only a warning
+        # in the container, but the N1.7 backbone nvidia/Cosmos-Reason2-2B is a
+        # gated repo, so training then fails with HTTP 401 at that download.
         environment.append({"name": "HF_TOKEN_SECRET_ID", "value": hf_token_secret_id})
     return environment
 
@@ -453,8 +454,10 @@ def main():
     parser.add_argument(
         "--hf-token-secret-id",
         default="",
-        help="Secrets Manager secret id/ARN holding the HuggingFace token. Optional: "
-        "the base model is not gated, so an unresolvable lookup is only a warning",
+        help="Secrets Manager secret id/ARN holding the HuggingFace token. Unset keeps "
+        "the job definition's own HF_TOKEN_SECRET_ID. A token is required: the N1.7 "
+        "backbone nvidia/Cosmos-Reason2-2B is a gated repo, so a job without one fails "
+        "with HTTP 401 at that download",
     )
     parser.add_argument("--job-name", default=None, help="Job name suffix; a timestamp is appended")
     parser.add_argument("--job-queue", default=DEFAULT_JOB_QUEUE)

@@ -18,7 +18,9 @@
 #   TUNE_VISUAL         - 0 (default, upstream behaviour) | 1. Off keeps the
 #                         vision tower frozen so the job fits one 48 GB L40S;
 #                         on adds ~1.15B trainable params and needs 4 GPUs.
-#   HF_TOKEN            - HuggingFace token for model download (optional)
+#   HF_TOKEN            - HuggingFace token for model download. Needed (directly or
+#                         via HF_TOKEN_SECRET_ID) unless the archive variables below
+#                         are set: the Cosmos-Reason2-2B backbone is gated (see NOTE).
 #   HF_TOKEN_SECRET_ID  - Secrets Manager secret id/ARN holding the token. Used
 #                         only when local model archives are absent and HF_TOKEN is unset.
 #   GROOT_BASE_MODEL_ARCHIVE_S3_URI - participant-S3 GR00T N1.7 tar archive
@@ -30,9 +32,12 @@
 # both models, rewrites GR00T's nested backbone reference to the local Reason2 directory,
 # and enables Hugging Face/Transformers offline mode.
 #
-# NOTE: the base model nvidia/GR00T-N1.7-3B is NOT gated on HuggingFace
-# (the hub API reports gated:false), so a missing/unresolvable token is a
-# warning, not a failure. The token only matters for gated or private models.
+# NOTE: nvidia/GR00T-N1.7-3B itself is not gated on HuggingFace (the hub API
+# reports gated:false), but its VLM backbone nvidia/Cosmos-Reason2-2B IS a gated
+# repo, and training downloads it. Without a token from an account that has been
+# granted access to that repo, the backbone download fails with HTTP 401. A
+# missing/unresolvable token is still only a warning here, not a failure, so the
+# job stops later, at that download. The offline archive path needs no token.
 # =============================================================================
 
 set -e
@@ -165,10 +170,15 @@ mkdir -p "$OUTPUT_DIR"
 
 # --- Resolve the HuggingFace token from Secrets Manager if not passed directly ---
 # The value is assigned, never printed; only "resolved / not resolved" is logged.
+warn_gated_backbone() {
+    echo "  WARNING: the GR00T N1.7 backbone nvidia/Cosmos-Reason2-2B is a gated HuggingFace"
+    echo "           repo. Without a token its download will fail with HTTP 401 Unauthorized."
+}
 if [ -z "$ARCHIVE_SETTINGS_PRESENT" ] && [ -z "${HF_TOKEN:-}" ] && [ -n "$SECRET_ID" ]; then
     echo "Resolving the HuggingFace token from Secrets Manager..."
-    # `|| true`-style fallback: the base model is not gated, so a failed lookup
-    # must not kill the job under `set -e`.
+    # `|| true`-style fallback: a failed lookup must not kill the job under
+    # `set -e`. It is reported below; the gated backbone download is where a
+    # missing token actually fails.
     HF_TOKEN=$(aws secretsmanager get-secret-value \
         --secret-id "$SECRET_ID" \
         --region "${AWS_DEFAULT_REGION:-us-east-2}" \
@@ -176,8 +186,12 @@ if [ -z "$ARCHIVE_SETTINGS_PRESENT" ] && [ -z "${HF_TOKEN:-}" ] && [ -n "$SECRET
     if [ -n "$HF_TOKEN" ]; then
         echo "  HuggingFace credential: resolved from Secrets Manager"
     else
-        echo "  HuggingFace credential: NOT resolved (continuing; base model is not gated)"
+        echo "  HuggingFace credential: NOT resolved (continuing)"
+        warn_gated_backbone
     fi
+elif [ -z "$ARCHIVE_SETTINGS_PRESENT" ] && [ -z "${HF_TOKEN:-}" ]; then
+    echo "  HuggingFace credential: none (HF_TOKEN and HF_TOKEN_SECRET_ID are both unset)"
+    warn_gated_backbone
 fi
 
 # --- Export HF token if set ---

@@ -117,9 +117,12 @@ optimizer state — but:
 | HuggingFace token in Secrets Manager (`physical-ai/hf-token`) | `aws secretsmanager describe-secret --secret-id physical-ai/hf-token --region us-east-2` |
 | Python 3.10+ with `pyarrow` (dataset prep only) | `python3 -c "import pyarrow"` |
 
-> `nvidia/GR00T-N1.7-3B` is **not** a gated repo, so the HuggingFace token is not
-> functionally required to download the base weights. It is still configured, and
-> an unresolvable lookup is a warning rather than a failure.
+> **The HuggingFace token is required for N1.7.** `nvidia/GR00T-N1.7-3B` itself
+> is not gated, but training also downloads its VLM backbone
+> `nvidia/Cosmos-Reason2-2B`, which **is** a gated repo: the token must belong to
+> an account that has been granted access to it on its Hugging Face model page.
+> Without a usable token the container only logs a warning and continues, then
+> training fails with HTTP `401 Unauthorized` on the backbone download.
 
 ---
 
@@ -218,7 +221,7 @@ two of them fail *silently* rather than loudly when they are wrong.
 | Env: `BATCH_SIZE` / `GRAD_ACCUM_STEPS` | `2` / `8` | `BATCH_SIZE` is the **global, pre-accumulation** batch and the trainer computes `per_device = BATCH_SIZE / num_gpus`, so on 1 GPU it *is* the per-device batch. 2 × 8 keeps the effective optimizer batch at 16. On 4 GPUs use `8` / `2` for the same effective batch |
 | Env: `MAX_STEPS` | `100` (or `15` for a smoke test) | |
 | Env: `AWS_DEFAULT_REGION` | `us-east-2` | Used by the in-container `aws s3`/`secretsmanager` calls |
-| Env: `HF_TOKEN_SECRET_ID` | `physical-ai/hf-token` | Optional in practice — `nvidia/GR00T-N1.7-3B` is not gated, so an unresolved lookup is a warning |
+| Env: `HF_TOKEN_SECRET_ID` | `physical-ai/hf-token` | **Required for N1.7.** The backbone `nvidia/Cosmos-Reason2-2B` is a gated repo, so the secret must hold a token whose account has access to it. A missing, empty or unreadable secret is only a warning at start-up; the job then fails with HTTP 401 at the backbone download |
 
 If the compute environment is also being created by hand, reuse the existing
 CloudFormation stack outputs rather than inventing new ones:
@@ -588,8 +591,22 @@ aws secretsmanager create-secret \
 
 The container reads it via `HF_TOKEN_SECRET_ID` using the Batch instance role, so
 the token never appears in the job definition, in CloudWatch, or in this repo.
-Because `nvidia/GR00T-N1.7-3B` is not gated, a failed lookup only prints
-`HuggingFace credential: NOT resolved (continuing; base model is not gated)`.
+
+The token must come from a Hugging Face account that has been granted access to
+the gated backbone `nvidia/Cosmos-Reason2-2B` (request it on the model page).
+A failed lookup — no secret, a secret created with no value, or no
+`secretsmanager:GetSecretValue` on the instance role — does not stop the
+container: it prints `HuggingFace credential: NOT resolved (continuing)` and a
+warning that the gated backbone download will fail, and training then fails
+with HTTP `401 Unauthorized` on `nvidia/Cosmos-Reason2-2B`. Store a real value
+before submitting:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id "physical-ai/hf-token" \
+  --secret-string "<YOUR_HF_TOKEN>" \
+  --region us-east-2
+```
 
 ---
 
@@ -1000,7 +1017,8 @@ shape here with a demonstrated end-to-end run.
 | Video pre-flight fails with a torchcodec/ffmpeg error on `episode_000000.mp4` | AV1 decode (`video.codec: "av1"`) unavailable in the image's ffmpeg/torchcodec combination | Transcode all 201 videos to H.264 (`ffmpeg -i in.mp4 -c:v libx264 -pix_fmt yuv420p out.mp4`), re-stage the dataset to S3, resubmit. This is a data fix, not a container change. |
 | `AccessDenied` reading `DATASET_S3_URI` | The instance role grants S3 only on `arn:aws:s3:::physical-ai-dev-*`, and the canonical dataset lives in `physical-ai-workshop-assets-<ACCOUNT_ID>` | Stage a prepared copy to `s3://physical-ai-dev-datasets-<ACCOUNT_ID>/groot-data/pick_place_data/`. Do **not** widen the policy. |
 | `HF_TOKEN` still appears in plaintext in the job definition | The Secrets Manager migration is written in `batch.tf` but **not applied** — applying registers a new revision | Apply `isaac-gr00t-on-aws/infra` deliberately (`enable_batch=true`), then confirm the new revision has `HF_TOKEN_SECRET_ID` and no `HF_TOKEN` |
-| `HuggingFace credential: NOT resolved` in the logs | The instance role has no `secretsmanager:GetSecretValue` yet (see the row above) | Harmless: `nvidia/GR00T-N1.7-3B` is not gated and training continues. Fix by applying the Terraform. |
+| `HuggingFace credential: NOT resolved` in the logs | The secret is missing or empty, or the instance role has no `secretsmanager:GetSecretValue` yet (see the row above) | **Not harmless:** the job continues but fails at the gated backbone download (next row). Store a token with `put-secret-value` ([Step 5](#step-5-store-the-huggingface-token)) and, if the permission is missing, apply the Terraform. |
+| Training fails with HTTP `401 Unauthorized` for `huggingface.co/nvidia/Cosmos-Reason2-2B` | `nvidia/Cosmos-Reason2-2B`, the N1.7 VLM backbone, is a gated repo, and the job had no token — or a token whose account has not been granted access to that repo | Request access on the `nvidia/Cosmos-Reason2-2B` model page with the account that owns the token, store the token in `physical-ai/hf-token`, and resubmit. Observed on a separate us-east-1 deployment: the same job failed this way with an empty secret and trained to completion once a valid token was stored. |
 | `AssertionError: global_batch_size must be divisible by num_gpus` at startup | `BATCH_SIZE` does not divide the job definition's GPU count — e.g. the single-GPU default `2` against a 4-GPU job definition | Match the pair to the shape: `2`/`8` for 1 GPU, `8`/`2` for 4 GPUs. `submit_batch_training_n17.py` refuses the mismatch before submitting. |
 | `CUDA out of memory` on one GPU | Either `TUNE_VISUAL=1` (which needs 4 GPUs for ZeRO sharding), or the per-device batch is too large — remember `BATCH_SIZE` *is* the per-device batch at `num_gpus=1` | Confirm the log banner says `Tune visual: False`. Then step down `BATCH_SIZE=1` with `GRAD_ACCUM_STEPS=16` to hold the effective batch at 16. No `--gradient-checkpointing` flag exists in this SDK revision, and the custom modules never call a checkpoint function, so it would not help. |
 | `TUNE_VISUAL=1` on a 1-GPU instance OOMs | At `num_gpus=1` DeepSpeed is disabled outright (`experiment.py:258-262`), so the ~2.03B trainable parameters carry unsharded fp32 grads and AdamW moments, and the ViT/LLM activation graph is retained | Leave `TUNE_VISUAL=0` on one GPU. Visual tuning is a 4-GPU configuration. |
