@@ -171,7 +171,7 @@ terraform apply -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch
 |----------|---------|
 | CodeBuild: `physical-ai-dev-gr00t-training-build` | Builds the GR00T training container |
 | CodeBuild: `physical-ai-dev-gr00t-inference-build` | Builds the GR00T inference container |
-| Batch compute env: `physical-ai-dev-gr00t-compute` | `var.batch_instance_type` (now defaulting to `g6e.4xlarge`), 512 GiB gp3 root, min/desired 0 vCPU, max 96. The **deployed** one still offers `g6e.12xlarge`; the single-GPU CE that ran the smoke test is the separate, unmanaged `…-compute-1gpu` (see the drift note above) |
+| Batch compute env: `physical-ai-dev-gr00t-compute` | `var.batch_instance_type` (now defaulting to `g6e.4xlarge`), or the optional fallback list `var.batch_instance_types`, 512 GiB gp3 root, min/desired 0 vCPU, max 96. The **deployed** one still offers `g6e.12xlarge`; the single-GPU CE that ran the smoke test is the separate, unmanaged `…-compute-1gpu` (see the drift note above) |
 | Batch job queue: `physical-ai-dev-gr00t-queue` | Job scheduling |
 | Batch job definition: `physical-ai-dev-gr00t-n17-training` | Image `:n17`, command `batch-train`, 16 VCPU / 122880 MEMORY / 1 GPU by default (variables — `48 / 180000 / 4` for the 4-GPU path), plus the **mandatory** `EMBODIMENT_CONFIG=g1_dex3` and `TUNE_VISUAL=0` (see [Required job-definition fields](#required-job-definition-fields)) |
 | Security group | Outbound access for ECR/S3/HuggingFace |
@@ -287,6 +287,9 @@ cd isaac-gr00t-on-aws/infra
 ~/bin/terraform fmt -check
 ~/bin/terraform init -backend=false
 ~/bin/terraform validate
+# Offline, mocked-provider checks of the compute-environment instance types and
+# the GPU preconditions (tests/batch_instance_types.tftest.hcl)
+~/bin/terraform test
 ```
 
 ---
@@ -930,7 +933,8 @@ comparing the two on cost per step.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_batch` | `false` | Set to `true` to deploy the Batch resources |
-| `batch_instance_type` | `g6e.4xlarge` | Matches the single-GPU job shape below. The currently deployed CE is `g6e.12xlarge`, so changing this replaces the compute environment |
+| `batch_instance_type` | `g6e.4xlarge` | Matches the single-GPU job shape below. The currently deployed CE is `g6e.12xlarge`, so changing this replaces the compute environment. Ignored when `batch_instance_types` is set |
+| `batch_instance_types` | `[]` | Optional fallback list that replaces `batch_instance_type`, e.g. `["g6e.4xlarge","g6e.8xlarge","g6e.16xlarge"]` for the single-GPU shape or `["g6e.12xlarge","g6e.24xlarge"]` for 4 GPUs. Empty renders exactly `[batch_instance_type]`, so existing deployments see no plan diff. **Setting or changing it replaces the compute environment** — do it with no jobs queued or running. See the note below on allocation strategy and cost |
 | `batch_max_vcpus` | `96` | Maximum vCPUs for auto-scaling |
 | `batch_job_vcpus` | `16` | Job-definition vCPU request. `48` for `g6e.12xlarge` |
 | `batch_job_memory_mib` | `122880` | Job-definition memory request. `180000` for `g6e.12xlarge` |
@@ -938,10 +942,25 @@ comparing the two on cost per step.
 
 The job definition carries two `lifecycle` preconditions that reject an
 inconsistent pair at plan time: `batch_job_gpus` must equal the GPU count of
-`batch_instance_type`, and that instance type's cards must be 48 GB-class. Both
-mismatches are otherwise silent — too many GPUs parks the job in `RUNNABLE` with
-no `statusReason`, and a 24 GB L4 (`g6.12xlarge`) lets the job launch and then
-OOM mid-load.
+`batch_instance_type` — or of **every** type in `batch_instance_types` — and
+those cards must be 48 GB-class. Both mismatches are otherwise silent — too
+many GPUs parks the job in `RUNNABLE` with no `statusReason`, and a 24 GB L4
+(`g6.12xlarge`) lets the job launch and then OOM mid-load. A type in
+`batch_instance_types` that `batch.tf`'s GPU lookup maps do not know is rejected
+too, because it cannot be checked.
+
+**Why a list, and what it changes.** One instance type can run out of on-demand
+capacity in every AZ at the same time, and quota does not help: on a separate
+us-east-1 deployment `g6e.4xlarge` was unavailable in three AZs and jobs sat
+`RUNNABLE` for about 80 minutes. With two or more
+types the compute environment switches from the default `BEST_FIT` allocation
+strategy (Batch picks one type and waits for it) to `BEST_FIT_PROGRESSIVE`
+(Batch moves on to another listed type when the first is unavailable). Batch
+then chooses among the listed types by its own cost preference (lowest cost per
+vCPU), not by list order, so a job can land on a larger, more expensive
+instance even while the first type has capacity: list only types you are
+willing to pay for. A single type, or an empty list, leaves the allocation
+strategy unset, as before.
 
 ---
 
@@ -1026,7 +1045,7 @@ shape here with a demonstrated end-to-end run.
 | Problem | Cause | Solution |
 |---------|-------|----------|
 | Job stuck in `RUNNABLE`, `statusReason` null, **and `desiredvCpus` never rises** | The job's `resourceRequirements` cannot be placed on the CE's instance type — e.g. 16 vCPU / 1 GPU against a `g6e.12xlarge`-only CE, or 48 vCPU / 4 GPU against a `g6e.4xlarge` one. Batch parks the job instead of rejecting it | Compare `aws batch describe-job-definitions --job-definition-name <name> --query 'jobDefinitions[-1].containerProperties.resourceRequirements'` against `aws batch describe-compute-environments --compute-environments <ce> --query 'computeEnvironments[0].computeResources.instanceTypes'`. Fix the shape (`batch_job_vcpus` / `batch_job_memory_mib` / `batch_job_gpus`) or the CE — do not wait for capacity. |
-| Job stuck in `RUNNABLE`, `statusReason` null, no log stream | No **capacity** for the instance type (not quota, not config) — the CE is `VALID` and `desiredvCpus` did rise | Inspect the backing ASG: `aws autoscaling describe-scaling-activities --auto-scaling-group-name <ce-asg> --region us-east-2 --query 'Activities[].{code:StatusCode,cause:StatusMessage}'`. `InsufficientInstanceCapacity` means wait — Batch retries by itself. Check the quota separately with `aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA`. |
+| Job stuck in `RUNNABLE`, `statusReason` null, no log stream | No **capacity** for the instance type (not quota, not config) — the CE is `VALID` and `desiredvCpus` did rise | Inspect the backing ASG: `aws autoscaling describe-scaling-activities --auto-scaling-group-name <ce-asg> --region us-east-2 --query 'Activities[].{code:StatusCode,cause:StatusMessage}'`. `InsufficientInstanceCapacity` means wait — Batch retries by itself. Check the quota separately with `aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA`. If one type is regularly unavailable, offer fallbacks with `batch_instance_types` (see [Configuration Variables](#configuration-variables-terraform)). |
 | Tempted to pin the CE to the AZ the error message names | The "you can currently get capacity in us-east-2b/c" hint is a point-in-time pool estimate | **Do not.** us-east-2b was recommended by both the 2a and 2c failure messages and itself failed 6/6. Pinning reduces the number of pools the ASG can try and fixes nothing. |
 | `CannotPullContainerError` / repository does not exist | Job submitted against `physical-ai-dev-gr00t-training` (any revision), which points at the misspelled repo `physical-ai/groot-training` | Submit against `physical-ai-dev-gr00t-n17-training` |
 | Container trains a UR3 end-effector config on G1 data, or SciPy raises in `Rotation.from_rotvec` | `EMBODIMENT_CONFIG` not set, so the image default `ur3` ran. Live job-definition revision 1 ships no `EMBODIMENT_CONFIG` | Pass `EMBODIMENT_CONFIG=g1_dex3` — in `--container-overrides` for every submission, or as a job-definition environment entry (see [Required job-definition fields](#required-job-definition-fields)). A Batch `command` override cannot fix this: `Dockerfile.n17` sets an `ENTRYPOINT` and Batch has no entrypoint override. |

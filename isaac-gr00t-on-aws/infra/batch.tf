@@ -9,9 +9,22 @@ variable "enable_batch" {
 }
 
 variable "batch_instance_type" {
-  description = "Instance type for Batch compute. Default matches the single-GPU job shape below (g6e.4xlarge = 1x L40S 48 GB). Pass g6e.12xlarge together with batch_job_vcpus=48 / batch_job_memory_mib=180000 / batch_job_gpus=4"
+  description = "Instance type for Batch compute. Default matches the single-GPU job shape below (g6e.4xlarge = 1x L40S 48 GB). Pass g6e.12xlarge together with batch_job_vcpus=48 / batch_job_memory_mib=180000 / batch_job_gpus=4. Ignored when batch_instance_types is set"
   type        = string
   default     = "g6e.4xlarge"
+}
+
+# Optional fallback list. One instance type can run out of on-demand capacity in
+# every AZ at once (jobs then sit in RUNNABLE with no statusReason); offering
+# several types that all fit the job lets Batch launch whichever is available.
+# Empty (the default) keeps exactly [batch_instance_type], so existing
+# deployments see no plan diff. Setting it on an existing deployment replaces
+# the compute environment.
+variable "batch_instance_types" {
+  description = "Optional list of instance types for the Batch compute environment. Empty (default) uses [batch_instance_type]. When set it replaces batch_instance_type; every type must be in the GPU lookup maps in batch.tf and have exactly batch_job_gpus 48 GB-class GPUs, e.g. [\"g6e.4xlarge\", \"g6e.8xlarge\", \"g6e.16xlarge\"] for the single-GPU shape. Two or more types switch the allocation strategy to BEST_FIT_PROGRESSIVE. Setting or changing it replaces the compute environment"
+  type        = list(string)
+  default     = []
+  nullable    = false
 }
 
 variable "batch_max_vcpus" {
@@ -84,18 +97,28 @@ locals {
   batch_subnet_ids = var.enable_batch ? split(",", data.aws_ssm_parameter.private_subnet_ids[0].value) : []
 
   # Physical GPU count and per-GPU VRAM for the instance types this guide
-  # reasons about, used only by the job definition's precondition below. An
-  # instance type that is absent from these maps is not rejected — it simply
-  # cannot be checked, so the precondition lets it through.
+  # reasons about, used by the preconditions below. A type in
+  # batch_instance_types must appear here, or the plan is rejected. A lone
+  # batch_instance_type that is absent keeps the earlier behaviour: it is not
+  # rejected, it simply cannot be checked, so the preconditions let it through.
+  # The extra g6e sizes are fallbacks that hold the same shapes: g6e.8xlarge
+  # (32 vCPU / 256 GiB) and g6e.16xlarge (64 / 512) for 1 GPU, g6e.24xlarge
+  # (96 / 768) for 4 GPUs.
   batch_gpus_per_instance = {
     "g6e.4xlarge"  = 1
+    "g6e.8xlarge"  = 1
+    "g6e.16xlarge" = 1
     "g6e.12xlarge" = 4
+    "g6e.24xlarge" = 4
     "g6.4xlarge"   = 1
     "g6.12xlarge"  = 4
   }
   batch_gpu_mib_per_instance = {
     "g6e.4xlarge"  = 46068 # L40S 48 GB
+    "g6e.8xlarge"  = 46068 # L40S 48 GB
+    "g6e.16xlarge" = 46068 # L40S 48 GB
     "g6e.12xlarge" = 46068 # L40S 48 GB
+    "g6e.24xlarge" = 46068 # L40S 48 GB
     "g6.4xlarge"   = 22888 # L4 24 GB
     "g6.12xlarge"  = 22888 # L4 24 GB
   }
@@ -105,8 +128,29 @@ locals {
   # even on a 4-GPU g6.12xlarge: the job is placeable there, launches, and OOMs.
   batch_min_gpu_mib = 32768
 
-  batch_instance_gpus    = lookup(local.batch_gpus_per_instance, var.batch_instance_type, var.batch_job_gpus)
-  batch_instance_gpu_mib = lookup(local.batch_gpu_mib_per_instance, var.batch_instance_type, local.batch_min_gpu_mib)
+  # The compute environment's instance types. With batch_instance_types empty
+  # this is exactly [var.batch_instance_type], what this stack rendered before
+  # the list existed.
+  batch_instance_types = length(var.batch_instance_types) > 0 ? distinct(var.batch_instance_types) : [var.batch_instance_type]
+
+  batch_unknown_instance_types = [
+    for t in distinct(var.batch_instance_types) : t if !contains(keys(local.batch_gpus_per_instance), t)
+  ]
+  batch_gpu_count_mismatches = [
+    for t in local.batch_instance_types : "${t} (${lookup(local.batch_gpus_per_instance, t, var.batch_job_gpus)} GPUs)"
+    if lookup(local.batch_gpus_per_instance, t, var.batch_job_gpus) != var.batch_job_gpus
+  ]
+  batch_gpu_memory_too_small = [
+    for t in local.batch_instance_types : "${t} (${lookup(local.batch_gpu_mib_per_instance, t, local.batch_min_gpu_mib)} MiB per GPU)"
+    if lookup(local.batch_gpu_mib_per_instance, t, local.batch_min_gpu_mib) < local.batch_min_gpu_mib
+  ]
+
+  # BEST_FIT (the API default, used when the attribute is unset) makes Batch pick
+  # one instance type and wait for it, so a second listed type would never be
+  # tried while the first is out of capacity. BEST_FIT_PROGRESSIVE moves on to
+  # the other listed types. Only a list of two or more needs it; a single type
+  # leaves the attribute unset, exactly as before.
+  batch_allocation_strategy = length(local.batch_instance_types) > 1 ? "BEST_FIT_PROGRESSIVE" : null
 }
 
 # --- Security Group ---
@@ -269,18 +313,29 @@ resource "aws_batch_compute_environment" "groot" {
   service_role = aws_iam_role.batch_service[0].arn
 
   compute_resources {
-    type               = "EC2"
-    instance_role      = aws_iam_instance_profile.batch[0].arn
-    instance_type      = [var.batch_instance_type]
-    max_vcpus          = var.batch_max_vcpus
-    min_vcpus          = 0
-    desired_vcpus      = 0
-    security_group_ids = [aws_security_group.batch[0].id]
-    subnets            = local.batch_subnet_ids
+    type                = "EC2"
+    allocation_strategy = local.batch_allocation_strategy
+    instance_role       = aws_iam_instance_profile.batch[0].arn
+    instance_type       = local.batch_instance_types
+    max_vcpus           = var.batch_max_vcpus
+    min_vcpus           = 0
+    desired_vcpus       = 0
+    security_group_ids  = [aws_security_group.batch[0].id]
+    subnets             = local.batch_subnet_ids
 
     launch_template {
       launch_template_id = aws_launch_template.batch[0].id
       version            = "$Latest"
+    }
+  }
+
+  # An explicitly listed type that the lookup maps do not know cannot be checked
+  # against the job's GPU count or memory, and a fallback list is exactly where
+  # an unchecked type would slip in, so it is rejected here.
+  lifecycle {
+    precondition {
+      condition     = length(local.batch_unknown_instance_types) == 0
+      error_message = "batch_instance_types lists ${join(", ", local.batch_unknown_instance_types)}, which batch.tf has no GPU count or GPU memory for, so it cannot be checked against the job shape. Use known types (${join(", ", sort(keys(local.batch_gpus_per_instance)))}) or add the type to batch_gpus_per_instance and batch_gpu_mib_per_instance."
     }
   }
 
@@ -383,15 +438,16 @@ resource "aws_batch_job_definition" "groot_n17" {
   # Both mismatches fail silently at runtime, hours after apply, so they are
   # caught here instead: more GPUs than the instance has parks the job in
   # RUNNABLE with no statusReason, and a card too small to hold the model lets
-  # the job launch and then OOM mid-load.
+  # the job launch and then OOM mid-load. Checked for EVERY compute-environment
+  # instance type, because Batch may place the job on any of them.
   lifecycle {
     precondition {
-      condition     = var.batch_job_gpus == local.batch_instance_gpus
-      error_message = "batch_job_gpus (${var.batch_job_gpus}) does not match the ${local.batch_instance_gpus} GPUs on batch_instance_type ${var.batch_instance_type}. Use g6e.4xlarge with 16 / 122880 / 1, or g6e.12xlarge with 48 / 180000 / 4."
+      condition     = length(local.batch_gpu_count_mismatches) == 0
+      error_message = "batch_job_gpus (${var.batch_job_gpus}) does not match the GPU count of ${join(", ", local.batch_gpu_count_mismatches)}. Every compute-environment instance type must have exactly batch_job_gpus GPUs. Use g6e.4xlarge with 16 / 122880 / 1, or g6e.12xlarge with 48 / 180000 / 4."
     }
     precondition {
-      condition     = local.batch_instance_gpu_mib >= local.batch_min_gpu_mib
-      error_message = "batch_instance_type ${var.batch_instance_type} has ${local.batch_instance_gpu_mib} MiB per GPU, below the ${local.batch_min_gpu_mib} MiB this training job needs. GR00T N1.7-3B occupies 22,023 MiB static at TUNE_VISUAL=0 before activations; use a 48 GB-class card such as g6e.4xlarge."
+      condition     = length(local.batch_gpu_memory_too_small) == 0
+      error_message = "${join(", ", local.batch_gpu_memory_too_small)} is below the ${local.batch_min_gpu_mib} MiB per GPU this training job needs. GR00T N1.7-3B occupies 22,023 MiB static at TUNE_VISUAL=0 before activations; use a 48 GB-class card such as g6e.4xlarge."
     }
   }
 
