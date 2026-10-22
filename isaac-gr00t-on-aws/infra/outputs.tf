@@ -10,6 +10,11 @@ output "groot_inference_ecr_uri" {
   sensitive   = true
 }
 
+output "batch_job_definition" {
+  description = "Batch job definition name for GR00T N1.7 training"
+  value       = var.enable_batch ? aws_batch_job_definition.groot_n17[0].name : null
+}
+
 output "codebuild_training_project" {
   description = "CodeBuild project name for GR00T training container"
   value       = aws_codebuild_project.groot_training.name

@@ -69,6 +69,16 @@ spec:
               # into it so a cached download survives pod restarts.
               mkdir -p /models/hf-cache /workspace/io
 
+              COSMOS_GUARDRAIL_REVISION="cf03c0395fac8c4de386c0bdab12cc4fc8d66362"
+              COSMOS_GUARDRAIL1_REVISION="d6d4bfa899a71454a700907664f3e88f503950cf"
+              QWEN3_GUARD_REVISION="fada3b2f655b89601929198343c94cd2f64d93cc"
+              guardrail_cache_ready() {
+                test -s "/models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/snapshots/${COSMOS_GUARDRAIL_REVISION}/config.json" \
+                  && test -s "/models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/snapshots/${COSMOS_GUARDRAIL1_REVISION}/video_content_safety_filter/safety_filter.pt" \
+                  && test -s "/models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/snapshots/${QWEN3_GUARD_REVISION}/config.json" \
+                  && test -s "/models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/snapshots/${QWEN3_GUARD_REVISION}/model.safetensors"
+              }
+
               # --- Resolve model + serve flags from COSMOS_MODEL ---
               case "${COSMOS_MODEL}" in
                 super)
@@ -91,19 +101,77 @@ spec:
                   ;;
               esac
 
+              # --- Ensure the AWS CLI is available before model-cache recovery ---
+              # The image has python3/pip3 but not the unzip utility required by the
+              # official installer, so use the pure-Python package.
+              if ! command -v aws >/dev/null 2>&1; then
+                echo "=== Installing AWS CLI (via pip) ==="
+                pip3 install --quiet awscli
+              fi
+
+              # --- Restore the node-local cache after Cluster Autoscaler replacement ---
+              # /models is a hostPath on the GPU node. Scaling the node group to zero
+              # deletes that disk, so a later Job must recover the verified participant-S3
+              # archive before REQUIRE_LOCAL_WEIGHTS is evaluated.
+              if [ -n "${LOCAL_MODEL_DIR:-}" ] \
+                 && { [ ! -d "$LOCAL_MODEL_DIR" ] \
+                      || [ -z "$(ls -A "$LOCAL_MODEL_DIR" 2>/dev/null)" ] \
+                      || ! guardrail_cache_ready; } \
+                 && [ -n "${COSMOS_ARCHIVE_S3_URI:-}" ]; then
+                [ -n "${COSMOS_ARCHIVE_SHA256:-}" ] || {
+                  echo "ERROR: COSMOS_ARCHIVE_SHA256 is required with COSMOS_ARCHIVE_S3_URI" >&2
+                  exit 1
+                }
+                ARCHIVE=/models/cosmos3-nano.tar
+                NEXT_DIR=/models/cosmos3-nano.next
+                NEXT_HF_HOME=/models/hf-cache.next
+                echo "=== Restoring Cosmos runtime bundle from participant S3 ==="
+                aws s3 cp "$COSMOS_ARCHIVE_S3_URI" "$ARCHIVE" \
+                  --region "$AWS_REGION" --only-show-errors
+                printf '%s  %s\n' "$COSMOS_ARCHIVE_SHA256" "$ARCHIVE" | sha256sum -c -
+                rm -rf "$NEXT_DIR" "$NEXT_HF_HOME"
+                mkdir -p "$NEXT_DIR"
+                tar -xf "$ARCHIVE" -C "$NEXT_DIR"
+                test -s "$NEXT_DIR/config.json"
+                test -s "$NEXT_DIR/model.safetensors.index.json"
+                test -s "$NEXT_DIR/transformer/diffusion_pytorch_model.safetensors.index.json"
+                test -s "$NEXT_DIR/vae/diffusion_pytorch_model.safetensors"
+                test -s "$NEXT_DIR/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/snapshots/${COSMOS_GUARDRAIL_REVISION}/config.json"
+                test -s "$NEXT_DIR/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/snapshots/${COSMOS_GUARDRAIL1_REVISION}/video_content_safety_filter/safety_filter.pt"
+                mv "$NEXT_DIR/hf-cache" "$NEXT_HF_HOME"
+                rm -rf "$LOCAL_MODEL_DIR" /models/hf-cache
+                mv "$NEXT_DIR" "$LOCAL_MODEL_DIR"
+                mv "$NEXT_HF_HOME" /models/hf-cache
+                rm -f "$ARCHIVE"
+                echo "=== Restored and verified Cosmos model and guardrails ==="
+              fi
+
+              if [ "${REQUIRE_LOCAL_WEIGHTS:-false}" = "true" ]; then
+                if ! guardrail_cache_ready; then
+                  echo "ERROR: both pinned Cosmos guardrail snapshots are required in /models/hf-cache; Hugging Face fallback is disabled" >&2
+                  exit 1
+                fi
+                mkdir -p \
+                  /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs \
+                  /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs \
+                  /models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/refs
+                printf '%s' "$COSMOS_GUARDRAIL_REVISION" \
+                  > /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs/main
+                printf '%s' "$COSMOS_GUARDRAIL1_REVISION" \
+                  > /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs/main
+                printf '%s' "$QWEN3_GUARD_REVISION" \
+                  > /models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/refs/main
+                echo "=== Pinned offline guardrail refs/main materialized ==="
+              fi
+
               # --- Prefer node-local staged weights over a gated HF download ---
-              # event-provision.sh stages weights onto the node's disk (hostPath
-              # /opt/cosmos3, mounted here at /models). Serving straight from that
-              # directory skips the ~33 GB gated Hugging Face download, so participants
-              # need neither an HF token nor an accepted model licence.
-              #
-              # Falling back to the Hugging Face repo id keeps the path that is actually
-              # validated end-to-end (measured on g6e.4xlarge: 7m44s to ready, 11m22s to
-              # generate) working unchanged when nothing has been staged.
               if [ -n "${LOCAL_MODEL_DIR:-}" ] && [ -d "$LOCAL_MODEL_DIR" ] \
                  && [ -n "$(ls -A "$LOCAL_MODEL_DIR" 2>/dev/null)" ]; then
                 echo "=== Using node-local staged weights: $LOCAL_MODEL_DIR ==="
                 MODEL_ID="$LOCAL_MODEL_DIR"
+              elif [ "${REQUIRE_LOCAL_WEIGHTS:-false}" = "true" ]; then
+                echo "ERROR: staged Cosmos weights are required at ${LOCAL_MODEL_DIR:-<unset>}; Hugging Face fallback is disabled" >&2
+                exit 1
               else
                 echo "=== No staged weights at ${LOCAL_MODEL_DIR:-<unset>} - falling back to Hugging Face (${MODEL_ID}) ==="
               fi
@@ -112,16 +180,6 @@ spec:
               # passed to `vllm serve`, so deriving this from the Hugging Face id would
               # make the readiness grep below never match a local-path launch.
               MODEL_SHORT_NAME=$(basename "$MODEL_ID")
-
-              # --- Ensure the AWS CLI is available (image doesn't ship it) ---
-              # Installed via pip instead of the official zip installer — the
-              # image has python3/pip3 but not `unzip`, which the zip
-              # installer requires. pip's awscli is pure-Python, no unzip
-              # needed, and is fast enough here (a few seconds).
-              if ! command -v aws >/dev/null 2>&1; then
-                echo "=== Installing AWS CLI (via pip) ==="
-                pip3 install --quiet awscli
-              fi
 
               # --- Start the server in the background ---
               echo "=== Starting vLLM-Omni ${MODEL_ID} ==="
@@ -149,10 +207,22 @@ spec:
                 exit 1
               fi
 
-              # --- Download the reference video from S3 ---
-              REF_LOCAL=/workspace/io/reference.mp4
+              # --- Download and normalize the reference video from S3 ---
+              # Workshop Studio packages the source clip as AV1. OpenCV in the Cosmos
+              # image attempts an unavailable hardware AV1 decoder and returns 0 frames,
+              # so use ffmpeg's software decoder to create an H.264 inference copy.
+              REF_SOURCE=/workspace/io/reference-source.mp4
+              REF_LOCAL=/workspace/io/reference-h264.mp4
               echo "=== Downloading reference video: ${INPUT_S3_URI} ==="
-              aws s3 cp "${INPUT_S3_URI}" "$REF_LOCAL" --region "${AWS_REGION}"
+              aws s3 cp "${INPUT_S3_URI}" "$REF_SOURCE" --region "${AWS_REGION}"
+              command -v ffmpeg >/dev/null 2>&1 || {
+                echo "ERROR: ffmpeg is required to normalize the workshop input video" >&2
+                exit 1
+              }
+              ffmpeg -hide_banner -loglevel error -y -i "$REF_SOURCE" \
+                -an -c:v libx264 -pix_fmt yuv420p "$REF_LOCAL"
+              test -s "$REF_LOCAL"
+              echo "=== Reference video normalized to H.264 for Cosmos ==="
 
               # --- Generate ---
               # Uses the ASYNC job API (POST /v1/videos + poll + /content),
@@ -208,7 +278,7 @@ spec:
               # --- Upload result (+ original reference) to S3 ---
               echo "=== Uploading to ${OUTPUT_S3_PREFIX} ==="
               aws s3 cp "$OUT_LOCAL" "${OUTPUT_S3_PREFIX}/${OUTPUT_FILENAME}" --region "${AWS_REGION}"
-              aws s3 cp "$REF_LOCAL" "${OUTPUT_S3_PREFIX}/${REFERENCE_FILENAME}" --region "${AWS_REGION}"
+              aws s3 cp "$REF_SOURCE" "${OUTPUT_S3_PREFIX}/${REFERENCE_FILENAME}" --region "${AWS_REGION}"
 
               echo "=== Done. Shutting down server. ==="
               kill "$SERVER_PID" 2>/dev/null || true
@@ -228,6 +298,12 @@ spec:
             # the top of this file. Must be kept in sync with
             # resources.requests/limits below.
             - { name: COSMOS_MODEL, value: "super" }
+            # Set true in event manifests after central weight staging is configured.
+            - { name: REQUIRE_LOCAL_WEIGHTS, value: "false" }
+            # Optional recovery source for a new autoscaled GPU node. Event manifests
+            # populate these from Cosmos3ArchiveS3Uri and Cosmos3ArchiveSha256 outputs.
+            - { name: COSMOS_ARCHIVE_S3_URI, value: "" }
+            - { name: COSMOS_ARCHIVE_SHA256, value: "" }
             # <REGION> and <DATASETS_BUCKET> are account-specific — replace
             # both before applying (see note at the top of this file).
             - { name: AWS_REGION, value: "<REGION>" }
@@ -267,11 +343,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
-        # hostPath rather than a PVC: eks.tf builds the cluster in the Foundation VPC
-        # and installs only aws-ebs-csi-driver (no EFS), and the GPU node group is a
-        # single node, so node-local disk is both sufficient and the fastest option.
-        # DirectoryOrCreate keeps the pod schedulable on a node that was never staged,
-        # in which case the Hugging Face fallback above takes over.
+        # hostPath keeps repeated Jobs fast while a GPU node remains alive. If Cluster
+        # Autoscaler replaces the node, the container restores the verified archive from
+        # participant S3 before starting Cosmos.
         - name: models
           hostPath:
             path: /opt/cosmos3

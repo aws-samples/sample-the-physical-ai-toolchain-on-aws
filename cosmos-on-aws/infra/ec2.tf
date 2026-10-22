@@ -56,14 +56,31 @@ variable "server_volume_size_gb" {
   default     = 500
 }
 
+variable "server_instance_profile" {
+  description = "Instance profile NAME for the Cosmos 3 EC2 server. Empty (default) reads /<project_name>/cosmos-instance-profile from SSM (Foundation)."
+  type        = string
+  default     = ""
+}
+
+# Network from SSM (Foundation) only when it was not passed in explicitly.
 data "aws_ssm_parameter" "vpc_id" {
-  count = var.enable_ec2_server ? 1 : 0
+  count = var.enable_ec2_server && var.vpc_id == "" ? 1 : 0
   name  = "/${var.project_name}/vpc-id"
 }
 
 data "aws_ssm_parameter" "private_subnet_ids" {
-  count = var.enable_ec2_server ? 1 : 0
+  count = var.enable_ec2_server && length(var.private_subnet_ids) == 0 ? 1 : 0
   name  = "/${var.project_name}/private-subnet-ids"
+}
+
+locals {
+  ec2_vpc_id = var.vpc_id != "" ? var.vpc_id : (var.enable_ec2_server ? data.aws_ssm_parameter.vpc_id[0].value : "")
+  ec2_private_subnet_ids = length(var.private_subnet_ids) > 0 ? var.private_subnet_ids : (
+    var.enable_ec2_server ? split(",", data.aws_ssm_parameter.private_subnet_ids[0].value) : []
+  )
+  ec2_instance_profile = var.server_instance_profile != "" ? var.server_instance_profile : (
+    length(data.aws_ssm_parameter.cosmos_instance_profile) > 0 ? data.aws_ssm_parameter.cosmos_instance_profile[0].value : ""
+  )
 }
 
 # Pick a private subnet. Filtered to a specific AZ when one is given (required
@@ -73,7 +90,7 @@ data "aws_subnets" "server_candidates" {
   count = var.enable_ec2_server ? 1 : 0
   filter {
     name   = "subnet-id"
-    values = split(",", data.aws_ssm_parameter.private_subnet_ids[0].value)
+    values = local.ec2_private_subnet_ids
   }
   dynamic "filter" {
     for_each = var.availability_zone != "" ? [var.availability_zone] : []
@@ -110,7 +127,7 @@ resource "aws_security_group" "cosmos_server" {
   count       = var.enable_ec2_server ? 1 : 0
   name        = "${local.prefix}-cosmos-server-sg"
   description = "Cosmos 3 generation server - outbound only (SSM, no inbound needed)"
-  vpc_id      = data.aws_ssm_parameter.vpc_id[0].value
+  vpc_id      = local.ec2_vpc_id
 
   egress {
     from_port   = 0
@@ -133,7 +150,7 @@ resource "aws_instance" "cosmos_server" {
   instance_type          = var.server_instance_type
   subnet_id              = local.server_subnet_id
   vpc_security_group_ids = [aws_security_group.cosmos_server[0].id]
-  iam_instance_profile   = data.aws_ssm_parameter.cosmos_instance_profile.value
+  iam_instance_profile   = local.ec2_instance_profile
 
   # Launch into a Capacity Block only when one is specified. Omitted entirely
   # for on-demand launches (e.g. Nano on g6e.*) — Capacity Blocks require
