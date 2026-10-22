@@ -205,6 +205,9 @@ resource "aws_iam_role_policy" "codebuild" {
         Resource = ["arn:aws:s3:::${data.aws_ssm_parameter.datasets_bucket.value}"]
       },
       {
+        # Optional NGC key. buildspec-n17.yml logs in to nvcr.io only when this
+        # secret exists and is readable, and otherwise pulls the base anonymously,
+        # so granting read on a secret that does not exist is harmless.
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = ["arn:aws:secretsmanager:*:*:secret:${var.project_name}/ngc-api-key*"]

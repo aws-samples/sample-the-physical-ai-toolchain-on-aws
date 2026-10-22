@@ -21,15 +21,17 @@
 #                          <account>.dkr.ecr.<region>.amazonaws.com/physical-ai/gr00t-training
 #                          This script appends :n17 and :n17-YYYYMMDD itself.
 #   AWS_DEFAULT_REGION     (required) Region used for every AWS CLI call and both ECR logins.
-#   NGC_SECRET_ID          Secrets Manager secret id/ARN holding the NGC API key, used to pull
-#                          the NGC base image. Optional; empty on the central-mirror path.
+#   NGC_SECRET_ID          Secrets Manager secret id/ARN holding the NGC API key, used to log
+#                          in to nvcr.io before pulling the NGC base image. Optional: the
+#                          nvcr.io/nvidia/pytorch base also pulls anonymously. When it IS set
+#                          the key must be readable and accepted, or the build fails loudly.
 #   CENTRAL_BASE_IMAGE_URI Pre-mirrored base image in a central ECR. Optional, and takes
 #                          PRECEDENCE over NGC_SECRET_ID: when it is set no NGC login happens
 #                          at all, so participant accounts never need an NGC key.
 #
-# Exactly one of NGC_SECRET_ID / CENTRAL_BASE_IMAGE_URI must be non-empty. The workshop
-# template asserts that in its Rules section; the check below is belt-and-braces for a
-# hand-started build, where both can arrive as empty strings.
+# With neither set, the NGC base image is pulled from nvcr.io anonymously. For a
+# many-account event prefer CENTRAL_BASE_IMAGE_URI, so that every account does not pull
+# the base from nvcr.io itself.
 
 set -euo pipefail
 
@@ -93,8 +95,8 @@ elif [ -n "$NGC_SECRET_ID" ]; then
   printf '%s' "$NGC_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
   unset NGC_KEY
 else
-  log "ERROR: set CENTRAL_BASE_IMAGE_URI or NGC_SECRET_ID"
-  exit 1
+  log "Base image: nvcr.io (no NGC_SECRET_ID; NGC login skipped, pulling anonymously)"
+  BASE_IMAGE="nvcr.io/nvidia/pytorch:25.04-py3"
 fi
 log "Base image: ${BASE_IMAGE}"
 

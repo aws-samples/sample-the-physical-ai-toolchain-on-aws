@@ -113,7 +113,7 @@ optimizer state — but:
 | EC2 quota: `Running On-Demand G and VT instances` >= 16 vCPU (48 for the 4-GPU path) | Service Quotas, code `L-DB2E81BA` |
 | Capacity for the instance type you target | see Troubleshooting — quota is not the same as capacity. `g6e.4xlarge` is reservation-backed here; `g6e.12xlarge` was unobtainable |
 | A compute environment that can place the job's shape | The job's `resourceRequirements` must fit an instance type the queue's CEs offer, or the job sits in `RUNNABLE` indefinitely. `aws batch describe-compute-environments --region us-east-2` — this account has both: `physical-ai-dev-gr00t-compute-1gpu` (`g6e.4xlarge`, `ENABLED`/`VALID`, first in `physical-ai-dev-gr00t-queue`), which placed the validated single-GPU smoke test, and `physical-ai-dev-gr00t-compute` (`g6e.12xlarge`), second. The 1-GPU CE was created out of band and is **not** managed by `isaac-gr00t-on-aws/infra` — see the [Step 2 drift note](#step-2-deploy-groot-infrastructure) for the import/delete/extend decision |
-| NGC API key in Secrets Manager (`physical-ai/ngc-api-key`) | `aws secretsmanager describe-secret --secret-id physical-ai/ngc-api-key --region us-east-2` |
+| *Optional:* NGC API key in Secrets Manager (`physical-ai/ngc-api-key`) | Not needed for a stock build: the `nvcr.io/nvidia/pytorch:25.04-py3` base pulls anonymously. Create it only if you want authenticated nvcr.io pulls (see [3c](#3c-trigger-the-build)). Check with `aws secretsmanager describe-secret --secret-id physical-ai/ngc-api-key --region us-east-2` |
 | HuggingFace token in Secrets Manager (`physical-ai/hf-token`) | `aws secretsmanager describe-secret --secret-id physical-ai/hf-token --region us-east-2` |
 | Python 3.10+ with `pyarrow` (dataset prep only) | `python3 -c "import pyarrow"` |
 
@@ -366,6 +366,14 @@ aws codebuild start-build \
   --buildspec-override containers/gr00t-training/buildspec-n17.yml \
   --compute-type-override BUILD_GENERAL1_2XLARGE
 ```
+
+**The NGC key is optional.** The `nvcr.io/nvidia/pytorch:25.04-py3` base pulls
+anonymously. When the secret `physical-ai/ngc-api-key` is absent, empty or
+unreadable, `buildspec-n17.yml` logs `NGC login skipped (...); pulling the nvcr.io
+base image anonymously` and carries on; when it holds a key, the build logs in to
+nvcr.io with it first (and fails if nvcr.io rejects that key). Store a key if
+anonymous pulls are refused or throttled for you, or if you point the build at an
+NGC image that needs an entitled account.
 
 Do **not** pass the NGC key with `--environment-variables-override`: a
 `PLAINTEXT` override is stored in the build record. `buildspec-n17.yml` reads it
@@ -1029,6 +1037,7 @@ shape here with a demonstrated end-to-end run.
 | CodeBuild fails with `Expected Commands[N] to be of string type: found subkeys instead` | A buildspec command containing `": "` as an unquoted plain YAML scalar parses as a mapping | Single-quote the whole command. Note this surfaces only *after* queue + provisioning, so a typo can cost ~28 minutes. |
 | CodeBuild runs out of memory during `uv sync` / flash-attn | Default `BUILD_GENERAL1_LARGE` compute | Pass `--compute-type-override BUILD_GENERAL1_2XLARGE` |
 | NGC key visible in the build record | Passed with `--environment-variables-override ... PLAINTEXT` | Let `buildspec-n17.yml` read it from Secrets Manager instead |
+| BUILD fails pulling `nvcr.io/nvidia/pytorch:25.04-py3` with an authorization or rate-limit error, after `NGC login skipped` in PRE_BUILD | No usable `physical-ai/ngc-api-key`, so the pull was anonymous and nvcr.io refused or throttled it | Store an NGC API key in `physical-ai/ngc-api-key` (Secrets Manager, build region) and re-run the build; the buildspec logs in with it automatically |
 | Cached image on a warm Batch instance after a `:n17` re-push | Old layers still on the instance | Scale the CE to 0, wait for termination, scale back up |
 | Foundation VPC not found | SSM parameter missing | Deploy Foundation first (`cd foundation/infra && terraform apply`) |
 

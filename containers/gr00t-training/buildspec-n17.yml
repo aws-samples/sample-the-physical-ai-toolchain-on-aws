@@ -13,11 +13,17 @@ version: 0.2
 #   AWS_ACCOUNT_ID      - account ID
 #   AWS_DEFAULT_REGION  - region
 #
-# The NGC key is read from Secrets Manager at build time (same as the CodeBuild
-# project's own inline buildspec). Do NOT pass it in with
-# --environment-variables-override: a PLAINTEXT override is stored in the build
-# record. The CodeBuild role is already scoped to
-# secretsmanager:GetSecretValue on physical-ai/ngc-api-key*.
+# NGC login is OPTIONAL. The nvcr.io/nvidia/pytorch:25.04-py3 base pulls
+# anonymously, so a stock account needs no NGC key. When the secret
+# physical-ai/ngc-api-key exists and is readable, the build logs in to nvcr.io
+# with it (authenticated pulls); when it is absent, empty or unreadable, the
+# build logs that the login is skipped and pulls the base anonymously. A key
+# that IS present but rejected by nvcr.io still fails the build.
+#
+# Do NOT pass the key in with --environment-variables-override: a PLAINTEXT
+# override is stored in the build record, and this buildspec overwrites
+# NGC_API_KEY from Secrets Manager anyway. The CodeBuild role is already scoped
+# to secretsmanager:GetSecretValue on physical-ai/ngc-api-key*.
 #
 # The project is NO_SOURCE with an inline N1.6 buildspec, so this file has to be
 # supplied as an override, and the default LARGE compute has too little memory
@@ -47,9 +53,12 @@ phases:
       - echo "Logging in to ECR..."
       - REGISTRY=$(echo "$ECR_REPO_URI" | cut -d/ -f1)
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
-      - echo "Logging in to NGC (nvcr.io) with the key from Secrets Manager..."
-      - NGC_API_KEY=$(aws secretsmanager get-secret-value --secret-id "physical-ai/ngc-api-key" --region "$AWS_DEFAULT_REGION" --query SecretString --output text)
-      - echo "$NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+      # Optional NGC login (see the header). POSIX sh: no buildspec `shell` is
+      # set. The key is only ever piped to --password-stdin, never echoed to the
+      # log, and is unset once the login is done.
+      - NGC_API_KEY=$(aws secretsmanager get-secret-value --secret-id "physical-ai/ngc-api-key" --region "$AWS_DEFAULT_REGION" --query SecretString --output text 2>/dev/null) || NGC_API_KEY=""
+      - if [ -n "$NGC_API_KEY" ]; then echo "Logging in to NGC (nvcr.io) with the key from Secrets Manager..."; echo "$NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin; else echo "NGC login skipped (physical-ai/ngc-api-key absent, empty or unreadable); pulling the nvcr.io base image anonymously"; fi
+      - unset NGC_API_KEY
   build:
     commands:
       - echo "Building GR00T N1.7 training container..."
