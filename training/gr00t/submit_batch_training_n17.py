@@ -127,6 +127,7 @@ def build_environment(
     tune_visual: bool = DEFAULT_TUNE_VISUAL,
     checkpoint_prefix: str = "",
     hf_token_secret_id: str = "",
+    upload_training_state: bool = False,
 ) -> list:
     """Build the containerOverrides.environment list.
 
@@ -153,6 +154,11 @@ def build_environment(
         # in the container, but the N1.7 backbone nvidia/Cosmos-Reason2-2B is a
         # gated repo, so training then fails with HTTP 401 at that download.
         environment.append({"name": "HF_TOKEN_SECRET_ID", "value": hf_token_secret_id})
+    if upload_training_state:
+        # Opt-in only. batch-train's default uploads the final model (~12.6 GB);
+        # this adds every checkpoint-<N>/ with its optimizer/scheduler/RNG state
+        # (~38 GB for a 100-step run). Omitted when off, so the image default applies.
+        environment.append({"name": "UPLOAD_TRAINING_STATE", "value": "true"})
     return environment
 
 
@@ -356,6 +362,7 @@ def submit_training_job(
     tune_visual: bool = DEFAULT_TUNE_VISUAL,
     checkpoint_prefix: str = "",
     hf_token_secret_id: str = "",
+    upload_training_state: bool = False,
     job_queue: str = DEFAULT_JOB_QUEUE,
     job_definition: str = DEFAULT_JOB_DEFINITION,
     region: str = DEFAULT_REGION,
@@ -371,6 +378,7 @@ def submit_training_job(
         tune_visual=tune_visual,
         checkpoint_prefix=checkpoint_prefix,
         hf_token_secret_id=hf_token_secret_id,
+        upload_training_state=upload_training_state,
     )
     payload = build_payload(job_name, job_queue, job_definition, environment)
 
@@ -459,6 +467,13 @@ def main():
         "backbone nvidia/Cosmos-Reason2-2B is a gated repo, so a job without one fails "
         "with HTTP 401 at that download",
     )
+    parser.add_argument(
+        "--upload-training-state",
+        action="store_true",
+        help="Also upload every intermediate checkpoint-<N>/ with its optimizer, scheduler "
+        "and RNG state (~38 GB for a 100-step run instead of ~12.6 GB). Off by default: "
+        "only the final model is uploaded",
+    )
     parser.add_argument("--job-name", default=None, help="Job name suffix; a timestamp is appended")
     parser.add_argument("--job-queue", default=DEFAULT_JOB_QUEUE)
     parser.add_argument(
@@ -542,6 +557,7 @@ def main():
         tune_visual=args.tune_visual,
         checkpoint_prefix=args.checkpoint_prefix,
         hf_token_secret_id=args.hf_token_secret_id,
+        upload_training_state=args.upload_training_state,
         job_queue=args.job_queue,
         job_definition=args.job_definition,
         region=args.region,

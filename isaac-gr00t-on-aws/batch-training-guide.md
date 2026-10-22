@@ -318,6 +318,7 @@ The rebuilt entrypoint is embodiment-selectable:
 | `MODALITY_CONFIG_PATH` | Optional absolute path inside the container; wins over `EMBODIMENT_CONFIG`. Set-but-missing is a hard failure, not a silent fallback. |
 | `TUNE_VISUAL` | `0` (default, matching upstream) or `1`. `0` freezes the vision tower: 877,747,328 trainable parameters, fits one L40S. `1` restores the ~2.03B-parameter configuration and needs 4 GPUs. An unparseable value is a hard failure. |
 | `HF_TOKEN_SECRET_ID` | Secrets Manager id, read only when `HF_TOKEN` is unset. |
+| `UPLOAD_TRAINING_STATE` | `false` (default) or `true`. What goes to `CHECKPOINT_BUCKET` after training. `false` uploads only the deployable final model at the output root — weights, `config.json`, `processor/`, `experiment_cfg/`, `training_metadata.json` — and skips the intermediate `checkpoint-<N>/` directories, which repeat the weights and add optimizer, scheduler and RNG state. On a 100-step run that is **~12.6 GB instead of ~38.1 GB** (11.7 GiB instead of 35.5 GiB). `true` restores the full upload; nothing in this toolchain resumes from a `checkpoint-<N>/`, so you only need it to keep the training state yourself. If the root ever holds no weights, the newest `checkpoint-<N>/` is uploaded without its training state instead. An unparseable value fails the job before it downloads anything. `submit_batch_training_n17.py --upload-training-state` sets it. |
 
 The same rebuild also fixed the **command dispatch**. The entrypoint used to test
 `$1` against the exact string `batch-train`, but the job definition (and anyone
@@ -829,7 +830,10 @@ All three were observed on the 15-step smoke test (job
    `batch-train` default prefix `checkpoints/groot-n17/<AWS_BATCH_JOB_ID>/`.
    Measured: **35 objects, 35.5 GiB** — `checkpoint-15/` (3 safetensors shards,
    `optimizer.pt`, `trainer_state.json`, `experiment_cfg/`), the final model at
-   the prefix root, `processor/`, and `training_metadata.json`.
+   the prefix root, `processor/`, and `training_metadata.json`. That run predates
+   the final-model-only default: an image built from this revision uploads the
+   root only (no `checkpoint-15/`), about a third of that, unless
+   `UPLOAD_TRAINING_STATE=true` (see [3a](#3a-why-a-rebuild-is-mandatory)).
 
 ```bash
 aws s3 ls s3://physical-ai-dev-checkpoints-<ACCOUNT_ID>/ --recursive --region us-east-2
@@ -848,6 +852,11 @@ aws s3 cp \
 The prefix also contains `training_metadata.json`, which records the resolved
 `embodiment_config`, `modality_config_path` and `embodiment_tag` — the quickest
 way to confirm which modality config a checkpoint was trained with.
+
+By default the prefix holds the final model only (weights, `config.json`,
+`processor/`, `experiment_cfg/`), which is what you load for inference. The
+intermediate `checkpoint-<N>/` directories, with their optimizer, scheduler and
+RNG state, are uploaded only for a job submitted with `UPLOAD_TRAINING_STATE=true`.
 
 ---
 
@@ -960,7 +969,7 @@ Measured in account `<ACCOUNT_ID>`, region `us-east-2`.
 | GR00T N1.7-3B model load (1 GPU, frozen vision tower) | ✅ Validated | 2 checkpoint shards loaded at +56 s, `--no-tune-visual` in the echoed command, no DeepSpeed line. The log reports DiT 1,091,722,240 and SelfAttentionTransformer 201,433,088 but **no trainable total**, so the derived 877,747,328 is still unconfirmed from a log. |
 | DeepSpeed ZeRO at 4 GPUs (`TUNE_VISUAL=1`) | ⬜ Untested | Never run; `g6e.12xlarge` capacity was never obtained |
 | Training steps / loss / per-step timing | ✅ Validated | 15 steps in **124.8 s** (8.3 s/step, 1.92 samples/s), `'loss': 1.2443`, `'train_loss': 1.2284` — both finite |
-| Checkpoint upload to S3 | ✅ Validated | **35 objects / 35.5 GiB** under `checkpoints/groot-n17/<JOB_ID>/`, uploaded in **53.5 s** (~690 MiB/s) |
+| Checkpoint upload to S3 | ✅ Validated | **35 objects / 35.5 GiB** under `checkpoints/groot-n17/<JOB_ID>/`, uploaded in **53.5 s** (~690 MiB/s). Full upload, before the final-model-only default (`UPLOAD_TRAINING_STATE`); the smaller default upload has not been run against a live job yet |
 | End-to-end job | ✅ **Validated** | `g1-dex3-smoke-1gpu-20261006-111432`: `SUCCEEDED`, exit 0, **28 m 27 s** submit-to-terminal, ≤ $1.43 |
 
 The successful run went in as raw CLI with a `resourceRequirements` override

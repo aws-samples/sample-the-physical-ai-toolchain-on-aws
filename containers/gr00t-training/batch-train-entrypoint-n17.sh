@@ -12,6 +12,10 @@
 #   GRAD_ACCUM_STEPS    - Gradient accumulation steps (default: 4)
 #   CHECKPOINT_BUCKET   - S3 bucket for checkpoint upload
 #   CHECKPOINT_PREFIX   - S3 key prefix (default: checkpoints/groot-n17/<job_id>)
+#   UPLOAD_TRAINING_STATE - false (default) | true. False uploads the deployable
+#                         final model only (~12.6 GB); true also uploads every
+#                         intermediate checkpoint-<N>/ with its optimizer,
+#                         scheduler and RNG state (~38 GB for a 100-step run).
 #   EMBODIMENT_CONFIG   - embodiment modality config to use: ur3 (default) | g1_dex3
 #   MODALITY_CONFIG_PATH- explicit path to a modality config module (wins over
 #                         EMBODIMENT_CONFIG; must exist inside the container)
@@ -61,6 +65,16 @@ GROOT_BASE_MODEL_SHA256="${GROOT_BASE_MODEL_SHA256:-}"
 COSMOS_REASON2_ARCHIVE_S3_URI="${COSMOS_REASON2_ARCHIVE_S3_URI:-}"
 COSMOS_REASON2_SHA256="${COSMOS_REASON2_SHA256:-}"
 LOCAL_MODEL_ROOT="/opt/ml/input/models"
+
+# Validated before any download or training so a typo cannot cost a full run.
+# Same accepted spellings as the TUNE_VISUAL flag in train_entrypoint_n17.py.
+UPLOAD_TRAINING_STATE_RAW="${UPLOAD_TRAINING_STATE:-false}"
+case "$(printf '%s' "$UPLOAD_TRAINING_STATE_RAW" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) UPLOAD_TRAINING_STATE=true ;;
+    0|false|no|off) UPLOAD_TRAINING_STATE=false ;;
+    *) echo "ERROR: UPLOAD_TRAINING_STATE='${UPLOAD_TRAINING_STATE_RAW}' is not a boolean; use true or false" >&2
+       exit 1 ;;
+esac
 
 # --- Prepare participant-S3 model archives for offline event training ---
 materialize_model_archive() {  # label uri sha destination required-file
@@ -164,6 +178,7 @@ echo "  Job ID:           $JOB_ID"
 echo "  Embodiment:       $EMBODIMENT_CONFIG"
 echo "  Modality config:  ${MODALITY_CONFIG_PATH:-<from embodiment>}"
 echo "  Tune visual:      $TUNE_VISUAL"
+echo "  Upload state:     $UPLOAD_TRAINING_STATE (UPLOAD_TRAINING_STATE)"
 echo "============================================================"
 
 mkdir -p "$OUTPUT_DIR"
@@ -256,11 +271,56 @@ PY
 fi
 
 # --- Upload checkpoints to S3 ---
+# launch_finetune.py saves the final model (weights + config.json + processor/ +
+# experiment_cfg/) at the output root AND keeps up to --save-total-limit
+# intermediate checkpoint-<N>/ directories, each repeating the weights plus
+# optimizer/scheduler/RNG state. A full sync therefore stores the model twice:
+# 38.1 GB for a 100-step run, of which the root model is 12.6 GB. Nothing in this
+# toolchain resumes from a checkpoint-<N>/, so by default only the root is
+# uploaded; UPLOAD_TRAINING_STATE=true restores the full sync. If the root holds no
+# weights, the newest checkpoint-<N>/ is uploaded without its training state
+# instead, so a successful run never uploads no model.
+has_model_weights() {  # dir
+    for f in "$1"/model*.safetensors "$1"/pytorch_model*.bin; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+newest_checkpoint() {  # dir -> prints the highest-numbered checkpoint-<N> path, or nothing
+    best=""; best_step=-1
+    for d in "$1"/checkpoint-*/; do
+        [ -d "$d" ] || continue
+        d="${d%/}"; step="${d##*/checkpoint-}"
+        [[ "$step" =~ ^[0-9]+$ ]] || continue
+        if [ "$step" -gt "$best_step" ]; then best_step="$step"; best="$d"; fi
+    done
+    printf '%s' "$best"
+}
+
 if [ -n "${CHECKPOINT_BUCKET:-}" ]; then
     S3_PREFIX="${CHECKPOINT_PREFIX:-checkpoints/groot-n17/${JOB_ID}}"
-    echo "Uploading checkpoints to s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}/ ..."
-    aws s3 sync "$OUTPUT_DIR" "s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}/" --region "${AWS_DEFAULT_REGION:-us-east-2}"
-    echo "Done. Checkpoints uploaded to s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}/"
+    S3_DEST="s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}"
+    S3_REGION="${AWS_DEFAULT_REGION:-us-east-2}"
+    if [ "$UPLOAD_TRAINING_STATE" = "true" ]; then
+        echo "Uploading checkpoints to ${S3_DEST}/ (full output incl. checkpoint-<N>/ training state) ..."
+        aws s3 sync "$OUTPUT_DIR" "${S3_DEST}/" --region "$S3_REGION"
+    else
+        echo "Uploading checkpoints to ${S3_DEST}/ (final model only; UPLOAD_TRAINING_STATE=true adds checkpoint-<N>/) ..."
+        aws s3 sync "$OUTPUT_DIR" "${S3_DEST}/" --region "$S3_REGION" --exclude "checkpoint-*/*"
+        if ! has_model_weights "$OUTPUT_DIR"; then
+            FALLBACK_CHECKPOINT="$(newest_checkpoint "$OUTPUT_DIR")"
+            if [ -n "$FALLBACK_CHECKPOINT" ]; then
+                FALLBACK_NAME="$(basename "$FALLBACK_CHECKPOINT")"
+                echo "WARNING: no model weights at ${OUTPUT_DIR}; uploading ${FALLBACK_NAME}/ without its training state instead"
+                aws s3 sync "$FALLBACK_CHECKPOINT" "${S3_DEST}/${FALLBACK_NAME}/" --region "$S3_REGION" \
+                    --exclude "optimizer.pt" --exclude "scheduler.pt" --exclude "rng_state*.pth" \
+                    --exclude "*optim_states.pt"
+            else
+                echo "WARNING: no model weights at ${OUTPUT_DIR} and no checkpoint-<N>/ directory to fall back to"
+            fi
+        fi
+    fi
+    echo "Done. Checkpoints uploaded to ${S3_DEST}/"
 else
     echo "WARNING: CHECKPOINT_BUCKET not set. Checkpoints will be lost when container exits."
 fi
