@@ -205,6 +205,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--region", required=True)
     parser.add_argument("--stack-name", default="physical-ai-toolchain")
+    parser.add_argument(
+        "--data-bucket",
+        help="Validated participant data bucket; otherwise read from stack outputs",
+    )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--seed", type=int, default=100)
@@ -236,10 +240,13 @@ def main() -> int:
                 "another Cosmos generation client is already running on this workstation"
             ) from exc
 
-        outputs = load_stack_outputs(args.stack_name, args.region)
-        bucket = outputs.get("DataBucketName")
-        if not bucket:
-            raise RuntimeError("DataBucketName was not found in stack outputs")
+        if args.data_bucket:
+            bucket = args.data_bucket
+        else:
+            outputs = load_stack_outputs(args.stack_name, args.region)
+            bucket = outputs.get("DataBucketName")
+            if not bucket:
+                raise RuntimeError("DataBucketName was not found in stack outputs")
         generated_name, reference_name = output_names(args.run_id)
         for name in (generated_name, reference_name):
             key = f"{args.output_prefix}/{name}"
