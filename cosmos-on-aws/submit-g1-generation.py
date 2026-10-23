@@ -27,6 +27,7 @@ DEFAULT_NEGATIVE_PROMPT = (
     "slipping grasp, camera shake, camera movement, scene cuts, flicker"
 )
 RUN_ID = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,47}[a-z0-9])?$")
+KUBERNETES_NAME = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 
 
 def run(command: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -64,7 +65,13 @@ def load_stack_outputs(stack_name: str, region: str) -> dict[str, str]:
     return {row["OutputKey"]: row["OutputValue"] for row in rows}
 
 
-def validate_settings(run_id: str, prompt: str, seed: int, server_url: str) -> None:
+def validate_settings(
+    run_id: str,
+    prompt: str,
+    seed: int,
+    server_url: str,
+    deployment_name: str = "cosmos3-g1-server",
+) -> None:
     if not RUN_ID.fullmatch(run_id):
         raise ValueError(
             "run ID must use lowercase letters, numbers, and hyphens (maximum 49 characters)"
@@ -73,6 +80,10 @@ def validate_settings(run_id: str, prompt: str, seed: int, server_url: str) -> N
         raise ValueError("prompt must not be empty")
     if not 0 <= seed <= 4_294_967_295:
         raise ValueError("seed must be between 0 and 4294967295")
+    if not KUBERNETES_NAME.fullmatch(deployment_name):
+        raise ValueError(
+            "deployment name must be a lowercase Kubernetes DNS label of at most 63 characters"
+        )
     parsed = urlparse(server_url)
     if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port:
         raise ValueError("server URL must be an explicit http://127.0.0.1:<port> URL")
@@ -109,6 +120,92 @@ def object_exists(bucket: str, key: str, region: str) -> bool:
     if "404" in detail or "Not Found" in detail or "NoSuchKey" in detail:
         return False
     raise RuntimeError(detail.strip() or f"unable to inspect s3://{bucket}/{key}")
+
+
+def normalize_video(
+    source: Path,
+    destination: Path,
+    deployment_name: str,
+    run_id: str,
+) -> str:
+    ffmpeg_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        str(destination),
+    ]
+    if shutil.which("ffmpeg") is not None:
+        run(ffmpeg_command)
+        return "workstation ffmpeg"
+
+    if shutil.which("kubectl") is None:
+        raise RuntimeError(
+            "ffmpeg is unavailable locally and kubectl is required for in-Pod normalization"
+        )
+    pod_result = run(
+        [
+            "kubectl",
+            "get",
+            "pod",
+            "-l",
+            f"app={deployment_name}",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+        capture=True,
+    )
+    pod = pod_result.stdout.strip()
+    if not pod:
+        raise RuntimeError(f"no ready Pod found for Deployment {deployment_name}")
+
+    remote_directory = f"/tmp/cosmos3-client-{run_id}"
+    remote_source = f"{remote_directory}/reference-source.mp4"
+    remote_destination = f"{remote_directory}/reference-h264.mp4"
+    try:
+        run(["kubectl", "exec", pod, "--", "mkdir", "-p", remote_directory])
+        run(["kubectl", "cp", str(source), f"{pod}:{remote_source}"])
+        run(
+            [
+                "kubectl",
+                "exec",
+                pod,
+                "--",
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                remote_source,
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                remote_destination,
+            ]
+        )
+        run(["kubectl", "cp", f"{pod}:{remote_destination}", str(destination)])
+    finally:
+        subprocess.run(
+            ["kubectl", "exec", pod, "--", "rm", "-rf", remote_directory],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError("in-Pod video normalization produced no output")
+    return f"Cosmos Pod {pod}"
 
 
 def get_json(url: str, timeout: int = 15) -> dict:
@@ -214,6 +311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument("--server-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--deployment-name", default="cosmos3-g1-server")
     parser.add_argument("--input-key", default=DEFAULT_INPUT_KEY)
     parser.add_argument("--output-prefix", default="cosmos3-generated")
     parser.add_argument("--timeout-minutes", type=int, default=30)
@@ -223,12 +321,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        validate_settings(args.run_id, args.prompt, args.seed, args.server_url)
+        validate_settings(
+            args.run_id,
+            args.prompt,
+            args.seed,
+            args.server_url,
+            args.deployment_name,
+        )
         if args.timeout_minutes < 1 or args.timeout_minutes > 60:
             raise ValueError("timeout must be between 1 and 60 minutes")
-        for executable in ("aws", "curl", "ffmpeg"):
+        for executable in ("aws", "curl"):
             if shutil.which(executable) is None:
                 raise RuntimeError(f"required command is not installed: {executable}")
+        if shutil.which("ffmpeg") is None and shutil.which("kubectl") is None:
+            raise RuntimeError("either ffmpeg or kubectl is required for video normalization")
 
         lock_path = Path.home() / ".cache" / "cosmos3-generation.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -278,23 +384,13 @@ def main() -> int:
                     "--only-show-errors",
                 ]
             )
-            run(
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-i",
-                    str(source),
-                    "-an",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    str(normalized),
-                ]
+            normalization_path = normalize_video(
+                source,
+                normalized,
+                args.deployment_name,
+                args.run_id,
             )
+            print(f"PASS - Input normalized with {normalization_path}")
             response = run(
                 build_create_command(
                     args.server_url,

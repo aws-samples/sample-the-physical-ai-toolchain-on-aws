@@ -4,6 +4,7 @@
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -65,6 +66,35 @@ class SubmitG1GenerationTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "AccessDenied"):
                 MODULE.object_exists("bucket", "output.mp4", "us-east-2")
+
+    def test_missing_local_ffmpeg_uses_cosmos_pod(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            destination = Path(directory) / "normalized.mp4"
+            source.write_bytes(b"source")
+
+            def fake_run(command: list[str], *, capture: bool = False):
+                if command[:3] == ["kubectl", "get", "pod"]:
+                    return subprocess.CompletedProcess(command, 0, "cosmos-pod", "")
+                if command[:2] == ["kubectl", "cp"] and ":" in command[2]:
+                    Path(command[3]).write_bytes(b"normalized")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def fake_which(name: str):
+                return None if name == "ffmpeg" else f"/usr/bin/{name}"
+
+            with mock.patch.object(MODULE.shutil, "which", side_effect=fake_which), \
+                 mock.patch.object(MODULE, "run", side_effect=fake_run), \
+                 mock.patch.object(MODULE.subprocess, "run"):
+                method = MODULE.normalize_video(
+                    source,
+                    destination,
+                    "cosmos3-g1-server",
+                    "warm-lighting-v1",
+                )
+
+            self.assertEqual(method, "Cosmos Pod cosmos-pod")
+            self.assertEqual(destination.read_bytes(), b"normalized")
 
     def test_rejects_non_loopback_server(self) -> None:
         with self.assertRaisesRegex(ValueError, "127.0.0.1"):
