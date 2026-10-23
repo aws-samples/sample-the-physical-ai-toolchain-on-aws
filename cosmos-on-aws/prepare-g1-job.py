@@ -23,13 +23,14 @@ REQUIRED_OUTPUTS = (
 DEFAULT_PROMPT = (
     "A fixed head-mounted camera view from a Unitree G1 humanoid robot shows a "
     "white tabletop and its two open three-fingered Dex3 hands on opposite sides "
-    "of a rigid blue rectangular box. At first, both hands approach slowly while "
-    "the box remains still. The fingertips align with the box's side faces, then "
-    "all fingers close simultaneously to form a firm symmetric grasp. After a "
-    "brief stabilization pause, the robot lifts the level box straight upward at "
-    "a slow constant speed while maintaining continuous contact. The table, box "
-    "shape, lighting, and camera remain stable throughout. Photorealistic, fluid "
-    "mechanical motion in one continuous shot."
+    "of a rigid blue rectangular box. The scene has soft diffused warm overhead "
+    "lighting and gentle natural shadows. At first, both hands approach slowly "
+    "while the box remains still. The fingertips align with the box's side faces, "
+    "then all fingers close simultaneously to form a firm symmetric grasp. After "
+    "a brief stabilization pause, the robot lifts the level box straight upward "
+    "at a slow constant speed while maintaining continuous contact. The table, "
+    "box shape, camera, and chosen domain variation remain stable throughout. "
+    "Photorealistic, fluid mechanical motion in one continuous shot."
 )
 KUBERNETES_NAME = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 MP4_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.mp4$")
@@ -176,6 +177,9 @@ def render_job(
             f'name: REFERENCE_FILENAME, value: "{reference_filename}"' in text,
         "seed": f'name: SEED, value: "{seed}"' in text,
         "prompt": all(line in text for line in prompt_lines),
+        "prompt request": '-F "prompt=${PROMPT}"' in text,
+        "video reference request":
+            '-F "input_reference=@${REF_LOCAL};type=video/mp4"' in text,
         "negative prompt": "negative_prompt=" in text and "slipping grasp" in text,
         "local weights": 'name: REQUIRE_LOCAL_WEIGHTS, value: "true"' in text,
         "archive URI": f'name: COSMOS_ARCHIVE_S3_URI, value: "{archive_uri}"' in text,

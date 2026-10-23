@@ -106,7 +106,7 @@ spec:
               # official installer, so use the pure-Python package.
               if ! command -v aws >/dev/null 2>&1; then
                 echo "=== Installing AWS CLI (via pip) ==="
-                pip3 install --quiet awscli
+                pip3 install --quiet awscli==1.46.2
               fi
 
               # --- Restore the node-local cache after Cluster Autoscaler replacement ---

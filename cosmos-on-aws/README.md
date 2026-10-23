@@ -87,7 +87,10 @@ Cosmos 3 ships in three sizes — Super (64B), Nano (16B), and Edge (4B, not cov
 | [`launch-cosmos3.sh`](launch-cosmos3.sh) | Launch p5.48xlarge into an active Capacity Block (EC2 path) |
 | [`setup-cosmos3-server.sh`](setup-cosmos3-server.sh) | Pull the container and start the Cosmos3 server — Super or Nano via `COSMOS_MODEL` (EC2 path) |
 | [`generate-v2v.sh`](generate-v2v.sh) | Generate a V2V synthetic demonstration from a reference video (EC2 path) |
-| [`cosmos3-job.yaml`](cosmos3-job.yaml) | Self-contained Kubernetes Job — starts the Cosmos3 server (Super or Nano via `COSMOS_MODEL`), generates, and writes output straight to S3, all inside the pod (EKS path) |
+| [`cosmos3-service.yaml`](cosmos3-service.yaml) | Reusable Cosmos server as a one-replica GPU Deployment plus private ClusterIP Service; intended for sequential prompt experiments |
+| [`prepare-g1-service.py`](prepare-g1-service.py) | Renders and validates the account-specific Nano/G1 service from CloudFormation outputs |
+| [`submit-g1-generation.py`](submit-g1-generation.py) | Submits one prompt/video request through a localhost port-forward and writes uniquely named output to S3 |
+| [`cosmos3-job.yaml`](cosmos3-job.yaml) | Legacy self-contained one-shot Kubernetes Job that starts a server, generates once, uploads, and exits |
 | `infra/ec2.tf` | Terraform for the EC2 server instance |
 | `infra/eks.tf` | Terraform for the dedicated EKS cluster + GPU node group |
 | `infra/main.tf` | Terraform for the CodeBuild-based container build path (Cosmos 3 + Cosmos Transfer 2.5) |
