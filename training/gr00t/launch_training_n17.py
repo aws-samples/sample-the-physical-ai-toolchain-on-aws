@@ -114,7 +114,8 @@ def launch_training_job(
             "HUGGING_FACE_HUB_TOKEN": hf_token,
         }
     else:
-        print("  WARNING: HF_TOKEN not set — the base-model download may hit rate limits.")
+        print("  WARNING: HF_TOKEN not set — the N1.7 backbone nvidia/Cosmos-Reason2-2B is a "
+              "gated repo, so its download will fail with HTTP 401.")
 
     # Cost estimation (ml.g6e.12xlarge: ~$8.06/hr on-demand, 4x L40S)
     hourly_rate = {"ml.g6e.12xlarge": 8.06, "ml.g6e.48xlarge": 32.24, "ml.g6e.4xlarge": 2.24}.get(

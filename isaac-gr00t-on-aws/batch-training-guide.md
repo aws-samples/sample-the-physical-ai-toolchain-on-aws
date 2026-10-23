@@ -113,13 +113,16 @@ optimizer state — but:
 | EC2 quota: `Running On-Demand G and VT instances` >= 16 vCPU (48 for the 4-GPU path) | Service Quotas, code `L-DB2E81BA` |
 | Capacity for the instance type you target | see Troubleshooting — quota is not the same as capacity. `g6e.4xlarge` is reservation-backed here; `g6e.12xlarge` was unobtainable |
 | A compute environment that can place the job's shape | The job's `resourceRequirements` must fit an instance type the queue's CEs offer, or the job sits in `RUNNABLE` indefinitely. `aws batch describe-compute-environments --region us-east-2` — this account has both: `physical-ai-dev-gr00t-compute-1gpu` (`g6e.4xlarge`, `ENABLED`/`VALID`, first in `physical-ai-dev-gr00t-queue`), which placed the validated single-GPU smoke test, and `physical-ai-dev-gr00t-compute` (`g6e.12xlarge`), second. The 1-GPU CE was created out of band and is **not** managed by `isaac-gr00t-on-aws/infra` — see the [Step 2 drift note](#step-2-deploy-groot-infrastructure) for the import/delete/extend decision |
-| NGC API key in Secrets Manager (`physical-ai/ngc-api-key`) | `aws secretsmanager describe-secret --secret-id physical-ai/ngc-api-key --region us-east-2` |
+| *Optional:* NGC API key in Secrets Manager (`physical-ai/ngc-api-key`) | Not needed for a stock build: the `nvcr.io/nvidia/pytorch:25.04-py3` base pulls anonymously. Create it only if you want authenticated nvcr.io pulls (see [3c](#3c-trigger-the-build)). Check with `aws secretsmanager describe-secret --secret-id physical-ai/ngc-api-key --region us-east-2` |
 | HuggingFace token in Secrets Manager (`physical-ai/hf-token`) | `aws secretsmanager describe-secret --secret-id physical-ai/hf-token --region us-east-2` |
 | Python 3.10+ with `pyarrow` (dataset prep only) | `python3 -c "import pyarrow"` |
 
-> `nvidia/GR00T-N1.7-3B` is **not** a gated repo, so the HuggingFace token is not
-> functionally required to download the base weights. It is still configured, and
-> an unresolvable lookup is a warning rather than a failure.
+> **The HuggingFace token is required for N1.7.** `nvidia/GR00T-N1.7-3B` itself
+> is not gated, but training also downloads its VLM backbone
+> `nvidia/Cosmos-Reason2-2B`, which **is** a gated repo: the token must belong to
+> an account that has been granted access to it on its Hugging Face model page.
+> Without a usable token the container only logs a warning and continues, then
+> training fails with HTTP `401 Unauthorized` on the backbone download.
 
 ---
 
@@ -168,7 +171,7 @@ terraform apply -var="aws_region=us-east-2" -var="enable_batch=true" -var="batch
 |----------|---------|
 | CodeBuild: `physical-ai-dev-gr00t-training-build` | Builds the GR00T training container |
 | CodeBuild: `physical-ai-dev-gr00t-inference-build` | Builds the GR00T inference container |
-| Batch compute env: `physical-ai-dev-gr00t-compute` | `var.batch_instance_type` (now defaulting to `g6e.4xlarge`), 512 GiB gp3 root, min/desired 0 vCPU, max 96. The **deployed** one still offers `g6e.12xlarge`; the single-GPU CE that ran the smoke test is the separate, unmanaged `…-compute-1gpu` (see the drift note above) |
+| Batch compute env: `physical-ai-dev-gr00t-compute` | `var.batch_instance_type` (now defaulting to `g6e.4xlarge`), or the optional fallback list `var.batch_instance_types`, 512 GiB gp3 root, min/desired 0 vCPU, max 96. The **deployed** one still offers `g6e.12xlarge`; the single-GPU CE that ran the smoke test is the separate, unmanaged `…-compute-1gpu` (see the drift note above) |
 | Batch job queue: `physical-ai-dev-gr00t-queue` | Job scheduling |
 | Batch job definition: `physical-ai-dev-gr00t-n17-training` | Image `:n17`, command `batch-train`, 16 VCPU / 122880 MEMORY / 1 GPU by default (variables — `48 / 180000 / 4` for the 4-GPU path), plus the **mandatory** `EMBODIMENT_CONFIG=g1_dex3` and `TUNE_VISUAL=0` (see [Required job-definition fields](#required-job-definition-fields)) |
 | Security group | Outbound access for ECR/S3/HuggingFace |
@@ -218,7 +221,7 @@ two of them fail *silently* rather than loudly when they are wrong.
 | Env: `BATCH_SIZE` / `GRAD_ACCUM_STEPS` | `2` / `8` | `BATCH_SIZE` is the **global, pre-accumulation** batch and the trainer computes `per_device = BATCH_SIZE / num_gpus`, so on 1 GPU it *is* the per-device batch. 2 × 8 keeps the effective optimizer batch at 16. On 4 GPUs use `8` / `2` for the same effective batch |
 | Env: `MAX_STEPS` | `100` (or `15` for a smoke test) | |
 | Env: `AWS_DEFAULT_REGION` | `us-east-2` | Used by the in-container `aws s3`/`secretsmanager` calls |
-| Env: `HF_TOKEN_SECRET_ID` | `physical-ai/hf-token` | Optional in practice — `nvidia/GR00T-N1.7-3B` is not gated, so an unresolved lookup is a warning |
+| Env: `HF_TOKEN_SECRET_ID` | `physical-ai/hf-token` | **Required for N1.7.** The backbone `nvidia/Cosmos-Reason2-2B` is a gated repo, so the secret must hold a token whose account has access to it. A missing, empty or unreadable secret is only a warning at start-up; the job then fails with HTTP 401 at the backbone download |
 
 If the compute environment is also being created by hand, reuse the existing
 CloudFormation stack outputs rather than inventing new ones:
@@ -284,6 +287,9 @@ cd isaac-gr00t-on-aws/infra
 ~/bin/terraform fmt -check
 ~/bin/terraform init -backend=false
 ~/bin/terraform validate
+# Offline, mocked-provider checks of the compute-environment instance types and
+# the GPU preconditions (tests/batch_instance_types.tftest.hcl)
+~/bin/terraform test
 ```
 
 ---
@@ -315,6 +321,7 @@ The rebuilt entrypoint is embodiment-selectable:
 | `MODALITY_CONFIG_PATH` | Optional absolute path inside the container; wins over `EMBODIMENT_CONFIG`. Set-but-missing is a hard failure, not a silent fallback. |
 | `TUNE_VISUAL` | `0` (default, matching upstream) or `1`. `0` freezes the vision tower: 877,747,328 trainable parameters, fits one L40S. `1` restores the ~2.03B-parameter configuration and needs 4 GPUs. An unparseable value is a hard failure. |
 | `HF_TOKEN_SECRET_ID` | Secrets Manager id, read only when `HF_TOKEN` is unset. |
+| `UPLOAD_TRAINING_STATE` | `false` (default) or `true`. What goes to `CHECKPOINT_BUCKET` after training. `false` uploads only the deployable final model at the output root — weights, `config.json`, `processor/`, `experiment_cfg/`, `training_metadata.json` — and skips the intermediate `checkpoint-<N>/` directories, which repeat the weights and add optimizer, scheduler and RNG state. On a 100-step run that is **~12.6 GB instead of ~38.1 GB** (11.7 GiB instead of 35.5 GiB). `true` restores the full upload; nothing in this toolchain resumes from a `checkpoint-<N>/`, so you only need it to keep the training state yourself. If the root ever holds no weights, the newest `checkpoint-<N>/` is uploaded without its training state instead. An unparseable value fails the job before it downloads anything. `submit_batch_training_n17.py --upload-training-state` sets it. |
 
 The same rebuild also fixed the **command dispatch**. The entrypoint used to test
 `$1` against the exact string `batch-train`, but the job definition (and anyone
@@ -363,6 +370,14 @@ aws codebuild start-build \
   --buildspec-override containers/gr00t-training/buildspec-n17.yml \
   --compute-type-override BUILD_GENERAL1_2XLARGE
 ```
+
+**The NGC key is optional.** The `nvcr.io/nvidia/pytorch:25.04-py3` base pulls
+anonymously. When the secret `physical-ai/ngc-api-key` is absent, empty or
+unreadable, `buildspec-n17.yml` logs `NGC login skipped (...); pulling the nvcr.io
+base image anonymously` and carries on; when it holds a key, the build logs in to
+nvcr.io with it first (and fails if nvcr.io rejects that key). Store a key if
+anonymous pulls are refused or throttled for you, or if you point the build at an
+NGC image that needs an entitled account.
 
 Do **not** pass the NGC key with `--environment-variables-override`: a
 `PLAINTEXT` override is stored in the build record. `buildspec-n17.yml` reads it
@@ -588,8 +603,22 @@ aws secretsmanager create-secret \
 
 The container reads it via `HF_TOKEN_SECRET_ID` using the Batch instance role, so
 the token never appears in the job definition, in CloudWatch, or in this repo.
-Because `nvidia/GR00T-N1.7-3B` is not gated, a failed lookup only prints
-`HuggingFace credential: NOT resolved (continuing; base model is not gated)`.
+
+The token must come from a Hugging Face account that has been granted access to
+the gated backbone `nvidia/Cosmos-Reason2-2B` (request it on the model page).
+A failed lookup — no secret, a secret created with no value, or no
+`secretsmanager:GetSecretValue` on the instance role — does not stop the
+container: it prints `HuggingFace credential: NOT resolved (continuing)` and a
+warning that the gated backbone download will fail, and training then fails
+with HTTP `401 Unauthorized` on `nvidia/Cosmos-Reason2-2B`. Store a real value
+before submitting:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id "physical-ai/hf-token" \
+  --secret-string "<YOUR_HF_TOKEN>" \
+  --region us-east-2
+```
 
 ---
 
@@ -804,7 +833,10 @@ All three were observed on the 15-step smoke test (job
    `batch-train` default prefix `checkpoints/groot-n17/<AWS_BATCH_JOB_ID>/`.
    Measured: **35 objects, 35.5 GiB** — `checkpoint-15/` (3 safetensors shards,
    `optimizer.pt`, `trainer_state.json`, `experiment_cfg/`), the final model at
-   the prefix root, `processor/`, and `training_metadata.json`.
+   the prefix root, `processor/`, and `training_metadata.json`. That run predates
+   the final-model-only default: an image built from this revision uploads the
+   root only (no `checkpoint-15/`), about a third of that, unless
+   `UPLOAD_TRAINING_STATE=true` (see [3a](#3a-why-a-rebuild-is-mandatory)).
 
 ```bash
 aws s3 ls s3://physical-ai-dev-checkpoints-<ACCOUNT_ID>/ --recursive --region us-east-2
@@ -823,6 +855,11 @@ aws s3 cp \
 The prefix also contains `training_metadata.json`, which records the resolved
 `embodiment_config`, `modality_config_path` and `embodiment_tag` — the quickest
 way to confirm which modality config a checkpoint was trained with.
+
+By default the prefix holds the final model only (weights, `config.json`,
+`processor/`, `experiment_cfg/`), which is what you load for inference. The
+intermediate `checkpoint-<N>/` directories, with their optimizer, scheduler and
+RNG state, are uploaded only for a job submitted with `UPLOAD_TRAINING_STATE=true`.
 
 ---
 
@@ -896,7 +933,8 @@ comparing the two on cost per step.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_batch` | `false` | Set to `true` to deploy the Batch resources |
-| `batch_instance_type` | `g6e.4xlarge` | Matches the single-GPU job shape below. The currently deployed CE is `g6e.12xlarge`, so changing this replaces the compute environment |
+| `batch_instance_type` | `g6e.4xlarge` | Matches the single-GPU job shape below. The currently deployed CE is `g6e.12xlarge`, so changing this replaces the compute environment. Ignored when `batch_instance_types` is set |
+| `batch_instance_types` | `[]` | Optional fallback list that replaces `batch_instance_type`, e.g. `["g6e.4xlarge","g6e.8xlarge","g6e.16xlarge"]` for the single-GPU shape or `["g6e.12xlarge","g6e.24xlarge"]` for 4 GPUs. Empty renders exactly `[batch_instance_type]`, so existing deployments see no plan diff. **Setting or changing it replaces the compute environment** — do it with no jobs queued or running. See the note below on allocation strategy and cost |
 | `batch_max_vcpus` | `96` | Maximum vCPUs for auto-scaling |
 | `batch_job_vcpus` | `16` | Job-definition vCPU request. `48` for `g6e.12xlarge` |
 | `batch_job_memory_mib` | `122880` | Job-definition memory request. `180000` for `g6e.12xlarge` |
@@ -904,10 +942,25 @@ comparing the two on cost per step.
 
 The job definition carries two `lifecycle` preconditions that reject an
 inconsistent pair at plan time: `batch_job_gpus` must equal the GPU count of
-`batch_instance_type`, and that instance type's cards must be 48 GB-class. Both
-mismatches are otherwise silent — too many GPUs parks the job in `RUNNABLE` with
-no `statusReason`, and a 24 GB L4 (`g6.12xlarge`) lets the job launch and then
-OOM mid-load.
+`batch_instance_type` — or of **every** type in `batch_instance_types` — and
+those cards must be 48 GB-class. Both mismatches are otherwise silent — too
+many GPUs parks the job in `RUNNABLE` with no `statusReason`, and a 24 GB L4
+(`g6.12xlarge`) lets the job launch and then OOM mid-load. A type in
+`batch_instance_types` that `batch.tf`'s GPU lookup maps do not know is rejected
+too, because it cannot be checked.
+
+**Why a list, and what it changes.** One instance type can run out of on-demand
+capacity in every AZ at the same time, and quota does not help: on a separate
+us-east-1 deployment `g6e.4xlarge` was unavailable in three AZs and jobs sat
+`RUNNABLE` for about 80 minutes. With two or more
+types the compute environment switches from the default `BEST_FIT` allocation
+strategy (Batch picks one type and waits for it) to `BEST_FIT_PROGRESSIVE`
+(Batch moves on to another listed type when the first is unavailable). Batch
+then chooses among the listed types by its own cost preference (lowest cost per
+vCPU), not by list order, so a job can land on a larger, more expensive
+instance even while the first type has capacity: list only types you are
+willing to pay for. A single type, or an empty list, leaves the allocation
+strategy unset, as before.
 
 ---
 
@@ -935,7 +988,7 @@ Measured in account `<ACCOUNT_ID>`, region `us-east-2`.
 | GR00T N1.7-3B model load (1 GPU, frozen vision tower) | ✅ Validated | 2 checkpoint shards loaded at +56 s, `--no-tune-visual` in the echoed command, no DeepSpeed line. The log reports DiT 1,091,722,240 and SelfAttentionTransformer 201,433,088 but **no trainable total**, so the derived 877,747,328 is still unconfirmed from a log. |
 | DeepSpeed ZeRO at 4 GPUs (`TUNE_VISUAL=1`) | ⬜ Untested | Never run; `g6e.12xlarge` capacity was never obtained |
 | Training steps / loss / per-step timing | ✅ Validated | 15 steps in **124.8 s** (8.3 s/step, 1.92 samples/s), `'loss': 1.2443`, `'train_loss': 1.2284` — both finite |
-| Checkpoint upload to S3 | ✅ Validated | **35 objects / 35.5 GiB** under `checkpoints/groot-n17/<JOB_ID>/`, uploaded in **53.5 s** (~690 MiB/s) |
+| Checkpoint upload to S3 | ✅ Validated | **35 objects / 35.5 GiB** under `checkpoints/groot-n17/<JOB_ID>/`, uploaded in **53.5 s** (~690 MiB/s). Full upload, before the final-model-only default (`UPLOAD_TRAINING_STATE`); the smaller default upload has not been run against a live job yet |
 | End-to-end job | ✅ **Validated** | `g1-dex3-smoke-1gpu-20261006-111432`: `SUCCEEDED`, exit 0, **28 m 27 s** submit-to-terminal, ≤ $1.43 |
 
 The successful run went in as raw CLI with a `resourceRequirements` override
@@ -992,7 +1045,7 @@ shape here with a demonstrated end-to-end run.
 | Problem | Cause | Solution |
 |---------|-------|----------|
 | Job stuck in `RUNNABLE`, `statusReason` null, **and `desiredvCpus` never rises** | The job's `resourceRequirements` cannot be placed on the CE's instance type — e.g. 16 vCPU / 1 GPU against a `g6e.12xlarge`-only CE, or 48 vCPU / 4 GPU against a `g6e.4xlarge` one. Batch parks the job instead of rejecting it | Compare `aws batch describe-job-definitions --job-definition-name <name> --query 'jobDefinitions[-1].containerProperties.resourceRequirements'` against `aws batch describe-compute-environments --compute-environments <ce> --query 'computeEnvironments[0].computeResources.instanceTypes'`. Fix the shape (`batch_job_vcpus` / `batch_job_memory_mib` / `batch_job_gpus`) or the CE — do not wait for capacity. |
-| Job stuck in `RUNNABLE`, `statusReason` null, no log stream | No **capacity** for the instance type (not quota, not config) — the CE is `VALID` and `desiredvCpus` did rise | Inspect the backing ASG: `aws autoscaling describe-scaling-activities --auto-scaling-group-name <ce-asg> --region us-east-2 --query 'Activities[].{code:StatusCode,cause:StatusMessage}'`. `InsufficientInstanceCapacity` means wait — Batch retries by itself. Check the quota separately with `aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA`. |
+| Job stuck in `RUNNABLE`, `statusReason` null, no log stream | No **capacity** for the instance type (not quota, not config) — the CE is `VALID` and `desiredvCpus` did rise | Inspect the backing ASG: `aws autoscaling describe-scaling-activities --auto-scaling-group-name <ce-asg> --region us-east-2 --query 'Activities[].{code:StatusCode,cause:StatusMessage}'`. `InsufficientInstanceCapacity` means wait — Batch retries by itself. Check the quota separately with `aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA`. If one type is regularly unavailable, offer fallbacks with `batch_instance_types` (see [Configuration Variables](#configuration-variables-terraform)). |
 | Tempted to pin the CE to the AZ the error message names | The "you can currently get capacity in us-east-2b/c" hint is a point-in-time pool estimate | **Do not.** us-east-2b was recommended by both the 2a and 2c failure messages and itself failed 6/6. Pinning reduces the number of pools the ASG can try and fixes nothing. |
 | `CannotPullContainerError` / repository does not exist | Job submitted against `physical-ai-dev-gr00t-training` (any revision), which points at the misspelled repo `physical-ai/groot-training` | Submit against `physical-ai-dev-gr00t-n17-training` |
 | Container trains a UR3 end-effector config on G1 data, or SciPy raises in `Rotation.from_rotvec` | `EMBODIMENT_CONFIG` not set, so the image default `ur3` ran. Live job-definition revision 1 ships no `EMBODIMENT_CONFIG` | Pass `EMBODIMENT_CONFIG=g1_dex3` — in `--container-overrides` for every submission, or as a job-definition environment entry (see [Required job-definition fields](#required-job-definition-fields)). A Batch `command` override cannot fix this: `Dockerfile.n17` sets an `ENTRYPOINT` and Batch has no entrypoint override. |
@@ -1000,7 +1053,8 @@ shape here with a demonstrated end-to-end run.
 | Video pre-flight fails with a torchcodec/ffmpeg error on `episode_000000.mp4` | AV1 decode (`video.codec: "av1"`) unavailable in the image's ffmpeg/torchcodec combination | Transcode all 201 videos to H.264 (`ffmpeg -i in.mp4 -c:v libx264 -pix_fmt yuv420p out.mp4`), re-stage the dataset to S3, resubmit. This is a data fix, not a container change. |
 | `AccessDenied` reading `DATASET_S3_URI` | The instance role grants S3 only on `arn:aws:s3:::physical-ai-dev-*`, and the canonical dataset lives in `physical-ai-workshop-assets-<ACCOUNT_ID>` | Stage a prepared copy to `s3://physical-ai-dev-datasets-<ACCOUNT_ID>/groot-data/pick_place_data/`. Do **not** widen the policy. |
 | `HF_TOKEN` still appears in plaintext in the job definition | The Secrets Manager migration is written in `batch.tf` but **not applied** — applying registers a new revision | Apply `isaac-gr00t-on-aws/infra` deliberately (`enable_batch=true`), then confirm the new revision has `HF_TOKEN_SECRET_ID` and no `HF_TOKEN` |
-| `HuggingFace credential: NOT resolved` in the logs | The instance role has no `secretsmanager:GetSecretValue` yet (see the row above) | Harmless: `nvidia/GR00T-N1.7-3B` is not gated and training continues. Fix by applying the Terraform. |
+| `HuggingFace credential: NOT resolved` in the logs | The secret is missing or empty, or the instance role has no `secretsmanager:GetSecretValue` yet (see the row above) | **Not harmless:** the job continues but fails at the gated backbone download (next row). Store a token with `put-secret-value` ([Step 5](#step-5-store-the-huggingface-token)) and, if the permission is missing, apply the Terraform. |
+| Training fails with HTTP `401 Unauthorized` for `huggingface.co/nvidia/Cosmos-Reason2-2B` | `nvidia/Cosmos-Reason2-2B`, the N1.7 VLM backbone, is a gated repo, and the job had no token — or a token whose account has not been granted access to that repo | Request access on the `nvidia/Cosmos-Reason2-2B` model page with the account that owns the token, store the token in `physical-ai/hf-token`, and resubmit. Observed on a separate us-east-1 deployment: the same job failed this way with an empty secret and trained to completion once a valid token was stored. |
 | `AssertionError: global_batch_size must be divisible by num_gpus` at startup | `BATCH_SIZE` does not divide the job definition's GPU count — e.g. the single-GPU default `2` against a 4-GPU job definition | Match the pair to the shape: `2`/`8` for 1 GPU, `8`/`2` for 4 GPUs. `submit_batch_training_n17.py` refuses the mismatch before submitting. |
 | `CUDA out of memory` on one GPU | Either `TUNE_VISUAL=1` (which needs 4 GPUs for ZeRO sharding), or the per-device batch is too large — remember `BATCH_SIZE` *is* the per-device batch at `num_gpus=1` | Confirm the log banner says `Tune visual: False`. Then step down `BATCH_SIZE=1` with `GRAD_ACCUM_STEPS=16` to hold the effective batch at 16. No `--gradient-checkpointing` flag exists in this SDK revision, and the custom modules never call a checkpoint function, so it would not help. |
 | `TUNE_VISUAL=1` on a 1-GPU instance OOMs | At `num_gpus=1` DeepSpeed is disabled outright (`experiment.py:258-262`), so the ~2.03B trainable parameters carry unsharded fp32 grads and AdamW moments, and the ViT/LLM activation graph is retained | Leave `TUNE_VISUAL=0` on one GPU. Visual tuning is a 4-GPU configuration. |
@@ -1011,6 +1065,7 @@ shape here with a demonstrated end-to-end run.
 | CodeBuild fails with `Expected Commands[N] to be of string type: found subkeys instead` | A buildspec command containing `": "` as an unquoted plain YAML scalar parses as a mapping | Single-quote the whole command. Note this surfaces only *after* queue + provisioning, so a typo can cost ~28 minutes. |
 | CodeBuild runs out of memory during `uv sync` / flash-attn | Default `BUILD_GENERAL1_LARGE` compute | Pass `--compute-type-override BUILD_GENERAL1_2XLARGE` |
 | NGC key visible in the build record | Passed with `--environment-variables-override ... PLAINTEXT` | Let `buildspec-n17.yml` read it from Secrets Manager instead |
+| BUILD fails pulling `nvcr.io/nvidia/pytorch:25.04-py3` with an authorization or rate-limit error, after `NGC login skipped` in PRE_BUILD | No usable `physical-ai/ngc-api-key`, so the pull was anonymous and nvcr.io refused or throttled it | Store an NGC API key in `physical-ai/ngc-api-key` (Secrets Manager, build region) and re-run the build; the buildspec logs in with it automatically |
 | Cached image on a warm Batch instance after a `:n17` re-push | Old layers still on the instance | Scale the CE to 0, wait for termination, scale back up |
 | Foundation VPC not found | SSM parameter missing | Deploy Foundation first (`cd foundation/infra && terraform apply`) |
 
