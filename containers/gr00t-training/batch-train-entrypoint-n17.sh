@@ -92,37 +92,72 @@ if [ -n "$ARCHIVE_SETTINGS_PRESENT" ]; then
     materialize_model_archive "Cosmos Reason2" "$COSMOS_REASON2_ARCHIVE_S3_URI" \
       "$COSMOS_REASON2_SHA256" "$REASON2_LOCAL_DIR" "model.safetensors"
 
-    python3 - "$GROOT_LOCAL_DIR" "$REASON2_LOCAL_DIR" <<'PY'
+    # GR00T uses config.model_name as a class discriminator, so it must remain the
+    # canonical repository id even in offline mode. Seed the verified raw snapshot
+    # into Hugging Face's cache instead of rewriting model_name to a filesystem path.
+    REASON2_REVISION="9ce19a195e423419c349abfc86fd07178b230561"
+    export HF_HOME="${LOCAL_MODEL_ROOT}/hf-cache"
+    export HF_HUB_CACHE="${HF_HOME}/hub"
+    REASON2_CACHE_DIR="${HF_HUB_CACHE}/models--nvidia--Cosmos-Reason2-2B"
+    REASON2_SNAPSHOT_DIR="${REASON2_CACHE_DIR}/snapshots/${REASON2_REVISION}"
+    mkdir -p "${REASON2_CACHE_DIR}/snapshots" "${REASON2_CACHE_DIR}/refs"
+    rm -rf "$REASON2_SNAPSHOT_DIR"
+    mv "$REASON2_LOCAL_DIR" "$REASON2_SNAPSHOT_DIR"
+    # huggingface_hub treats every byte as part of the ref. Do not append a newline.
+    printf '%s' "$REASON2_REVISION" > "${REASON2_CACHE_DIR}/refs/main"
+    [ "$(wc -c < "${REASON2_CACHE_DIR}/refs/main")" -eq 40 ] \
+      || { echo "ERROR: Cosmos Reason2 refs/main is not exactly 40 bytes" >&2; exit 1; }
+    [ -s "$REASON2_SNAPSHOT_DIR/config.json" ] \
+      && [ -s "$REASON2_SNAPSHOT_DIR/model.safetensors" ] \
+      || { echo "ERROR: Cosmos Reason2 cache snapshot is incomplete" >&2; exit 1; }
+    REASON2_LOCAL_DIR="$REASON2_SNAPSHOT_DIR"
+
+    # Transformers' tokenizer performs a model_info() request when it receives a
+    # repository id, even when every processor file is cached and offline mode is
+    # enabled. GR00T still needs the canonical id for get_backbone_cls(), so patch
+    # only its processor factory to pass the verified local snapshot directory.
+    PROCESSOR_SOURCE="${GROOT_SDK_DIR:-/workspace/gr00t-repo}/gr00t/model/gr00t_n1d7/processing_gr00t_n1d7.py"
+    python3 - "$PROCESSOR_SOURCE" "$REASON2_LOCAL_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+local_snapshot = sys.argv[2]
+source = path.read_text()
+needle = "return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)"
+replacement = (
+    "return Qwen3VLProcessor.from_pretrained("
+    f"{local_snapshot!r}, **transformers_loading_kwargs)"
+)
+if source.count(needle) != 1:
+    raise SystemExit(
+        f"Expected exactly one GR00T processor load site, found {source.count(needle)}"
+    )
+path.write_text(source.replace(needle, replacement))
+print(f"Redirected Qwen3-VL processor loading to {local_snapshot}")
+PY
+
+    python3 - "$GROOT_LOCAL_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-reason = sys.argv[2]
-source = "nvidia/Cosmos-Reason2-2B"
+canonical = "nvidia/Cosmos-Reason2-2B"
 
-def rewrite(value):
-    if isinstance(value, dict):
-        return {key: rewrite(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [rewrite(item) for item in value]
-    if isinstance(value, str):
-        return value.replace(source, reason)
-    return value
-
-changed = 0
+# At least one GR00T config must retain the canonical model name. The pinned
+# loader uses this value to select the Cosmos/Qwen3-VL backbone class before
+# Hugging Face resolves the same id from the local cache.
 for path in root.rglob("*.json"):
     try:
-        original = json.loads(path.read_text())
+        value = json.loads(path.read_text())
     except (UnicodeDecodeError, json.JSONDecodeError):
         continue
-    updated = rewrite(original)
-    if updated != original:
-        path.write_text(json.dumps(updated, indent=2) + "\n")
-        changed += 1
-if changed == 0:
-    raise SystemExit("No Cosmos Reason2 references were found in the GR00T snapshot")
-print(f"Rewrote Cosmos Reason2 to local path in {changed} GR00T JSON files")
+    if canonical in json.dumps(value):
+        print(f"Preserved canonical Cosmos Reason2 identity in {path}")
+        break
+else:
+    raise SystemExit("GR00T snapshot has no canonical Cosmos Reason2 identity")
 PY
 
     BASE_MODEL="$GROOT_LOCAL_DIR"

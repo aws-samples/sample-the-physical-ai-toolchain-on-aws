@@ -56,8 +56,12 @@ case "$1 ${2:-}" in
       *) echo "arn:aws:sts::123456789012:assumed-role/TerraformBuildRole/s" ;;
     esac ;;
   "iam get-role")
-    if [ -n "${STUB_CONFIGURED_PARTICIPANT_ARN:-}" ]; then
-      echo "$STUB_CONFIGURED_PARTICIPANT_ARN"
+    case " $* " in
+      *" --role-name admin "*) ROLE_ARN="${STUB_ADDITIONAL_VIEWER_ARN:-}" ;;
+      *) ROLE_ARN="${STUB_CONFIGURED_PARTICIPANT_ARN:-}" ;;
+    esac
+    if [ -n "$ROLE_ARN" ]; then
+      echo "$ROLE_ARN"
     else
       echo "An error occurred (NoSuchEntity) when calling the GetRole operation" >&2
       exit 254
@@ -65,6 +69,8 @@ case "$1 ${2:-}" in
   "iam list-roles")
     [ -n "${STUB_PARTICIPANT_CANDIDATES:-}" ] && echo "$STUB_PARTICIPANT_CANDIDATES"
     exit 0 ;;
+  "eks describe-access-entry") exit "${STUB_EKS_ACCESS_ENTRY_RC:-254}" ;;
+  "eks create-access-entry"|"eks associate-access-policy") exit 0 ;;
   "ec2 describe-subnets")
     shift 2
     ids=""; collecting=0
@@ -271,6 +277,31 @@ expect "exit 0" rc_is 0
 expect "ambiguous candidates not mapped" tfvar "$TFV" eks_view_principal_arns "[]"
 expect "ambiguity logged" has "$OUT" "multiple participant-role candidates exist"
 finish "b3  multiple participant roles -> no access-entry guess"
+
+# (b4) optional exact admin role -> idempotent second read-only access entry
+ADMIN_VIEWER_ARN="arn:aws:iam::$ACCOUNT:role/admin"
+run_case b4 "${WORKSHOP_ENV[@]}" "PARTICIPANT_ROLE_NAME=WSParticipantRole" \
+  "STUB_PARTICIPANT_CANDIDATES=$PARTICIPANT_CANDIDATE" \
+  "ADDITIONAL_EKS_VIEWER_ROLE_NAME=admin" \
+  "STUB_ADDITIONAL_VIEWER_ARN=$ADMIN_VIEWER_ARN"
+expect "exit 0" rc_is 0
+expect "participant remains Terraform-managed viewer" tfvar "$TFV" eks_view_principal_arns "[\"$PARTICIPANT_CANDIDATE\"]"
+expect "admin viewer access entry created" has "$LOG" "aws eks create-access-entry --cluster-name physical-ai-evt-cosmos3 --principal-arn $ADMIN_VIEWER_ARN --kubernetes-groups cosmos3-viewers --type STANDARD --region us-east-2"
+expect "admin read-only policy associated" has "$LOG" "aws eks associate-access-policy --cluster-name physical-ai-evt-cosmos3 --principal-arn $ADMIN_VIEWER_ARN --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy --access-scope type=cluster --region us-east-2"
+expect "admin viewer mapping logged" has "$OUT" "Additional role granted read-only cluster access: $ADMIN_VIEWER_ARN"
+finish "b4  participant + admin roles -> both get read-only EKS access"
+
+# (b5) existing admin entry -> preserve it and re-associate the read-only policy
+run_case b5 "${WORKSHOP_ENV[@]}" "PARTICIPANT_ROLE_NAME=WSParticipantRole" \
+  "STUB_PARTICIPANT_CANDIDATES=$PARTICIPANT_CANDIDATE" \
+  "ADDITIONAL_EKS_VIEWER_ROLE_NAME=admin" \
+  "STUB_ADDITIONAL_VIEWER_ARN=$ADMIN_VIEWER_ARN" \
+  "STUB_EKS_ACCESS_ENTRY_RC=0"
+expect "exit 0" rc_is 0
+expect "existing admin entry not recreated" hasnt "$LOG" "aws eks create-access-entry"
+expect "existing admin policy reconciled" has "$LOG" "aws eks associate-access-policy --cluster-name physical-ai-evt-cosmos3 --principal-arn $ADMIN_VIEWER_ARN --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy --access-scope type=cluster --region us-east-2"
+expect "existing entry logged" has "$OUT" "Additional EKS viewer access entry already exists: $ADMIN_VIEWER_ARN"
+finish "b5  existing admin viewer -> preserved and policy reconciled"
 
 # (c2) presigned archive -> verified, relayed to participant S3, then extracted on node
 run_case c2 "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" "DATA_BUCKET=$DATA"

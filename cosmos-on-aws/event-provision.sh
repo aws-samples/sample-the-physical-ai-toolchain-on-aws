@@ -31,6 +31,12 @@
 #   WORKSTATION_ROLE_ARN  IAM role granted EKS cluster-admin, so the workshop
 #                       workstation can run kubectl and `terraform plan` (the Helm
 #                       provider must reach the Kubernetes API to refresh state).
+#   PARTICIPANT_ROLE_NAME  Primary workshop participant role granted read-only EKS
+#                       access. If missing, exactly one participant-named role may be
+#                       auto-detected; ambiguous candidates are never guessed.
+#   ADDITIONAL_EKS_VIEWER_ROLE_NAME  Optional second exact IAM role name granted the
+#                       same read-only EKS access (for example admin). Missing roles are
+#                       skipped, so the template remains portable across event accounts.
 #   CENTRAL_WEIGHTS_S3  Central S3 prefix with unpacked Cosmos 3 Nano weights (optional)
 #   CENTRAL_WEIGHTS_URL Presigned HTTPS URL for a Cosmos 3 Nano tar archive (optional;
 #                       mutually exclusive with CENTRAL_WEIGHTS_S3)
@@ -527,6 +533,43 @@ subjects:
     name: cosmos3-viewers
 EOF
 log "ClusterRole cosmos3-cluster-viewer bound to group cosmos3-viewers (node read for the console)"
+
+# Optional second read-only console role. The primary participant role remains
+# Terraform-managed through eks_view_principal_arns. Event operators may use a
+# separate account-level role (commonly "admin") to inspect workloads. Reconcile the
+# exact configured role rather than guessing administrator-like names. New entries
+# join cosmos3-viewers so the Compute tab can read nodes without using
+# AmazonEKSAdminViewPolicy, which would expose Kubernetes Secrets.
+ADDITIONAL_VIEWER_ROLE_NAME="${ADDITIONAL_EKS_VIEWER_ROLE_NAME:-}"
+if [ -n "$ADDITIONAL_VIEWER_ROLE_NAME" ]; then
+  [[ "$ADDITIONAL_VIEWER_ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]] \
+    || die "ADDITIONAL_EKS_VIEWER_ROLE_NAME is not a valid IAM role name"
+
+  ADDITIONAL_VIEWER_ROLE_ARN=""
+  if ADDITIONAL_VIEWER_ROLE_ARN="$(aws iam get-role \
+       --role-name "$ADDITIONAL_VIEWER_ROLE_NAME" \
+       --query 'Role.Arn' --output text 2>/dev/null)" \
+     && [ -n "$ADDITIONAL_VIEWER_ROLE_ARN" ]; then
+    if aws eks describe-access-entry --cluster-name "$CLUSTER" \
+         --principal-arn "$ADDITIONAL_VIEWER_ROLE_ARN" \
+         --region "$AWS_REGION_NAME" >/dev/null 2>&1; then
+      log "Additional EKS viewer access entry already exists: ${ADDITIONAL_VIEWER_ROLE_ARN}"
+    else
+      aws eks create-access-entry --cluster-name "$CLUSTER" \
+        --principal-arn "$ADDITIONAL_VIEWER_ROLE_ARN" \
+        --kubernetes-groups cosmos3-viewers \
+        --type STANDARD --region "$AWS_REGION_NAME" >/dev/null
+      log "Created additional EKS viewer access entry: ${ADDITIONAL_VIEWER_ROLE_ARN}"
+    fi
+    aws eks associate-access-policy --cluster-name "$CLUSTER" \
+      --principal-arn "$ADDITIONAL_VIEWER_ROLE_ARN" \
+      --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy \
+      --access-scope type=cluster --region "$AWS_REGION_NAME" >/dev/null
+    log "Additional role granted read-only cluster access: ${ADDITIONAL_VIEWER_ROLE_ARN}"
+  else
+    log "Additional EKS viewer role '${ADDITIONAL_VIEWER_ROLE_NAME}' not found - skipping"
+  fi
+fi
 
 if [ -z "$CENTRAL_WEIGHTS_S3" ] && [ -z "$CENTRAL_WEIGHTS_URL" ]; then
   kubectl create secret generic hf-token -n default \
