@@ -239,6 +239,7 @@ spec:
                 -H "Accept: application/json" \
                 -F "model=${MODEL_ID}" \
                 -F "prompt=${PROMPT}" \
+                -F "negative_prompt=blurry, distorted, low quality, jittery, jerky motion, sudden acceleration, deformed hands, fused fingers, extra fingers, floating objects, deforming box, slipping grasp, camera shake, camera movement, scene cuts, flicker" \
                 -F "size=1280x720" \
                 -F "num_frames=189" \
                 -F "fps=24" \

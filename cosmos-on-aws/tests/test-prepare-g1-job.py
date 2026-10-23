@@ -34,9 +34,68 @@ class PrepareG1JobTest(unittest.TestCase):
         self.assertEqual(rendered.count('nvidia.com/gpu: "1"'), 2)
         self.assertIn("observation.images.cam_high/episode_000000.mp4", rendered)
         self.assertIn("g1_pick_blue_box_generated.mp4", rendered)
+        self.assertIn("both hands approach slowly", rendered)
+        self.assertIn("firm symmetric grasp", rendered)
+        self.assertIn("brief stabilization pause", rendered)
+        self.assertIn("slow constant speed", rendered)
+        self.assertIn("motion in one continuous shot", rendered)
+        self.assertIn("negative_prompt=", rendered)
+        self.assertIn("jittery, jerky motion", rendered)
+        self.assertIn("deformed hands", rendered)
+        self.assertIn("slipping grasp", rendered)
         self.assertIn("models--Qwen--Qwen3Guard-Gen-0.6B", rendered)
         self.assertIn("-c:v libx264", rendered)
         self.assertNotRegex(rendered, r"<(?:REGION|DATASETS_BUCKET|DATA_BUCKET)>")
+
+    def test_renders_custom_prompt_and_unique_run_settings(self) -> None:
+        prompt = (
+            "A fixed robot camera observes both hands.\n"
+            "The hands establish a stable grasp, then lift the box slowly."
+        )
+        rendered = MODULE.render_job(
+            MANIFEST.read_text(),
+            "us-east-2",
+            self.outputs,
+            prompt=prompt,
+            job_name="cosmos3-g1-smooth-pickup-v2",
+            output_filename="g1_pick_blue_box_smooth-pickup-v2.mp4",
+            reference_filename="g1_pick_blue_box_smooth-pickup-v2_reference.mp4",
+            seed=200,
+        )
+        self.assertIn("name: cosmos3-g1-smooth-pickup-v2", rendered)
+        self.assertIn("app: cosmos3-g1-smooth-pickup-v2", rendered)
+        self.assertIn("A fixed robot camera observes both hands.", rendered)
+        self.assertIn("establish a stable grasp", rendered)
+        self.assertIn(
+            'name: OUTPUT_FILENAME, value: "g1_pick_blue_box_smooth-pickup-v2.mp4"',
+            rendered,
+        )
+        self.assertIn(
+            'name: REFERENCE_FILENAME, value: '
+            '"g1_pick_blue_box_smooth-pickup-v2_reference.mp4"',
+            rendered,
+        )
+        self.assertIn('name: SEED, value: "200"', rendered)
+
+    def test_rejects_invalid_run_settings(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Kubernetes DNS label"):
+            MODULE.render_job(
+                MANIFEST.read_text(),
+                "us-east-2",
+                self.outputs,
+                job_name="Invalid_Name",
+            )
+        with self.assertRaisesRegex(ValueError, "simple .mp4 filename"):
+            MODULE.render_job(
+                MANIFEST.read_text(),
+                "us-east-2",
+                self.outputs,
+                output_filename="../output.mp4",
+            )
+        with self.assertRaisesRegex(ValueError, "prompt must not be empty"):
+            MODULE.render_job(
+                MANIFEST.read_text(), "us-east-2", self.outputs, prompt="  "
+            )
 
     def test_rejects_stale_runtime_bundle_checksum(self) -> None:
         self.outputs["Cosmos3ArchiveSha256"] = "0" * 64
