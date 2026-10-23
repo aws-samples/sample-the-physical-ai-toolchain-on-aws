@@ -46,11 +46,26 @@ def put_verified(session, bucket, key, body):
     return {"bucket": bucket, "key": key, "version_id": version, "sha256": digest}
 
 
-def download_command(item, destination):
+def download_command(item, destination, *, wait_for_access=False):
     command = ["aws", "s3api", "get-object", "--region", "us-east-1",
                "--bucket", item["bucket"], "--key", item["key"],
                "--version-id", item["version_id"], destination]
-    return (shlex.join(command) + " >/dev/null\n" +
+    download = shlex.join(command) + " >/dev/null"
+    if wait_for_access:
+        # The just-added inline role policy may not yet be effective on EC2.
+        # Retry this read only; never weaken the version/hash or IAM checks.
+        error = shlex.quote(destination + ".download-error")
+        download = f"""for attempt in {{1..13}}; do
+  if {download} 2>{error}; then
+    rm -f {error}
+    break
+  fi
+  cat {error} >&2
+  if [ "$attempt" -eq 13 ] || ! grep -q 'AccessDenied' {error}; then exit 1; fi
+  echo "Waiting for the new instance-role S3 grant (attempt $attempt/13)" >&2
+  sleep 10
+done"""
+    return (download + "\n" +
             shlex.join(["printf", "%s  %s\\n", item["sha256"], destination]) + " | sha256sum -c -")
 
 
@@ -80,6 +95,7 @@ def mark_prepared(session, record, save):
                              (json.dumps(selection, indent=2) + "\n").encode())
     record["selection_uri"] = f"s3://{reference['bucket']}/{reference['key']}"
     record["selection_version"] = reference["version_id"]
+    record["activity"] = "Host prerequisites, checkout and selected images are prepared"
     save()
 
 
@@ -111,7 +127,7 @@ def prepare_host(session, cfg, record, save, *, yes, plan_only=False):
     secret = session.client("secretsmanager").describe_secret(SecretId=cfg.hf_secret_name)
     policy = runtime_policy(cfg, bucket, secret["ARN"])
     local.update(expected_role=role, development_bucket=bucket, instance_type=instance["InstanceType"],
-                 host_supplied=True)
+                 host_supplied=not bool(record.get("owned_gpu")))
     prefix = f"/opt/vla-cli/{record['id']}"
     checkout = f"{prefix}/checkouts/{record['source_commit']}/repo"
     local.update(component=f"{checkout}/{COMPONENT.name}", state_dir=f"{prefix}/state",
@@ -142,6 +158,7 @@ def prepare_host(session, cfg, record, save, *, yes, plan_only=False):
         # not send a new command when submitted_at is already present.
         submit(ssm, host, previous, [], save)
     if previous and previous.get("command_id"):
+        record["activity"] = "Following existing host preparation: " + previous["command_id"]
         result = observe(ssm, host, previous)
         save()
         if result["Status"] in ACTIVE:
@@ -207,6 +224,7 @@ def prepare_host(session, cfg, record, save, *, yes, plan_only=False):
         print(record["activity"], flush=True)
         time.sleep(30)
     # Always inspect current idleness, even when resuming completed preparation.
+    record["activity"] = f"SSM online; checking idle host and GPU on {host}"
     probe = {}
     phases["idle-probe"] = probe
     submit(ssm, host, probe, [IDLE_PROBE], save, timeout=120)
@@ -264,7 +282,7 @@ def prepare_host(session, cfg, record, save, *, yes, plan_only=False):
         "export VLA_SCRATCH_ROOT=" + shlex.quote(local["scratch_root"]),
         shlex.join(["install", "-d", "-m", "700", prefix]),
         f'test "$(aws sts get-caller-identity --query Account --output text)" = {shlex.quote(cfg.account_id)}',
-        download_command(bootstrap, prefix + "/bootstrap.sh"),
+        download_command(bootstrap, prefix + "/bootstrap.sh", wait_for_access=True),
         shlex.join(["bash", prefix + "/bootstrap.sh"]),
         # Hold the host lock across clone, dependency setup and image pulls too.
         "exec 9>/var/lock/vla-local-gpu.lock",
@@ -283,6 +301,7 @@ def prepare_host(session, cfg, record, save, *, yes, plan_only=False):
         shlex.join([local["component"] + "/.venv/bin/python", "-m", "vla_pipeline.remote_worker",
                     "prepare", "--state-dir", local["state_dir"], "--deployment", record["id"]]),
     ])
+    record["activity"] = "Preparing host prerequisites, checkout and selected image downloads"
     submit(ssm, host, setup, ["bash -c " + shlex.quote(command)], save, timeout=43200, bucket=bucket)
     wait(ssm, host, setup, save)
     mark_prepared(session, record, save)

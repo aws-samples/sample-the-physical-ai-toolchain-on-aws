@@ -29,9 +29,9 @@ REPO_ROOT = _find_repo_root()
 CONFIG_PATH = REPO_ROOT / "config.json"
 
 
-def load() -> dict:
-    """Load config.json, tolerating _comment keys."""
-    with open(CONFIG_PATH, encoding="utf-8") as f:
+def load(path: str | Path | None = None) -> dict:
+    """Load the shared JSON config, or an explicitly selected file."""
+    with open(path if path is not None else CONFIG_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 

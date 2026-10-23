@@ -21,6 +21,57 @@ EVIDENCE_FILES = (
 OPTIONAL_EVIDENCE_FILES = ("negative-validation.json", "negative-validation.log", "disk-checks.json")
 
 
+def remove_verified_containers(root, manifest, ids):
+    """Reconcile a prior removal without treating an unexplained absence as success."""
+    path = root / "container-cleanup.json"
+    receipt = json.loads(path.read_text()) if path.exists() else {
+        "run_id": manifest["run_id"], "canonical_commit": manifest["canonical_commit"],
+        "ids": ids, "removal_requested": [], "removed": [],
+    }
+    if (receipt["run_id"], receipt["canonical_commit"], receipt["ids"]) != (
+            manifest["run_id"], manifest["canonical_commit"], ids):
+        raise RuntimeError("Container cleanup receipt belongs to a different run or container set")
+
+    def save():
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(receipt, indent=2) + "\n")
+        temporary.replace(path)
+
+    def inspect(container_id):
+        result = subprocess.run(["docker", "inspect", container_id],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            if "no such object:" in result.stderr.lower() or "no such container:" in result.stderr.lower():
+                return None
+            raise RuntimeError(f"Could not inspect container: {result.stderr}")
+        return json.loads(result.stdout)[0]
+
+    # Validate the whole set before deleting any currently present container.
+    present = []
+    for container_id in ids:
+        container = inspect(container_id)
+        if container is None:
+            if container_id not in receipt["removal_requested"]:
+                raise RuntimeError("Container is missing without a recorded removal request")
+            continue
+        if container["Config"].get("Labels", {}).get("vla.local.run") != manifest["run_id"]:
+            raise RuntimeError("Container does not belong to this run")
+        if container["State"]["Running"] or container["State"]["ExitCode"] != 0:
+            raise RuntimeError("Container is active or did not exit successfully")
+        present.append(container_id)
+    for container_id in present:
+        if container_id not in receipt["removal_requested"]:
+            receipt["removal_requested"].append(container_id)
+        save()
+        subprocess.run(["docker", "rm", container_id], check=True, capture_output=True, timeout=60)
+    for container_id in ids:
+        if inspect(container_id) is not None:
+            raise RuntimeError("Container still exists after removal")
+    receipt["removed"] = ids
+    save()
+    return ids
+
+
 def archive_run(root, remove_containers=False):
     def load(name):
         return json.loads((root / name).read_text())
@@ -62,6 +113,10 @@ def archive_run(root, remove_containers=False):
     files = [name for name in EVIDENCE_FILES
              if (name not in {"train.log", "eval.log", "validate.log"} or name[:-4] in kinds)
              and (name != "verified-receipt.json" or "Validate" in required_steps)]
+    if verification.get("contract_checks"):
+        if load("contract-checks.json") != verification["contract_checks"]:
+            raise RuntimeError("Named check report differs from the independently verified result")
+        files.append("contract-checks.json")
     if manifest.get("resolved_request_sha256"):
         files.extend(["resolved-request.json", "job-outputs.json"])
         if "SimEval" in required_steps and "Validate" not in required_steps:
@@ -82,14 +137,7 @@ def archive_run(root, remove_containers=False):
         ids = [row["id"] for row in load("container-exits.json")]
         if len(ids) != len(kinds):
             raise RuntimeError("Expected exactly the containers for the verified requested steps")
-        actual = json.loads(subprocess.check_output(["docker", "inspect", *ids], text=True))
-        for container in actual:
-            if container["Config"]["Labels"].get("vla.local.run") != manifest["run_id"]:
-                raise RuntimeError("Container does not belong to this run")
-            if container["State"]["Running"] or container["State"]["ExitCode"] != 0:
-                raise RuntimeError("Container is active or did not exit successfully")
-        subprocess.run(["docker", "rm", *ids], check=True, capture_output=True)
-        archive["removed_containers"] = ids
+        archive["removed_containers"] = remove_verified_containers(root, manifest, ids)
         (root / "archive-manifest.json").write_text(json.dumps(archive, indent=2) + "\n")
     return archive
 
