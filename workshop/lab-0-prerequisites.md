@@ -42,8 +42,8 @@ to train, refine, and deploy a pick-and-place robot policy.
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/aws-samples/aws-physical-ai-toolchain.git
-cd aws-physical-ai-toolchain
+git clone https://github.com/aws-samples/sample-the-physical-ai-toolchain-on-aws.git
+cd sample-the-physical-ai-toolchain-on-aws
 ```
 
 ### 2. Install the `pai` CLI
@@ -70,13 +70,7 @@ npm install
 cd ..
 ```
 
-### 4. Bootstrap CDK (once per account/region)
-
-```bash
-npx cdk bootstrap aws://<ACCOUNT_ID>/us-east-1
-```
-
-### 5. Set your region and environment variables
+### 4. Set your region and environment variables
 
 `config.json` is the single source of truth for the toolchain region — both `pai`
 and CDK read it, so it can't drift from your shell. Set it once:
@@ -85,8 +79,15 @@ and CDK read it, so it can't drift from your shell. Set it once:
 pai config set aws.region us-west-2    # or your target region
 
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CDK_DEFAULT_REGION=us-east-1
+# Read the region back from config.json (works from any directory inside the repo)
+export CDK_DEFAULT_REGION=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['aws']['region'])" "$(git rev-parse --show-toplevel)/config.json")
 export HF_TOKEN=hf_xxxx  # Your Hugging Face token
+```
+
+### 5. Bootstrap CDK (once per account/region)
+
+```bash
+(cd cdk && npx cdk bootstrap "aws://$CDK_DEFAULT_ACCOUNT/$CDK_DEFAULT_REGION")
 ```
 
 ### 6. Store your NGC API key in Secrets Manager

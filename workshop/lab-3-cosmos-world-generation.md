@@ -123,13 +123,17 @@ Each is a unique, plausible execution of the pick-and-place task under different
      - Copy the `hf_...` value (shown only once)
   4. Store the token in AWS Secrets Manager:
      ```bash
+     # Set this once to the region your foundation stack is deployed in — every
+     # command in this lab uses it.
+     export REGION="<your-region>"
+
      aws secretsmanager create-secret --name physical-ai/hf-token \
-       --secret-string "hf_YOUR_TOKEN_HERE" --region us-east-1
+       --secret-string "hf_YOUR_TOKEN_HERE" --region $REGION
      ```
 - **P5 quota** — at least 192 vCPUs of "Running On-Demand P instances":
   ```bash
   aws service-quotas get-service-quota --service-code ec2 \
-    --quota-code L-417A185B --region us-east-1 --query 'Quota.Value'
+    --quota-code L-417A185B --region $REGION --query 'Quota.Value'
   ```
 - **IAM role + instance profile** — with SSM, ECR read, and S3 access (see `docs/cosmos3-validated-runbook.md`)
 - **vllm-omni:cosmos3 image in ECR** — Step 1 below
@@ -143,11 +147,12 @@ Mirror it to your ECR using CodeBuild (avoids pulling 30 GB locally):
 
 ```bash
 # Create the ECR repo
-aws ecr create-repository --repository-name vllm-omni --region us-east-1
+aws ecr create-repository --repository-name vllm-omni --region $REGION
 
-# Run the mirror script (creates a CodeBuild project, starts the build)
-bash scripts/mirror-vllm-omni.sh
-# → Takes ~15 min. Image lands at: <ACCOUNT>.dkr.ecr.us-east-1.amazonaws.com/vllm-omni:cosmos3
+# Run the mirror script (creates a CodeBuild project, starts the build).
+# It reads AWS_REGION, so pass the same region as above.
+AWS_REGION=$REGION bash scripts/mirror-vllm-omni.sh
+# → Takes ~15 min. Image lands at: <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/vllm-omni:cosmos3
 ```
 
 ---
@@ -210,7 +215,7 @@ Copy a reference clip from your Lab 1 dataset to the instance, then generate:
 ```bash
 # Copy reference video to the instance
 aws ssm send-command --instance-ids $INSTANCE_ID --document-name AWS-RunShellScript \
-  --parameters '{"commands":["aws s3 cp s3://<BUCKET>/groot-data/ur3/dataset/videos/chunk-000/observation.images.wrist/episode_000000.mp4 /tmp/episode_000000.mp4 --region us-east-1 && docker cp /tmp/episode_000000.mp4 cosmos3:/tmp/episode_000000.mp4"]}' \
+  --parameters '{"commands":["aws s3 cp s3://<BUCKET>/groot-data/ur3/dataset/videos/chunk-000/observation.images.wrist/episode_000000.mp4 /tmp/episode_000000.mp4 --region '"$REGION"' && docker cp /tmp/episode_000000.mp4 cosmos3:/tmp/episode_000000.mp4"]}' \
   --region $REGION
 ```
 
@@ -228,7 +233,7 @@ Upload the result:
 
 ```bash
 aws ssm send-command --instance-ids $INSTANCE_ID --document-name AWS-RunShellScript \
-  --parameters '{"commands":["docker cp cosmos3:/tmp/output.mp4 /tmp/output.mp4 && aws s3 cp /tmp/output.mp4 s3://<BUCKET>/cosmos-samples/generated_demo_seed100.mp4 --region us-east-1"]}' \
+  --parameters '{"commands":["docker cp cosmos3:/tmp/output.mp4 /tmp/output.mp4 && aws s3 cp /tmp/output.mp4 s3://<BUCKET>/cosmos-samples/generated_demo_seed100.mp4 --region '"$REGION"'"]}' \
   --region $REGION
 ```
 
@@ -242,7 +247,7 @@ landed in S3 and is a real, playable video before moving on.
 **1. Confirm the object exists and check its size:**
 
 ```bash
-aws s3 ls s3://<BUCKET>/cosmos-samples/ --region us-east-1 --human-readable
+aws s3 ls s3://<BUCKET>/cosmos-samples/ --region $REGION --human-readable
 ```
 
 You should see both the original reference clip and the generated output, e.g.:
@@ -259,8 +264,8 @@ instance for errors before continuing.
 
 ```bash
 mkdir -p ./cosmos-output
-aws s3 cp s3://<BUCKET>/cosmos-samples/original_episode_000000.mp4 ./cosmos-output/ --region us-east-1
-aws s3 cp s3://<BUCKET>/cosmos-samples/generated_demo_seed100.mp4 ./cosmos-output/ --region us-east-1
+aws s3 cp s3://<BUCKET>/cosmos-samples/original_episode_000000.mp4 ./cosmos-output/ --region $REGION
+aws s3 cp s3://<BUCKET>/cosmos-samples/generated_demo_seed100.mp4 ./cosmos-output/ --region $REGION
 ls -lh ./cosmos-output/
 ```
 
@@ -344,7 +349,7 @@ See `docs/cosmos3-prompt-catalog.md` for the complete catalog with results and l
 ## Step 5: Terminate When Done
 
 ```bash
-aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region us-east-1
+aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION
 ```
 
 The capacity block expires at its end time regardless. Instance charges stop on termination.

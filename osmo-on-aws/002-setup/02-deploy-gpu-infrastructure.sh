@@ -139,6 +139,32 @@ main() {
   fi
 
   #----------------------------------------------------------------------------
+  # Wait for nvidia.com/gpu before installing KAI. The GPU Operator needs ~10 min
+  # to build/load the NVIDIA kernel modules, and KAI snapshots node capacity when
+  # it starts: a scheduler that starts before the GPU is advertised reports
+  # "Total allocatable resources are <... Gpus: 0>" and every GPU workflow pod
+  # stays Pending with no scheduling events.
+  #----------------------------------------------------------------------------
+  if [[ "$gpu_node_count" -gt 0 ]]; then
+    section "Waiting for nvidia.com/gpu to be allocatable"
+    local gpu_wait="${GPU_ALLOCATABLE_TIMEOUT:-1200}" waited=0 alloc=0
+    while [[ "$waited" -lt "$gpu_wait" ]]; do
+      alloc=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}' 2>/dev/null \
+        | awk 'NF && $1 != "0"' | wc -l) || alloc=0
+      [[ "$alloc" -gt 0 ]] && break
+      sleep 20
+      waited=$((waited + 20))
+    done
+    if [[ "$alloc" -gt 0 ]]; then
+      pass "nvidia.com/gpu advertised by $alloc node(s) after ${waited}s"
+    else
+      warn "nvidia.com/gpu still not advertised after ${gpu_wait}s; check 'kubectl logs -n $GPU_OPERATOR_NAMESPACE -l app=nvidia-driver-daemonset'."
+      warn "If the driver failed to build, bump driver.version in values/nvidia-gpu-operator.yaml."
+      warn "Once GPUs appear, restart KAI so it re-reads capacity: kubectl rollout restart deploy -n \${KAI_SCHEDULER_NAMESPACE:-kai-scheduler}"
+    fi
+  fi
+
+  #----------------------------------------------------------------------------
   # Deploy KAI Scheduler (GPU-aware scheduler for OSMO)
   # https://nvidia.github.io/OSMO/main/deployment_guide/install_backend/dependencies/dependencies.html
   #----------------------------------------------------------------------------
