@@ -4,6 +4,7 @@
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -119,6 +120,80 @@ class SubmitG1GenerationTest(unittest.TestCase):
 
             self.assertEqual(method, "Cosmos Pod cosmos-pod")
             self.assertEqual(destination.read_bytes(), b"normalized")
+
+    def test_s3_uri_inputs_are_parsed_and_downloaded(self) -> None:
+        self.assertEqual(
+            MODULE.parse_s3_uri(
+                "s3://physical-ai-data/cosmos3-inputs/source.mp4"
+            ),
+            ("physical-ai-data", "cosmos3-inputs/source.mp4"),
+        )
+        for invalid in (
+            "https://example.com/source.mp4",
+            "s3://physical-ai-data",
+            "s3:///source.mp4",
+            "s3://physical-ai-data/source.mp4?versionId=1",
+        ):
+            with self.subTest(uri=invalid), self.assertRaisesRegex(
+                ValueError, "invalid S3 URI"
+            ):
+                MODULE.parse_s3_uri(invalid)
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "source.mp4"
+
+            def fake_run(command: list[str], *, capture: bool = False):
+                destination.write_bytes(b"video")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(MODULE, "run", side_effect=fake_run) as run_mock:
+                MODULE.download_s3_object(
+                    "physical-ai-data",
+                    "cosmos3-inputs/source.mp4",
+                    destination,
+                    "us-east-2",
+                )
+
+            self.assertEqual(destination.read_bytes(), b"video")
+            self.assertEqual(
+                run_mock.call_args.args[0],
+                [
+                    "aws",
+                    "s3",
+                    "cp",
+                    "s3://physical-ai-data/cosmos3-inputs/source.mp4",
+                    str(destination),
+                    "--region",
+                    "us-east-2",
+                    "--only-show-errors",
+                ],
+            )
+
+    def test_cli_accepts_paired_s3_video_uris(self) -> None:
+        argv = [
+            str(SCRIPT),
+            "--region",
+            "us-east-2",
+            "--run-id",
+            "warm-lighting-v1",
+            "--prompt",
+            "Smooth pickup",
+            "--input-s3-uri",
+            "s3://physical-ai-data/cosmos3-inputs/source.mp4",
+            "--edge-control-s3-uri",
+            "s3://physical-ai-data/cosmos3-inputs/control.mp4",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            args = MODULE.parse_args()
+
+        self.assertEqual(
+            args.input_s3_uri,
+            "s3://physical-ai-data/cosmos3-inputs/source.mp4",
+        )
+        self.assertEqual(
+            args.edge_control_s3_uri,
+            "s3://physical-ai-data/cosmos3-inputs/control.mp4",
+        )
 
     def test_rejects_non_loopback_server(self) -> None:
         with self.assertRaisesRegex(ValueError, "127.0.0.1"):

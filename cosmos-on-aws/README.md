@@ -89,7 +89,7 @@ Cosmos 3 ships in three sizes — Super (64B), Nano (16B), and Edge (4B, not cov
 | [`generate-v2v.sh`](generate-v2v.sh) | Generate a V2V synthetic demonstration from a reference video (EC2 path) |
 | [`cosmos3-service.yaml`](cosmos3-service.yaml) | Reusable Cosmos server as a one-replica GPU Deployment plus private ClusterIP Service; intended for sequential prompt experiments |
 | [`prepare-g1-service.py`](prepare-g1-service.py) | Renders and validates the account-specific Nano/G1 service from CloudFormation outputs |
-| [`submit-g1-generation.py`](submit-g1-generation.py) | Submits one prompt/source request through a localhost port-forward, optionally adds a paired edge-control video, and writes uniquely named output to S3 |
+| [`submit-g1-generation.py`](submit-g1-generation.py) | Submits one prompt/source request through a localhost port-forward, accepts local or S3-hosted paired edge-control videos, and writes uniquely named output to S3 |
 | [`cosmos3-job.yaml`](cosmos3-job.yaml) | Legacy self-contained one-shot Kubernetes Job that starts a server, generates once, uploads, and exits |
 | `infra/ec2.tf` | Terraform for the EC2 server instance |
 | `infra/eks.tf` | Terraform for the dedicated EKS cluster + GPU node group |

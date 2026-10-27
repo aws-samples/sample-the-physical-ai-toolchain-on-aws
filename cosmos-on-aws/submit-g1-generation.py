@@ -122,6 +122,43 @@ def object_exists(bucket: str, key: str, region: str) -> bool:
     raise RuntimeError(detail.strip() or f"unable to inspect s3://{bucket}/{key}")
 
 
+def parse_s3_uri(uri: str) -> tuple[str, str]:
+    parsed = urlparse(uri)
+    key = parsed.path.lstrip("/")
+    if (
+        parsed.scheme != "s3"
+        or not parsed.netloc
+        or not key
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"invalid S3 URI: {uri}")
+    return parsed.netloc, key
+
+
+def download_s3_object(
+    bucket: str,
+    key: str,
+    destination: Path,
+    region: str,
+) -> None:
+    run(
+        [
+            "aws",
+            "s3",
+            "cp",
+            f"s3://{bucket}/{key}",
+            str(destination),
+            "--region",
+            region,
+            "--only-show-errors",
+        ]
+    )
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError(f"S3 input is empty: s3://{bucket}/{key}")
+
+
 def normalize_video(
     source: Path,
     destination: Path,
@@ -358,14 +395,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deployment-name", default="cosmos3-g1-server")
     parser.add_argument("--input-key", default=DEFAULT_INPUT_KEY)
     parser.add_argument(
+        "--input-s3-uri",
+        help="S3 URI for the prepared source video; overrides --input-key",
+    )
+    parser.add_argument(
         "--input-file",
         type=Path,
         help="Local prepared source video; overrides --input-key",
     )
     parser.add_argument(
+        "--edge-control-s3-uri",
+        help="S3 URI for the paired 121-frame edge control video",
+    )
+    parser.add_argument(
         "--edge-control-file",
         type=Path,
-        help="Local 121-frame edge control video paired with --input-file",
+        help="Local 121-frame edge control video paired with the prepared source",
     )
     parser.add_argument("--output-prefix", default="cosmos3-generated")
     parser.add_argument("--timeout-minutes", type=int, default=30)
@@ -384,8 +429,12 @@ def main() -> int:
         )
         if args.timeout_minutes < 1 or args.timeout_minutes > 60:
             raise ValueError("timeout must be between 1 and 60 minutes")
-        if args.edge_control_file is not None and args.input_file is None:
-            raise ValueError("--edge-control-file requires the matching --input-file")
+        if args.input_file is not None and args.input_s3_uri:
+            raise ValueError("use only one of --input-file and --input-s3-uri")
+        if args.edge_control_file is not None and args.edge_control_s3_uri:
+            raise ValueError(
+                "use only one of --edge-control-file and --edge-control-s3-uri"
+            )
         for label, path in (
             ("input file", args.input_file),
             ("edge control file", args.edge_control_file),
@@ -415,6 +464,30 @@ def main() -> int:
             bucket = outputs.get("DataBucketName")
             if not bucket:
                 raise RuntimeError("DataBucketName was not found in stack outputs")
+
+        input_s3 = None
+        if args.input_file is None:
+            input_s3 = (
+                parse_s3_uri(args.input_s3_uri)
+                if args.input_s3_uri
+                else (bucket, args.input_key)
+            )
+        edge_s3 = (
+            parse_s3_uri(args.edge_control_s3_uri)
+            if args.edge_control_s3_uri
+            else None
+        )
+        for label, location in (
+            ("prepared source video", input_s3),
+            ("edge control video", edge_s3),
+        ):
+            if location is not None and not object_exists(
+                location[0], location[1], args.region
+            ):
+                raise RuntimeError(
+                    f"{label} was not found at s3://{location[0]}/{location[1]}"
+                )
+
         generated_name, reference_name = output_names(args.run_id)
         for name in (generated_name, reference_name):
             key = f"{args.output_prefix}/{name}"
@@ -438,17 +511,9 @@ def main() -> int:
             if args.input_file is not None:
                 shutil.copyfile(args.input_file.expanduser(), source)
             else:
-                run(
-                    [
-                        "aws",
-                        "s3",
-                        "cp",
-                        f"s3://{bucket}/{args.input_key}",
-                        str(source),
-                        "--region",
-                        args.region,
-                        "--only-show-errors",
-                    ]
+                assert input_s3 is not None
+                download_s3_object(
+                    input_s3[0], input_s3[1], source, args.region
                 )
             normalization_path = normalize_video(
                 source,
@@ -459,8 +524,15 @@ def main() -> int:
             print(f"PASS - Input normalized with {normalization_path}")
 
             edge_path = None
-            if args.edge_control_file is not None:
-                edge_source = args.edge_control_file.expanduser()
+            if args.edge_control_file is not None or edge_s3 is not None:
+                edge_source = work / "edge-control-source.mp4"
+                if args.edge_control_file is not None:
+                    shutil.copyfile(args.edge_control_file.expanduser(), edge_source)
+                else:
+                    assert edge_s3 is not None
+                    download_s3_object(
+                        edge_s3[0], edge_s3[1], edge_source, args.region
+                    )
                 edge_normalization_path = normalize_video(
                     edge_source,
                     edge_normalized,
