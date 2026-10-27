@@ -231,8 +231,42 @@ def build_create_command(
     negative_prompt: str,
     seed: int,
     video_path: Path,
+    edge_control_path: Path | None = None,
 ) -> list[str]:
-    return [
+    if edge_control_path is None:
+        size = "1280x720"
+        num_frames = 189
+        fps = 24
+        num_inference_steps = 35
+        guidance_scale = 6.0
+        extra_params = {
+            "condition_frame_indexes_vision": [0, 1],
+            "condition_video_keep": "first",
+        }
+    else:
+        # Match Jathavan's recorded Cosmos3-Nano transfer configuration.
+        size = "1104x832"
+        num_frames = 121
+        fps = 30
+        num_inference_steps = 50
+        guidance_scale = 3.0
+        extra_params = {
+            "condition_frame_indexes_vision": [0, 1],
+            "condition_video_keep": "first",
+            "edge": {"control_weight": 1.0},
+            "control_guidance": 2.0,
+            "max_frames": 121,
+            "num_video_frames_per_chunk": 121,
+            "num_conditional_frames": 1,
+            "num_first_chunk_conditional_frames": 0,
+            "share_vision_temporal_positions": True,
+            "emphasize_control_in_prompt": False,
+            "transfer_resize_mode": "center_crop",
+            "transfer_output_size": "model",
+            "resolution": "720",
+        }
+
+    command = [
         "curl",
         "-fsS",
         "-X",
@@ -247,26 +281,36 @@ def build_create_command(
         "--form-string",
         f"negative_prompt={negative_prompt}",
         "--form-string",
-        "size=1280x720",
+        f"size={size}",
         "--form-string",
-        "num_frames=189",
+        f"num_frames={num_frames}",
         "--form-string",
-        "fps=24",
+        f"fps={fps}",
         "--form-string",
-        "num_inference_steps=35",
+        f"num_inference_steps={num_inference_steps}",
         "--form-string",
-        "guidance_scale=6.0",
+        f"guidance_scale={guidance_scale}",
         "--form-string",
         "max_sequence_length=4096",
         "--form-string",
         "flow_shift=10.0",
         "--form-string",
-        'extra_params={"condition_frame_indexes_vision":[0,1],"condition_video_keep":"first"}',
+        "extra_params=" + json.dumps(extra_params, separators=(",", ":")),
         "--form-string",
         f"seed={seed}",
         "-F",
         f"input_reference=@{video_path};type=video/mp4",
     ]
+    if edge_control_path is not None:
+        command.extend(
+            [
+                "-F",
+                f"control_reference=@{edge_control_path};type=video/mp4",
+                "--form-string",
+                "control_type=edge",
+            ]
+        )
+    return command
 
 
 def wait_for_completion(server_url: str, video_id: str, timeout_minutes: int) -> None:
@@ -313,6 +357,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-url", default="http://127.0.0.1:8000")
     parser.add_argument("--deployment-name", default="cosmos3-g1-server")
     parser.add_argument("--input-key", default=DEFAULT_INPUT_KEY)
+    parser.add_argument(
+        "--input-file",
+        type=Path,
+        help="Local prepared source video; overrides --input-key",
+    )
+    parser.add_argument(
+        "--edge-control-file",
+        type=Path,
+        help="Local 121-frame edge control video paired with --input-file",
+    )
     parser.add_argument("--output-prefix", default="cosmos3-generated")
     parser.add_argument("--timeout-minutes", type=int, default=30)
     return parser.parse_args()
@@ -330,6 +384,14 @@ def main() -> int:
         )
         if args.timeout_minutes < 1 or args.timeout_minutes > 60:
             raise ValueError("timeout must be between 1 and 60 minutes")
+        if args.edge_control_file is not None and args.input_file is None:
+            raise ValueError("--edge-control-file requires the matching --input-file")
+        for label, path in (
+            ("input file", args.input_file),
+            ("edge control file", args.edge_control_file),
+        ):
+            if path is not None and not path.expanduser().is_file():
+                raise ValueError(f"{label} does not exist: {path}")
         for executable in ("aws", "curl"):
             if shutil.which(executable) is None:
                 raise RuntimeError(f"required command is not installed: {executable}")
@@ -370,20 +432,24 @@ def main() -> int:
             work = Path(directory)
             source = work / "reference-source.mp4"
             normalized = work / "reference-h264.mp4"
+            edge_normalized = work / "edge-control-h264.mp4"
             generated = work / "generated.mp4"
 
-            run(
-                [
-                    "aws",
-                    "s3",
-                    "cp",
-                    f"s3://{bucket}/{args.input_key}",
-                    str(source),
-                    "--region",
-                    args.region,
-                    "--only-show-errors",
-                ]
-            )
+            if args.input_file is not None:
+                shutil.copyfile(args.input_file.expanduser(), source)
+            else:
+                run(
+                    [
+                        "aws",
+                        "s3",
+                        "cp",
+                        f"s3://{bucket}/{args.input_key}",
+                        str(source),
+                        "--region",
+                        args.region,
+                        "--only-show-errors",
+                    ]
+                )
             normalization_path = normalize_video(
                 source,
                 normalized,
@@ -391,6 +457,23 @@ def main() -> int:
                 args.run_id,
             )
             print(f"PASS - Input normalized with {normalization_path}")
+
+            edge_path = None
+            if args.edge_control_file is not None:
+                edge_source = args.edge_control_file.expanduser()
+                edge_normalization_path = normalize_video(
+                    edge_source,
+                    edge_normalized,
+                    args.deployment_name,
+                    args.run_id,
+                )
+                edge_path = edge_normalized
+                print(f"PASS - Edge control normalized with {edge_normalization_path}")
+                print(
+                    "PASS - Edge profile: 121 frames, 30 FPS, 50 steps, "
+                    "guidance 3.0, control guidance 2.0, edge weight 1.0"
+                )
+
             response = run(
                 build_create_command(
                     args.server_url,
@@ -399,6 +482,7 @@ def main() -> int:
                     args.negative_prompt,
                     args.seed,
                     normalized,
+                    edge_path,
                 ),
                 capture=True,
             )

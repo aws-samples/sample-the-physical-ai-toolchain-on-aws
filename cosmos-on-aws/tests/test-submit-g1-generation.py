@@ -44,6 +44,30 @@ class SubmitG1GenerationTest(unittest.TestCase):
             ),
         )
 
+    def test_edge_request_contains_source_control_and_recorded_settings(self) -> None:
+        command = MODULE.build_create_command(
+            "http://127.0.0.1:8000",
+            "/models/cosmos3-nano",
+            "Preserve the source motion under warm lighting.",
+            "jittery, deformed hands",
+            2026,
+            Path("/work/source.mp4"),
+            Path("/work/control-edge.mp4"),
+        )
+        joined = "\n".join(command)
+        self.assertIn("input_reference=@/work/source.mp4;type=video/mp4", joined)
+        self.assertIn(
+            "control_reference=@/work/control-edge.mp4;type=video/mp4", joined
+        )
+        self.assertIn("control_type=edge", joined)
+        self.assertIn("size=1104x832", joined)
+        self.assertIn("num_frames=121", joined)
+        self.assertIn("fps=30", joined)
+        self.assertIn("num_inference_steps=50", joined)
+        self.assertIn("guidance_scale=3.0", joined)
+        self.assertIn('"control_guidance":2.0', joined)
+        self.assertIn('"control_weight":1.0', joined)
+
     def test_s3_output_preflight_distinguishes_missing_and_existing(self) -> None:
         with mock.patch.object(
             MODULE.subprocess,
