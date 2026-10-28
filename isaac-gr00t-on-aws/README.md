@@ -120,6 +120,10 @@ SageMaker deployment for N1.7 on `ml.g6e.12xlarge` (4 GPUs, DeepSpeed ZeRO requi
 
 Terraform-based Batch deployment for N1.6: Foundation → VPC → Batch compute → Container build → Job submission → S3 checkpoints. **Fully validated end-to-end** with UR3 teleoperation data.
 
+### [Run from VAMS (optional) →](../workflows/vams-bridge/README.md)
+
+Launch fine-tuning from the [Visual Asset Management System (VAMS)](https://github.com/awslabs/visual-asset-management-system) on a dataset asset and get the model written back to it. Deploys on top of the Batch (or SageMaker Pipeline) setup above; nothing here needs it.
+
 ---
 
 ## GR00T N1.6 vs N1.7

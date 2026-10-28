@@ -1,0 +1,53 @@
+{
+    "templateId": "sagemaker-pipeline",
+    "templateName": "SageMaker Pipeline (groot-finetune-pipeline)",
+    "description": "Runs the toolchain's groot-finetune-pipeline SageMaker Pipeline: Train, then RegisterModel into the groot-models model package group. The production shape when a model-registry entry is wanted.",
+    "isDefault": true,
+    "configFormat": "json",
+    "configBody": "{\"engine\":\"sagemaker-pipeline\",\"maxSteps\":{{MAX_STEPS}},\"batchSize\":{{BATCH_SIZE}},\"baseModel\":\"{{BASE_MODEL}}\",\"instanceType\":\"{{INSTANCE_TYPE}}\"}",
+    "allowCustomEdit": false,
+    "inputInstructions": "Select the asset holding a LeRobot v2 dataset (parquet episodes, mp4 videos and the meta/*.json files). The whole asset is staged to the toolchain's datasets bucket, validated, and the groot-finetune-pipeline is started. The checkpoint (model.tar.gz), the evaluation report and the registered ModelPackageArn are written back to this asset under a per-run folder.\n\nThe Hugging Face token is read from the toolchain account's Secrets Manager at submit time; it is never a form field.",
+    "tagSchema": [
+        {
+            "tagKey": "MAX_STEPS",
+            "type": "integer",
+            "required": false,
+            "default": 5000,
+            "label": "Max training steps",
+            "description": "Number of optimiser steps. The toolchain's smoke test uses 50; a real run uses 5000 or more."
+        },
+        {
+            "tagKey": "BATCH_SIZE",
+            "type": "integer",
+            "required": false,
+            "default": 32,
+            "label": "Global batch size",
+            "description": "Must be divisible by the GPU count of the chosen instance type."
+        },
+        {
+            "tagKey": "BASE_MODEL",
+            "type": "enum",
+            "required": false,
+            "default": "nvidia/GR00T-N1.5-3B",
+            "enumValues": [
+                "nvidia/GR00T-N1.5-3B",
+                "nvidia/GR00T-N1.6-3B"
+            ],
+            "label": "Base model",
+            "description": "Hugging Face model id the container fine-tunes from."
+        },
+        {
+            "tagKey": "INSTANCE_TYPE",
+            "type": "enum",
+            "required": false,
+            "default": "ml.g5.12xlarge",
+            "enumValues": [
+                "ml.g5.12xlarge",
+                "ml.g6e.12xlarge",
+                "ml.p4d.24xlarge"
+            ],
+            "label": "Training instance type",
+            "description": "SageMaker training instance. Quota for the instance family must exist in the toolchain account."
+        }
+    ]
+}
