@@ -1,10 +1,10 @@
 version: 0.2
 
-# Builds the Isaac Lab RL training container in CodeBuild and pushes it to ECR.
-# Base image is from NVIDIA NGC (nvcr.io), so an NGC API key is required.
+# Builds the Isaac Lab 3 G1 training container in CodeBuild and pushes it to ECR.
+# The base image is from NVIDIA NGC, so an NGC API key is required.
 #
-# Env vars provided by the ContainerBuild construct:
-#   ECR_REPO_URI        - full ECR repo URI (…/physical-ai/isaac-lab)
+# Environment variables provided by the ContainerBuild construct:
+#   ECR_REPO_URI        - full ECR repository URI (…/physical-ai/isaac-lab)
 #   AWS_DEFAULT_REGION  - build region
 #   NGC_SECRET_NAME     - Secrets Manager secret holding the NGC API key
 
@@ -20,13 +20,14 @@ phases:
       - echo "$NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
   build:
     commands:
-      - echo "Building isaac-lab-training image (this can take a while — ~16 GB NGC base)..."
-      # Dockerfile COPYs paths relative to the repo root (training/, workflows/),
-      # so the build context is the repo root and we point -f at the Dockerfile.
-      - docker build --platform linux/amd64 -t isaac-lab-training -f containers/isaac-lab/Dockerfile .
-      - docker tag isaac-lab-training:latest "$ECR_REPO_URI:latest"
+      - echo "Building Isaac Lab 3.0.0-beta2 G1 image..."
+      # Dockerfile COPYs paths relative to the repository root.
+      - docker build --platform linux/amd64 -t isaac-lab-training:3.0.0-beta2-g1 -f containers/isaac-lab/Dockerfile .
+      - docker tag isaac-lab-training:3.0.0-beta2-g1 "$ECR_REPO_URI:3.0.0-beta2-g1"
+      - docker tag isaac-lab-training:3.0.0-beta2-g1 "$ECR_REPO_URI:latest"
   post_build:
     commands:
-      - echo "Pushing to ECR..."
+      - echo "Pushing versioned and convenience tags to ECR..."
+      - docker push "$ECR_REPO_URI:3.0.0-beta2-g1"
       - docker push "$ECR_REPO_URI:latest"
-      - 'echo "Done. Image: $ECR_REPO_URI:latest"'
+      - 'echo "Done. Image: $ECR_REPO_URI:3.0.0-beta2-g1"'

@@ -27,7 +27,7 @@ def main():
     else:
         hyperparams = {}
 
-    task = hyperparams.get("task", "Isaac-Velocity-Flat-Anymal-D-v0")
+    task = hyperparams.get("task", "Isaac-Velocity-Flat-G1-v0")
     num_envs = hyperparams.get("num_envs", "128")
     max_iterations = hyperparams.get("max_iterations", "2")
     experiment_name = hyperparams.get("experiment_name", "sagemaker_run")
@@ -50,7 +50,7 @@ def main():
     # Use the isaaclab.sh wrapper which sets up the correct Python environment
     cmd = [
         "/workspace/isaaclab/isaaclab.sh", "-p",
-        "scripts/reinforcement_learning/rsl_rl/train.py",
+        "/workspace/isaaclab/scripts/reinforcement_learning/rsl_rl/train.py",
         "--task", task,
         "--num_envs", str(num_envs),
         "--max_iterations", str(max_iterations),
@@ -62,6 +62,7 @@ def main():
 
     env = os.environ.copy()
     env["ACCEPT_EULA"] = "Y"
+    env["PRIVACY_CONSENT"] = "Y"
     env["OMNI_ENV_PRIVACY_CONSENT"] = "Y"
 
     # Security: cmd is constructed from validated argparse inputs and known Isaac Lab

@@ -6,8 +6,8 @@ Launches an Isaac Lab reinforcement-learning training job on SageMaker using the
 (or smoke-test) an RL policy in simulation with no GR00T / imitation-learning stage
 and no Lab 1 dependency.
 
-The validated path uses Isaac Lab's built-in tasks (e.g.
-`Isaac-Velocity-Flat-Anymal-D-v0`), which run end-to-end today. The custom UR3
+The validated path uses Isaac Lab's built-in
+`Isaac-Velocity-Flat-G1-v0` task. The custom UR3
 pick-and-place task (`PickAndPlaceUR3-v0`) IS gym-registered (training/envs/__init__.py)
 but is NOT yet wired into the container's training entrypoint and is GPU-unvalidated
 — see docs/ROADMAP.md (Feature 2) — so it will not resolve in a training job until
@@ -65,8 +65,8 @@ def _isaac_lab_image() -> str:
         return os.environ["ISAAC_LAB_IMAGE"]
     ecr_uri = _ssm_get(f"/{PROJECT_NAME}/ecr/isaac-lab")
     if ecr_uri:
-        return f"{ecr_uri}:latest" if ":latest" not in ecr_uri else ecr_uri
-    return f"{_account()}.dkr.ecr.{REGION}.amazonaws.com/{PROJECT_NAME}/isaac-lab:latest"
+        return f"{ecr_uri}:3.0.0-beta2-g1" if ":" not in ecr_uri.rsplit("/", 1)[-1] else ecr_uri
+    return f"{_account()}.dkr.ecr.{REGION}.amazonaws.com/{PROJECT_NAME}/isaac-lab:3.0.0-beta2-g1"
 
 
 def _bucket() -> str:
@@ -130,7 +130,7 @@ def launch(task: str, num_envs: int, max_iterations: int, framework: str,
 
     if task.startswith("PickAndPlaceUR3") or task.startswith("PickAndPlace-UR3"):
         print("\n  WARNING: the UR3 task is not yet GPU-validated and won't resolve in a "
-              "training job. Use a built-in task (e.g. Isaac-Velocity-Flat-Anymal-D-v0).\n")
+              "training job. Use the validated Isaac-Velocity-Flat-G1-v0 task.\n")
 
     if instance_count > 1:
         print(f"  NOTE: Multi-node training ({instance_count} instances) is wired but "
@@ -151,8 +151,8 @@ def launch(task: str, num_envs: int, max_iterations: int, framework: str,
 
 def main():
     p = argparse.ArgumentParser(description="Standalone Isaac Lab RL launcher (no GR00T)")
-    p.add_argument("--task", default="Isaac-Velocity-Flat-Anymal-D-v0",
-                   help="Isaac Lab task id (built-in tasks work today; UR3 registered but not container-wired)")
+    p.add_argument("--task", default="Isaac-Velocity-Flat-G1-v0",
+                   help="Isaac Lab task id (G1 flat locomotion is the validated default)")
     p.add_argument("--num-envs", type=int, default=4096)
     p.add_argument("--max-iterations", type=int, default=50)
     p.add_argument("--framework", default="rsl_rl", choices=["rsl_rl", "skrl", "rl_games"])
