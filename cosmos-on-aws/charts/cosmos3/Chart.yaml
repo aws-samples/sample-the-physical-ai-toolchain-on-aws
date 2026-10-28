@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cosmos3
+version: 0.1.0
+appVersion: "cosmos3"
+description: Private reusable NVIDIA Cosmos 3 inference service for EKS
+type: application
