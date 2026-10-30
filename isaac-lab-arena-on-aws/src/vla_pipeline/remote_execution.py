@@ -13,6 +13,17 @@ from .operations import timestamp
 from . import remote_commands
 
 
+def apply_host_observations(record, remote):
+    """Carry verified host results while preserving the initiating profile and request."""
+    for key in ("status", "unit", "run_dir", "activity", "failure_reason", "receipt_uri",
+                "elapsed_seconds", "requested_steps", "complete_training_workflow",
+                "independently_verified", "verification_status", "verification_scope",
+                "contract_checks", "outputs", "cancellation_requested", "cleanup",
+                 "service_state", "last_log_age_seconds", "episodes", "success_rate", "evidence_archive"):
+        if key in remote:
+            record[key] = remote[key]
+
+
 def exchange(record, action, store, *, wait=True):
     with store.lock("runs", record["id"]):
         current = store.load("runs", record["id"])
@@ -35,7 +46,8 @@ def _exchange(record, action, store, *, wait):
     terminal_failure = entry and entry.get("status") in {
         "Failed", "TimedOut", "Cancelled", "DeliveryTimedOut", "ExecutionTimedOut",
     }
-    if entry is None or (action == "status" and (entry.get("response_received") or terminal_failure)):
+    if entry is None or (action in {"status", "cleanup"} and
+                         (entry.get("response_received") or terminal_failure)):
         if terminal_failure:
             record.setdefault("remote_action_history", []).append({"action": action, **entry})
         token = uuid.uuid4().hex
@@ -61,7 +73,7 @@ def _exchange(record, action, store, *, wait):
     ])
     remote_commands.submit(ssm, target["instance_id"], entry,
                            ["bash -c " + shlex.quote(command)], save,
-                           timeout=43200 if action == "verify" else 600,
+                            timeout=43200 if action == "verify" else 3600 if action in {"cleanup", "report"} else 600,
                            bucket=target["development_bucket"])
     while True:
         observed = remote_commands.observe(ssm, target["instance_id"], entry)
@@ -121,15 +133,7 @@ def _exchange(record, action, store, *, wait):
             or remote["request"]["steps"] != record["request"]["steps"]):
         raise ValueError("Host result differs from the submitted request")
     # Keep the initiating profile, paths and transport request; copy observations.
-    for key in ("status", "unit", "run_dir", "activity", "failure_reason", "receipt_uri",
-                "elapsed_seconds", "requested_steps", "complete_training_workflow",
-                "independently_verified", "verification_status", "verification_scope",
-                "outputs", "cancellation_requested"):
-        if key in remote:
-            record[key] = remote[key]
-    for key in ("service_state", "last_log_age_seconds", "episodes", "success_rate"):
-        if key in remote:
-            record[key] = remote[key]
+    apply_host_observations(record, remote)
     record.pop("transport_activity", None)
     save()
     return record

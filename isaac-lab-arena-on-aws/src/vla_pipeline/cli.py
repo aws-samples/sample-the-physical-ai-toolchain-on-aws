@@ -7,16 +7,19 @@ import json
 import sys
 
 from .operations import Store
+from .cli_context import command_context, command_name
 
 
 def parser():
+    prog = command_name()
     root = argparse.ArgumentParser(
-        prog="vla", description="Train a VLA model, evaluate it, validate evidence and register it."
+        prog=prog, description="Train a VLA model, evaluate it, validate evidence and register it."
     )
     root.add_argument("--state-dir", help="Persistent CLI records; overrides VLA_STATE_DIR "
                       "(default: ~/.local/state/vla)")
     root.add_argument("--json", action="store_true", help="Print machine-readable results")
     root.add_argument("--debug", action="store_true", help="Include a traceback when a command fails")
+    root.add_argument("--config", help="Shared toolchain config.json; defaults to the repository root file")
     commands = root.add_subparsers(dest="command", required=True)
     cells = commands.add_parser("cells", help="List supported model/simulator selections")
     cells.add_argument("--cell", help="Inspect one named cell from the catalog")
@@ -26,7 +29,7 @@ def parser():
     deploy = commands.add_parser(
         "deploy", help="Prepare infrastructure/images/host, or select an existing deployment"
     )
-    deploy.add_argument("--name", required=True, help="Name for saved preparation; runs use --deployment NAME")
+    deploy.add_argument("--name", help="Saved deployment name; default: arena.deployment_name in config.json")
     deploy.add_argument("--use-existing", action="store_true",
                         help="Read/check existing resources; never build or change infrastructure")
     deploy.add_argument("--prepare-host", action="store_true",
@@ -36,10 +39,11 @@ def parser():
     deploy.add_argument("--plan", action="store_true", help="Show/save preparation plans without applying them")
     deploy.add_argument("--yes", action="store_true", help="Apply displayed preparation plans noninteractively")
     deploy.add_argument("--profile", help="Provisioning AWS profile; omit on an instance-role host")
-    deploy.add_argument("--region", default="us-east-1", help="Application region (only us-east-1)")
+    deploy.add_argument("--region", help="Application region (default from config, otherwise us-east-1)")
+    deploy.add_argument("--account-id", help="Expected AWS account; default: arena.account_id in config.json")
     deploy.add_argument("--project", help="Foundation project (default: physical-ai, or saved selection)")
     deploy.add_argument("--environment", help="Resource environment suffix (default: dev)")
-    deploy.add_argument("--cell", action="append", help="One or more cells to prepare; see vla cells")
+    deploy.add_argument("--cell", action="append", help=f"One or more cells to prepare; see {prog} cells")
     deploy.add_argument("--image", action="append", default=[], metavar="STEP=ECR_URI",
                         help="Select a published FineTune or SimEval image; repeat per step "
                         "for one cell, using full private ECR URIs")
@@ -48,38 +52,48 @@ def parser():
     deploy.add_argument("--expected-role", help="Expected EC2 instance-role name for local execution")
     deploy.add_argument("--scratch-root", help="Working path on the host's separately mounted scratch disk")
     deploy.add_argument("--local-host", help="Existing GPU EC2 instance ID to prepare or select")
+    deploy.add_argument("--create-local-host", metavar="TYPE",
+                        help="Create and prepare a GPU EC2 instance of this type; omit for managed-only use")
+    deploy.add_argument("--gpu-zone", help="Optional availability zone for a newly created GPU EC2 instance")
+    deploy.add_argument("--hf-token-file", help="Private plaintext HF token file for creating the deployment's secret")
+    deploy.add_argument("--ngc-token-file", help="Private plaintext NGC token file for creating the deployment's secret")
     deploy.add_argument("--host-region", help="Region of the EC2 host; may differ from --region")
     deploy.add_argument("--hf-secret-name", help="Existing plaintext token secret (default: vla-pipeline/hf-token)")
     deploy.add_argument("--ngc-secret-name", help="Existing plaintext token secret (default: vla-pipeline/ngc-token)")
     deploy.add_argument("--input-s3-arn", action="append",
                         help="Additional managed input bucket/object ARN; repeat as required")
+    deploy.add_argument("--existing-ecr-repo", action="append", default=[],
+                        choices=["vla/gr00t", "vla/openvla", "vla/molmoact2", "vla/isaac-arena"],
+                        help="For a new deployment, reference this existing image repository "
+                        "without taking ownership; repeat for each externally owned repository")
 
     run = commands.add_parser(
         "run", help="Execute a cell; the default is the complete workflow",
-        description="Budgets and managed GPU instances are required choices. "
+        description="Select a cell, execution mode and budgets, or use --sample. "
                     "The full graph runs unless an explicit input or stopping point changes it.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Required choices:
+        epilog=f"""Required choices:
   Select --cell, or --model/--simulator/--suite (plus --model-version for gr00t).
-  Always supply --deployment, --mode and --max-runtime-seconds.
+  Supply --mode. Deployment, cell, hardware and runtime may come from config.json.
   FineTune requires --train-steps; SimEval requires --eval-trials.
   SuccessGate requires --threshold (0 is a workflow sample, not a quality bar).
-  Managed mode requires --instance STEP=TYPE for each selected GPU step.
+  --sample supplies 200 training steps, 3 trials and threshold 0; explicit flags win.
+  Managed mode requires an instance choice per GPU step, via config or --instance.
   Local mode uses the prepared GPU host; omit --instance.
 
 Examples after deployment:
-  vla run --deployment arena --cell gr00t-n16-arena --mode local \\
+  {prog} run --deployment arena --cell gr00t-n16-arena --mode local \\
     --train-steps 200 --eval-trials 3 --eval-seed 100 --threshold 0 \\
     --max-runtime-seconds 21600
-  vla run --deployment arena --cell gr00t-n16-arena --mode managed \\
+  {prog} run --deployment arena --cell gr00t-n16-arena --mode managed \\
     --instance FineTune=ml.g6e.xlarge --instance SimEval=ml.g6e.xlarge \\
     --train-steps 200 --eval-trials 3 --threshold 0 --max-runtime-seconds 21600
 
 Use --checkpoint-s3 to omit FineTune, or --through to stop after a named step.
-Inspect supported choices and declared resources with vla cells --details.""",
+Inspect supported choices and declared resources with {prog} cells --details.""",
     )
-    run.add_argument("--deployment", required=True, help="Saved deployment name from vla deploy")
-    run.add_argument("--cell", help="Named model/simulator/suite combination from vla cells")
+    run.add_argument("--deployment", help="Saved deployment name; default: arena.deployment_name in config.json")
+    run.add_argument("--cell", help=f"Named model/simulator/suite combination from {prog} cells")
     run.add_argument("--model", help="Explicit model alternative to --cell: gr00t, molmoact2 or openvla")
     run.add_argument("--model-version", choices=["n16", "n17"],
                      help="Required with explicit --model gr00t; omit for other models")
@@ -95,13 +109,15 @@ Inspect supported choices and declared resources with vla cells --details.""",
                      "does not resize local disks")
     run.add_argument("--image", action="append", default=[], metavar="STEP=ECR_URI",
                      help="Published FineTune or SimEval image override; otherwise use saved images")
+    run.add_argument("--sample", action="store_true",
+                     help="Real short run: 200 training steps, 3 evaluation trials, threshold 0. "
+                     "Explicit flags override sample defaults; checkpoint reuse still skips training.")
+    run.add_argument("--record-video", action=argparse.BooleanOptionalAction, default=None,
+                     help="Record Arena evaluation video; config may select auto for supported cells")
     run.add_argument("--train-steps", type=int, help="Positive training-step count; required with FineTune")
     run.add_argument("--eval-trials", type=int,
                      help="Required with SimEval: episodes total for Arena, per task for LIBERO")
     run.add_argument("--eval-seed", type=int, help="Rollout seed (default: Arena 100, LIBERO 1000)")
-    run.add_argument("--record-video", action="store_true",
-                     help="Arena only: save a rollout mp4 into SimEval's artifacts. Diagnostic; "
-                          "renders the scene, so it is not the measured reference configuration")
     run.add_argument("--threshold", type=float,
                      help="Required with SuccessGate: success rate from 0 to 1; 0 checks workflow only")
     run.add_argument("--max-runtime-seconds", type=int, help="GPU job deadline; does not limit a status watcher")
@@ -136,6 +152,20 @@ Inspect supported choices and declared resources with vla cells --details.""",
                         help="Following allowance; never cancels the workload (default: 86400)")
     stop = commands.add_parser("stop", help="Cancel one recorded execution; preserve its host and evidence")
     stop.add_argument("id", help="Saved run name to cancel")
+    cleanup = commands.add_parser("cleanup", help="Stop owned work; archive/remove verified local containers")
+    cleanup.add_argument("id", help="Saved run name")
+    cleanup.add_argument("--yes", action="store_true", help="Apply; otherwise print the cleanup plan")
+    cleanup.add_argument("--timeout-seconds", type=int, default=3600,
+                         help="Cancellation/archive allowance (default: 3600)")
+    report = commands.add_parser("report", help="Verify and export the exact run's results and recordings")
+    report.add_argument("id", help="Saved run ID")
+    report.add_argument("--output-dir", help="Directory for this run's evidence and readable summary")
+    report.add_argument("--include-video", action="store_true", help="Export this run's recorded videos when available")
+    destroy = commands.add_parser("destroy", help="Preserve evidence and remove this deployment's owned resources")
+    destroy.add_argument("id", help="Saved deployment name")
+    destroy.add_argument("--yes", action="store_true", help="Execute the displayed teardown; otherwise print a plan")
+    destroy.add_argument("--remove-evidence", action="store_true",
+                         help="Verify a local archive before removing the temporary AWS archive bucket")
     return root
 
 
@@ -240,27 +270,79 @@ def show(value, as_json):
     if value.get("episodes") is not None:
         print(f"  Evaluation episodes: {value['episodes']}; success rate: {value.get('success_rate')}")
         print("  A workflow sample with a zero threshold does not establish model quality.")
+    if value.get("cleanup"):
+        print("  Cleanup: " + json.dumps(value["cleanup"], default=str))
+    if value.get("readiness_checks"):
+        checks = value["readiness_checks"]
+        print("  Current deployment checks:")
+        print(f"    PASS  AWS account: {checks['configured_account']}")
+        print(f"    {checks['published_images'].upper()}  Published images: {checks['published_image_count']}")
+        if checks.get("instance_id"):
+            print(f"    EC2 {checks['instance_id']} ({checks['instance_type']}): "
+                  f"{checks['instance_state']}; SSM {checks['ssm_status']}")
+        host = checks.get("host", {})
+        if host:
+            print(f"    PASS  Checkout: {host['source_commit']}")
+            print(f"    GPU: {host['gpu']}")
+            for name, disk in host["disks"].items():
+                print(f"    {'PASS' if disk['passed'] else 'FAIL'}  {name} disk: "
+                      f"{disk['free_gib']:.2f} GiB free / {disk['required_gib']} GiB sample reserve")
+            print(f"    {'PASS' if host['scratch_is_separate'] else 'FAIL'}  Scratch uses a separate filesystem")
+            missing = [uri for uri, identity in host["images"].items() if not identity]
+            print(f"    {'PASS' if not missing else 'FAIL'}  Selected images present on GPU host")
+            print(f"    Sample readiness: {'passed' if host['sample_ready'] else 'not ready'}")
+    if value.get("absence_checks"):
+        print("  Fresh AWS removal checks:")
+        for name, values in value["absence_checks"].items():
+            print(f"    PASS  {name.replace('_', ' ')}: {values}")
+    if value.get("local_evidence"):
+        print("  Verified local evidence: " + json.dumps(value["local_evidence"], default=str))
+    for name in ("retained_archive", "removed_archive", "report_directory"):
+        if value.get(name):
+            print(f"  {name.replace('_', ' ')}: {value[name]}")
+    if value.get("status") == "TeardownPlan":
+        print("  Owned resources:", value["owned_resources"])
+        print("  Recorded runs:", ", ".join(value["runs"]) or "none")
+        print("  Steps:", " → ".join(value["steps"]))
+        print("  Retains:", value["retains"])
 
 
-def main(argv=None):
+def main(argv=None, *, prog="vla"):
+    with command_context(prog):
+        return _main(argv)
+
+
+def _main(argv):
     command = parser()
     args = command.parse_args(argv)
     store = Store(args.state_dir)
     try:
+        from .cli_settings import apply_settings
+        apply_settings(args)
         if getattr(args, "watch_timeout_seconds", 1) <= 0:
             raise ValueError("--watch-timeout-seconds must be positive")
         if args.command == "cells":
             show(catalog(args), args.json)
         elif args.command == "deploy":
+            if args.create_local_host and any((args.local_host, args.use_existing, args.prepare_host)):
+                raise ValueError("--create-local-host cannot be combined with a supplied host or existing selection")
+            if args.gpu_zone and not args.create_local_host and not args.resume:
+                raise ValueError("--gpu-zone requires --create-local-host")
+            if args.resume and any((args.create_local_host, args.gpu_zone, args.hf_token_file, args.ngc_token_file)):
+                raise ValueError("--resume uses the saved request; omit new host/token choices")
             if args.use_existing and any((args.prepare_host, args.resume, args.plan, args.yes,
                                           args.environment, args.hf_secret_name, args.ngc_secret_name,
-                                          args.input_s3_arn)):
+                                          args.input_s3_arn, args.existing_ecr_repo,
+                                          args.hf_token_file, args.ngc_token_file)):
                 raise ValueError("--use-existing is selection only; omit provisioning/host-preparation flags")
             if args.resume and any((args.prepare_host, args.cell, args.image, args.selection,
                                     args.local_host, args.host_region, args.development_bucket,
                                     args.expected_role, args.scratch_root, args.project, args.environment,
-                                    args.hf_secret_name, args.ngc_secret_name, args.input_s3_arn)):
+                                    args.hf_secret_name, args.ngc_secret_name, args.input_s3_arn,
+                                    args.existing_ecr_repo)):
                 raise ValueError("--resume uses the saved request; omit new preparation choices")
+            if args.prepare_host and any((args.existing_ecr_repo, args.hf_token_file, args.ngc_token_file)):
+                raise ValueError("Repository ownership and token files apply only to a new infrastructure deployment")
             with contextlib.redirect_stdout(sys.stderr):
                 if args.use_existing:
                     from .deployment import select_existing
@@ -279,6 +361,8 @@ def main(argv=None):
             if args.offline and not args.dry_run:
                 raise ValueError("--offline requires --dry-run")
             deployment = store.load("deployments", args.deployment)
+            if args.configured_account and deployment["account_id"] != args.configured_account:
+                raise ValueError("Saved deployment account differs from arena.account_id in config.json")
             with contextlib.redirect_stdout(sys.stderr):
                 request = prepare(request, deployment, check_remote=not args.offline)
             if args.dry_run:
@@ -312,7 +396,12 @@ def main(argv=None):
                         from .deployment_status import follow_deployment
                         return follow_deployment(store, args.id, as_json=args.json,
                                                  timeout_seconds=args.watch_timeout_seconds)
-                    show(store.load("deployments", args.id), args.json)
+                    deployment = store.load("deployments", args.id)
+                    if deployment.get("lifecycle"):
+                        from .lifecycle import inspect
+                        with contextlib.redirect_stdout(sys.stderr):
+                            deployment = inspect(deployment, store)
+                    show(deployment, args.json)
             else:
                 if args.follow:
                     raise ValueError("--follow requires a run ID")
@@ -328,13 +417,35 @@ def main(argv=None):
             if args.json:
                 show(record, True)
             else:
-                print(f"Cancellation requested for {args.id}; inspect with vla status {args.id}")
+                print(f"Cancellation requested for {args.id}; inspect with "
+                      f"{command_name()} status {args.id}")
+        elif args.command == "cleanup":
+            from .cleanup import cleanup
+            with contextlib.redirect_stdout(sys.stderr):
+                result = cleanup(store.load("runs", args.id), store, execute=args.yes,
+                                 timeout_seconds=args.timeout_seconds)
+            if args.yes:
+                show(result, args.json)
+            else:
+                print(json.dumps(result, indent=2))
+        elif args.command == "report":
+            from .reporting import report
+            with contextlib.redirect_stdout(sys.stderr):
+                result = report(store.load("runs", args.id), store, output_dir=args.output_dir,
+                                include_video=args.include_video)
+            show(result, args.json)
+        elif args.command == "destroy":
+            from .lifecycle import destroy
+            with contextlib.redirect_stdout(sys.stderr):
+                result = destroy(store.load("deployments", args.id), store, execute=args.yes,
+                                 remove_evidence=args.remove_evidence)
+            show(result, args.json)
         return 0
     except KeyboardInterrupt:
         if args.command == "deploy":
             print(f"Preparation interrupted; submitted builds/host commands may still be running. "
-                  f"Inspect vla status {args.name}, then continue with "
-                  f"vla deploy --name {args.name} --resume.", file=sys.stderr)
+                  f"Inspect {command_name()} status {args.name}, then continue with "
+                  f"{command_name()} deploy --name {args.name} --resume.", file=sys.stderr)
         else:
             print("Stopped watching; no workload cancellation was requested.", file=sys.stderr)
         return 130
@@ -343,7 +454,7 @@ def main(argv=None):
             import traceback
             traceback.print_exc(file=sys.stderr)
         else:
-            print(f"vla: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"{command_name()}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 

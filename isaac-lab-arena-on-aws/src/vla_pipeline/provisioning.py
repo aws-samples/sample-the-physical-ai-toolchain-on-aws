@@ -1,7 +1,6 @@
 """Coordinate the existing deployment recipes with durable state and explicit plans."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -13,6 +12,9 @@ from pathlib import Path
 from .backend import COMPONENT
 from .deployment import aws_session, discover
 from .operations import timestamp, validate_name, write_json
+from .cli_context import command_name
+
+COMPONENT_REPOSITORIES = ("vla/gr00t", "vla/openvla", "vla/molmoact2", "vla/isaac-arena")
 
 
 def secret_check(session, names):
@@ -29,15 +31,60 @@ def secret_check(session, names):
     return results
 
 
+def model_access_check(session, request):
+    """Check selected GR00T model/data access before starting paid image builds."""
+    from urllib.error import HTTPError
+    from urllib.parse import quote, urlparse
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+    from .registry import named_cells, resolve_suite
+
+    # Redirects to a storage CDN must not receive the caller's HF token.
+    class Redirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if redirected is not None and urlparse(newurl).hostname != "huggingface.co":
+                redirected.remove_header("Authorization")
+            return redirected
+
+    token = session.client("secretsmanager").get_secret_value(
+        SecretId=request["hf_secret_name"], VersionStage="AWSCURRENT")["SecretString"].strip()
+    opener = build_opener(Redirect())
+    paths = {"https://huggingface.co/api/whoami-v2"}
+    defaults = json.loads((COMPONENT / "entrypoints/train/gr00t/defaults.json").read_text())
+    for name in request["cells"]:
+        cell = named_cells()[name]
+        if cell["model"] != "gr00t":
+            continue
+        suffix = "_n16" if cell["version"] == "n16" else ""
+        repo = defaults["base_checkpoint" + suffix]
+        revision = defaults["base_checkpoint_hf_revision" + suffix]
+        paths.add(f"https://huggingface.co/{repo}/resolve/{revision}/config.json")
+        dataset = resolve_suite(cell["suite"]).dataset
+        if dataset:
+            file = "/".join(filter(None, (dataset.subdir, "meta/info.json")))
+            paths.add("https://huggingface.co/datasets/" + dataset.repo_id + "/resolve/"
+                      + quote(dataset.revision or "main", safe="") + "/" + file)
+    checked = []
+    for url in sorted(paths):
+        method = "GET" if url.endswith("/whoami-v2") else "HEAD"
+        try:
+            with opener.open(Request(url, method=method, headers={"Authorization": "Bearer " + token}),
+                             timeout=30) as response:
+                if response.status != 200:
+                    raise ValueError("Hugging Face did not confirm access to " + url)
+        except HTTPError as exc:
+            # Report the endpoint/status, never headers or the supplied token.
+            raise ValueError(f"Hugging Face access check returned HTTP {exc.code}: {url}. "
+                             "Check the token and accept the selected model/dataset terms before resuming.") from None
+        checked.append(url)
+        print("Model-access check passed:", url, flush=True)
+    return {"checked": checked, "scope": "HF token and selected GR00T configuration/dataset metadata. "
+            "Other model downloads and NGC registry authentication are checked by their build/runtime recipes."}
+
+
 def input_digest():
-    paths = subprocess.check_output([
-        "git", "ls-files", "-z", "--", COMPONENT.name,
-        "foundation/infra", "containers/isaac-lab-arena",
-    ], cwd=COMPONENT.parent).decode().split("\0")
-    digest = hashlib.sha256()
-    for name in sorted(filter(None, paths)):
-        digest.update(name.encode() + b"\0" + (COMPONENT.parent / name).read_bytes())
-    return digest.hexdigest()
+    from .source import input_digest as runtime_digest
+    return runtime_digest()
 
 
 def environment(profile, region):
@@ -68,12 +115,23 @@ def require_fresh_namespace(session, request):
         ParameterFilters=[{"Key": "Name", "Option": "BeginsWith", "Values": [f"/{project}/"]}],
         MaxResults=5,
     )["Parameters"]
-    repositories = [f"vla/{name}" for name in ("gr00t", "openvla", "molmoact2", "isaac-arena")]
+    supplied = set(request.get("existing_ecr_repos", []))
+    unknown = supplied - set(COMPONENT_REPOSITORIES)
+    if unknown:
+        raise ValueError("Unsupported existing image repositories: " + ", ".join(sorted(unknown)))
+    repositories = [name for name in COMPONENT_REPOSITORIES if name not in supplied]
     repositories += [f"{project}/{name}" for name in (
         "gr00t-training", "gr00t-inference", "isaac-lab", "isaac-lab-arena",
         "cosmos-transfer", "cosmos3")]
     collisions = [item["Name"] for item in parameters]
     ecr = session.client("ecr")
+    # Explicit references must exist. They remain data sources in Terraform,
+    # never imported resources or lifecycle policies owned by this deployment.
+    for name in sorted(supplied):
+        try:
+            ecr.describe_repositories(repositoryNames=[name])
+        except ecr.exceptions.RepositoryNotFoundException as exc:
+            raise ValueError(f"Selected existing repository {name} does not exist") from exc
     for name in repositories:
         try:
             ecr.describe_repositories(repositoryNames=[name])
@@ -96,6 +154,8 @@ def require_fresh_namespace(session, request):
         raise ValueError(
             "Existing resources have another state owner: " + ", ".join(collisions)
             + ". Use --use-existing to select them, then --prepare-host if needed. "
+              "For a new project sharing only image repositories, explicitly select "
+              "each --existing-ecr-repo. "
               "The CLI does not import or overwrite their Terraform state."
         )
 
@@ -155,6 +215,9 @@ def terraform_phase(name, request, work, env, record, save, *, yes, plan_only):
         variables.update(codebuild_project_name=f"{request['project']}-{request['environment']}-vla-image-build",
                          hf_secret_name=request["hf_secret_name"], ngc_secret_name=request["ngc_secret_name"],
                          additional_input_s3_arns=request.get("additional_input_s3_arns", []))
+        supplied = request.get("existing_ecr_repos", [])
+        variables.update(existing_ecr_repos=supplied,
+                         ecr_repos=[name for name in COMPONENT_REPOSITORIES if name not in supplied])
     write_json(directory / "deployment.auto.tfvars.json", variables)
     phases[name] = {"status": "Planning", "directory": str(directory)}
     save()
@@ -185,12 +248,7 @@ def deploy(args, store):
     from .registry import named_cells
 
     validate_name(args.name)
-    dirty = subprocess.check_output([
-        "git", "status", "--porcelain", "--untracked-files=normal", "--",
-        COMPONENT.name, "foundation/infra", "containers/isaac-lab-arena",
-    ], cwd=COMPONENT.parent, text=True).strip()
-    if dirty:
-        raise ValueError("Commit the selected deployment/build inputs before preparing resources")
+    source_identity()
     with store.lock("deployments", args.name):
         previous = store.load("deployments", args.name) if store.path("deployments", args.name).exists() else {}
         if args.resume:
@@ -219,7 +277,7 @@ def deploy(args, store):
                 raise ValueError("--environment must be 1–12 lowercase letters/digits/hyphens")
             cells = args.cell or list(selected.get("images", {}))
             if not cells or any(cell not in named_cells() for cell in cells):
-                raise ValueError("Select supported --cell values; inspect vla cells")
+                raise ValueError(f"Select supported --cell values; inspect {command_name()} cells")
             images = dict(selected.get("images", {}))
             overrides = assignments(args.image, "--image")
             if overrides:
@@ -227,6 +285,11 @@ def deploy(args, store):
                     raise ValueError("--image overrides require one selected --cell")
                 images[cells[0]] = {**images.get(cells[0], {}), **overrides}
             local = dict(selected.get("local", {}))
+            if args.create_local_host:
+                if not re.fullmatch(r"[a-z][a-z0-9-]{1,25}", args.name):
+                    raise ValueError("With --create-local-host, use a 2–26-character lowercase deployment name")
+                if local.get("instance_id"):
+                    raise ValueError("The imported selection already supplies a host; omit --create-local-host")
             for key, value in {"instance_id": args.local_host, "host_region": args.host_region,
                                "development_bucket": args.development_bucket,
                                "expected_role": args.expected_role, "scratch_root": args.scratch_root}.items():
@@ -241,9 +304,14 @@ def deploy(args, store):
                 "profile": args.profile or selected.get("profile"), "region": args.region,
                 "project": project, "environment": environment_name, "cells": list(dict.fromkeys(cells)),
                 "images": images, "local": local, "prepare_existing": args.prepare_host,
-                "hf_secret_name": args.hf_secret_name or "vla-pipeline/hf-token",
-                "ngc_secret_name": args.ngc_secret_name or "vla-pipeline/ngc-token",
+                "hf_secret_name": args.hf_secret_name or (
+                    f"vla-pipeline/{args.name}/hf-token" if args.hf_token_file else "vla-pipeline/hf-token"),
+                "ngc_secret_name": args.ngc_secret_name or (
+                    f"vla-pipeline/{args.name}/ngc-token" if args.ngc_token_file else "vla-pipeline/ngc-token"),
+                "hf_token_file": args.hf_token_file, "ngc_token_file": args.ngc_token_file,
+                "create_local_host": args.create_local_host, "gpu_zone": args.gpu_zone,
                 "additional_input_s3_arns": args.input_s3_arn or [],
+                "existing_ecr_repos": sorted(set(args.existing_ecr_repo)),
             }
             record = {
                 "id": args.name, "request": request, "created_at": timestamp(), "status": "Planning",
@@ -253,7 +321,8 @@ def deploy(args, store):
                 "host_preparation_verified": False,
             }
         session = aws_session(request["profile"], request["region"])
-        caller = session.client("sts").get_caller_identity()
+        from .cli_settings import require_account
+        caller = require_account(session, args.account_id or record.get("account_id"))
         if record.get("account_id", caller["Account"]) != caller["Account"]:
             raise ValueError("Selected profile belongs to a different account than the saved operation")
         record["account_id"] = request["account_id"] = caller["Account"]
@@ -317,10 +386,25 @@ def deploy(args, store):
                         raise ValueError("--prepare-host requires both published image selections for each cell")
                     record["images"][cell] = {step: image_digest(session, uri) for step, uri in selected.items()}
             else:
-                record["secrets"] = secret_check(
-                    session, [request["hf_secret_name"], request["ngc_secret_name"]])
                 if not shutil.which("terraform"):
-                    raise ValueError("Terraform is required for new deployment; install it before vla deploy")
+                    raise ValueError(
+                        f"Terraform is required for new deployment; install it before {command_name()} deploy")
+                if not args.plan:
+                    from .lifecycle import prepare_environment
+                    confirm("Prepare this deployment's token secrets and resource ownership records.", args.yes)
+                    prepare_environment(record, store)
+                if args.plan and (request.get("hf_token_file") or request.get("ngc_token_file")):
+                    record["secret_plan"] = {
+                        "names": [request["hf_secret_name"], request["ngc_secret_name"]],
+                        "action": "Create missing secret entries from supplied token files during apply",
+                    }
+                    print(json.dumps(record["secret_plan"]), flush=True)
+                else:
+                    record["secrets"] = secret_check(
+                        session, [request["hf_secret_name"], request["ngc_secret_name"]])
+                if not args.plan:
+                    record["model_access"] = model_access_check(session, request)
+                    save()
                 if not (work / "foundation/terraform.tfstate").exists():
                     require_fresh_namespace(session, request)
                 env = environment(request["profile"], request["region"])
@@ -344,6 +428,9 @@ def deploy(args, store):
                 record["activity"] = "Preparing selected images"
                 save()
                 prepare_images(session, cfg, record, save, retry_failed=args.resume)
+                if request.get("create_local_host"):
+                    from .lifecycle import create_host
+                    create_host(record, store)
             if record["local"].get("instance_id"):
                 from .host import prepare_host
                 prepare_host(session, cfg, record, save, yes=args.yes, plan_only=args.plan)
@@ -355,6 +442,7 @@ def deploy(args, store):
         except BaseException as exc:
             record.update(status="Interrupted" if isinstance(exc, KeyboardInterrupt) else "Failed",
                           failure_reason=f"{type(exc).__name__}: {exc}",
-                          next_action=f"Inspect this operation, then vla deploy --name {args.name} --resume")
+                          next_action=f"Inspect this operation, then {command_name()} deploy "
+                                      f"--name {args.name} --resume")
             save()
             raise
