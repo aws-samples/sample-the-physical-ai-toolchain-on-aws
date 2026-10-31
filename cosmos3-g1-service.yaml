@@ -142,9 +142,9 @@ spec:
             - { name: REQUIRE_LOCAL_WEIGHTS, value: "true" }
             - { name: HF_HUB_OFFLINE, value: "1" }
             - { name: TRANSFORMERS_OFFLINE, value: "1" }
-            - { name: COSMOS_ARCHIVE_S3_URI, value: "s3://physical-ai-data-804152302157/cosmos3-assets/archives/cosmos3-nano.tar" }
+            - { name: COSMOS_ARCHIVE_S3_URI, value: "s3://<DATA_BUCKET>/cosmos3-assets/archives/cosmos3-nano.tar" }
             - { name: COSMOS_ARCHIVE_SHA256, value: "a0660a0494018fff848fda34ecf0e8a823a360502a0254b5f5068f2e1c7f82ff" }
-            - { name: AWS_REGION, value: "us-east-2" }
+            - { name: AWS_REGION, value: "<REGION>" }
           ports:
             - { name: http, containerPort: 8000, protocol: TCP }
           startupProbe:
