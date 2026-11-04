@@ -40,14 +40,17 @@ def register(cli: click.Group) -> None:
 
 
 @deploy.command(name="foundation")
+@click.option("--no-approval", is_flag=True, help="Pass --require-approval never: deploy IAM/security-group changes WITHOUT showing them for review (for non-interactive shells)")
 @click.option("--dry-run", is_flag=True, help="Print command without executing")
-def deploy_foundation(dry_run: bool):
+def deploy_foundation(no_approval: bool, dry_run: bool):
     """Deploy the Foundation stack (ECR, S3, SageMaker role, Batch infra)."""
     env = config.get("environment", "dev")
     stack_name = f"PhysicalAi-{env}-Foundation"
     cdk_dir = str(config.REPO_ROOT / "cdk")
 
     cmd = ["npx", "cdk", "deploy", stack_name, "--context", "mode=simple"]
+    if no_approval:
+        cmd += ["--require-approval", "never"]
 
     if dry_run:
         helpers.info(f"[dry-run] Would execute in {cdk_dir}:")
@@ -102,8 +105,9 @@ def deploy_workstation(instance_type: str | None, allowed_cidr: str | None, dry_
 
 
 @deploy.command(name="batch")
+@click.option("--no-approval", is_flag=True, help="Pass --require-approval never: deploy IAM/security-group changes WITHOUT showing them for review (for non-interactive shells)")
 @click.option("--dry-run", is_flag=True, help="Print command without executing")
-def deploy_batch(dry_run: bool):
+def deploy_batch(no_approval: bool, dry_run: bool):
     """Deploy the Batch stack (AWS Batch compute environment for multi-node RL).
 
     Pre-checks:
@@ -132,6 +136,8 @@ def deploy_batch(dry_run: bool):
         helpers.info("Foundation stack exists. Assuming isaac-lab image is built.")
 
     cmd = ["npx", "cdk", "deploy", stack_name, "--context", "batch=true"]
+    if no_approval:
+        cmd += ["--require-approval", "never"]
 
     if dry_run:
         helpers.info(f"[dry-run] Would execute in {cdk_dir}:")

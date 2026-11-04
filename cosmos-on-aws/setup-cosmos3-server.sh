@@ -14,13 +14,24 @@
 
 set -e
 
-# Account-specific — replace before running (see ec2-deployment-guide.md).
-REGION="<REGION>"
+# Region of the instance this runs on. Auto-detected from IMDSv2 so the script
+# needs no editing; override by exporting REGION before running.
+if [ -z "${REGION:-}" ]; then
+  IMDS_TOKEN=$(curl -fsS --connect-timeout 1 -m 3 -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null || true)
+  REGION=$(curl -fsS --connect-timeout 1 -m 3 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+    "http://169.254.169.254/latest/meta-data/placement/region" 2>/dev/null || true)
+fi
+if [ -z "$REGION" ]; then
+  echo "ERROR: could not determine region from IMDS; export REGION=<region> and re-run" >&2
+  exit 1
+fi
+echo "Region: $REGION"
 
 # Model choice — "super" (64B, highest quality, needs all 8 GPUs) or "nano"
 # (16B, needs only 1 GPU, faster/cheaper, some quality tradeoff). See
 # cosmos-on-aws/README.md "Choosing Super vs Nano" for the full comparison.
-COSMOS_MODEL="super"
+COSMOS_MODEL="${COSMOS_MODEL:-super}"
 
 case "$COSMOS_MODEL" in
   super)

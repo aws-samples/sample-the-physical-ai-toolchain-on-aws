@@ -354,7 +354,9 @@ export class FoundationStack extends cdk.Stack {
       timeout: cdk.Duration.hours(2),
       environmentVariables: {
         COSMOS3_REPO: { value: 'https://github.com/NVIDIA/cosmos-framework.git' },
-        COSMOS3_REF: { value: 'main' }, // no release tags published yet; pin a commit if needed
+        // No release tags published yet, so pin a commit: tracking main broke the build
+        // when upstream moved its cu130 group to Python 3.13.
+        COSMOS3_REF: { value: '0771793ad9d547c7fc3c6ff378a8d2e9b95e5d83' },
       },
     });
 
