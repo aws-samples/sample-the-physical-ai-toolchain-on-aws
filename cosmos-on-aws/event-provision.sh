@@ -605,18 +605,27 @@ elif [ -n "$CENTRAL_WEIGHTS_URL" ]; then
   SHA_PREFIX="$(printf '%s' "$CENTRAL_WEIGHTS_SHA256" | cut -c1-16)"
   WEIGHTS_ARCHIVE_KEY="cosmos3-assets/archives/cosmos3-nano.tar"
   ARCHIVE_TMP="/tmp/cosmos3-nano-${SHA_PREFIX}.tar"
-  log "Downloading the presigned Cosmos weights archive (URL redacted)"
-  curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-    --connect-timeout 30 --output "$ARCHIVE_TMP" "$CENTRAL_WEIGHTS_URL" \
-    || die "presigned Cosmos weights download failed"
-  ACTUAL_SHA256="$(sha256sum "$ARCHIVE_TMP" | awk '{print $1}')"
   EXPECTED_SHA256="$(printf '%s' "$CENTRAL_WEIGHTS_SHA256" | tr '[:upper:]' '[:lower:]')"
-  [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] \
-    || die "Cosmos weights archive checksum mismatch: expected ${EXPECTED_SHA256}, got ${ACTUAL_SHA256}"
-  log "Archive checksum passed; relaying it to s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY}"
-  aws s3 cp "$ARCHIVE_TMP" "s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY}" \
-    --only-show-errors
-  rm -f "$ARCHIVE_TMP"
+  # A retried build skips an archive an earlier run already verified and uploaded, so
+  # the retry neither repeats the large download nor needs a presigned URL that may
+  # have expired. The sha256 metadata is written only after the checksum passed.
+  STAGED_SHA256="$(aws s3api head-object --bucket "$WEIGHTS_BUCKET" --key "$WEIGHTS_ARCHIVE_KEY" \
+    --query 'Metadata.sha256' --output text 2>/dev/null || true)"
+  if [ "$STAGED_SHA256" = "$EXPECTED_SHA256" ]; then
+    log "Cosmos weights archive already staged at s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY} with matching SHA-256 - skipping download"
+  else
+    log "Downloading the presigned Cosmos weights archive (URL redacted)"
+    curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+      --connect-timeout 30 --output "$ARCHIVE_TMP" "$CENTRAL_WEIGHTS_URL" \
+      || die "presigned Cosmos weights download failed (if the build is a retry, the presigned URL may have expired - refresh the secret and retry)"
+    ACTUAL_SHA256="$(sha256sum "$ARCHIVE_TMP" | awk '{print $1}')"
+    [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] \
+      || die "Cosmos weights archive checksum mismatch: expected ${EXPECTED_SHA256}, got ${ACTUAL_SHA256}"
+    log "Archive checksum passed; relaying it to s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY}"
+    aws s3 cp "$ARCHIVE_TMP" "s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY}" \
+      --metadata "sha256=${ACTUAL_SHA256}" --only-show-errors
+    rm -f "$ARCHIVE_TMP"
+  fi
 fi
 
 #-----------------------------------------------------------------------------------
