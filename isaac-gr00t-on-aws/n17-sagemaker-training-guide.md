@@ -60,18 +60,19 @@ aws s3 cp /tmp/source-n17.zip \
   s3://physical-ai-dev-datasets-<ACCOUNT_ID>/codebuild-source/source-n17.zip \
   --region us-east-2
 
-NGC_KEY=$(aws secretsmanager get-secret-value --secret-id physical-ai/ngc-api-key \
-  --region us-east-2 --query 'SecretString' --output text)
-
 aws codebuild start-build \
   --project-name "physical-ai-dev-gr00t-training-build" \
   --region us-east-2 \
   --source-type-override S3 \
   --source-location-override "physical-ai-dev-datasets-<ACCOUNT_ID>/codebuild-source/source-n17.zip" \
   --buildspec-override "containers/gr00t-training/buildspec-n17.yml" \
-  --compute-type-override BUILD_GENERAL1_2XLARGE \
-  --environment-variables-override "[{\"name\":\"NGC_API_KEY\",\"value\":\"$NGC_KEY\",\"type\":\"PLAINTEXT\"}]"
+  --compute-type-override BUILD_GENERAL1_2XLARGE
 ```
+
+No NGC key is needed: the `nvcr.io/nvidia/pytorch:25.04-py3` base pulls anonymously.
+If `physical-ai/ngc-api-key` exists in Secrets Manager, `buildspec-n17.yml` reads it
+and logs in to nvcr.io first. Never pass the key as a `PLAINTEXT`
+`--environment-variables-override`: that value is stored in the build record.
 
 **Build time:** ~15-20 min. Pushes to `physical-ai/gr00t-training:n17` (and `:latest`).
 
