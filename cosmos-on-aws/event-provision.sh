@@ -27,7 +27,12 @@
 #   GPU_INSTANCE_TYPE   GPU node instance type            (default g6e.4xlarge)
 #   GPU_AZ              AZ to pin the GPU node group to   (default: any private subnet)
 #   GPU_CR_ID           Capacity Block ID, if using one   (default: on-demand)
-#   GPU_DESIRED_SIZE    GPU nodes to pre-warm             (default 1)
+#   GPU_DESIRED_SIZE    GPU nodes to start at provisioning (default 0). 0 leaves the
+#                       GPU node group empty until the first Cosmos workload scales it
+#                       up, and skips the staging Job. A value above 0 launches that
+#                       many nodes and stages weights onto them, but Cluster Autoscaler
+#                       still removes an idle node after scale-down-unneeded-time, so
+#                       the staged cache lasts only while a workload keeps it busy.
 #   WORKSTATION_ROLE_ARN  IAM role granted EKS cluster-admin, so the workshop
 #                       workstation can run kubectl and `terraform plan` (the Helm
 #                       provider must reach the Kubernetes API to refresh state).
@@ -77,7 +82,7 @@ EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-cosmos3}"
 GPU_INSTANCE_TYPE="${GPU_INSTANCE_TYPE:-g6e.4xlarge}"
 GPU_AZ="${GPU_AZ:-}"
 GPU_CR_ID="${GPU_CR_ID:-}"
-GPU_DESIRED_SIZE="${GPU_DESIRED_SIZE:-1}"
+GPU_DESIRED_SIZE="${GPU_DESIRED_SIZE:-0}"
 CENTRAL_WEIGHTS_S3="${CENTRAL_WEIGHTS_S3:-}"
 CENTRAL_WEIGHTS_URL="${CENTRAL_WEIGHTS_URL:-}"
 CENTRAL_WEIGHTS_SHA256="${CENTRAL_WEIGHTS_SHA256:-}"
@@ -122,6 +127,9 @@ to_hcl_list() {  # $1=name $2=value $3=regex
 case "$ENABLE_IMAGE_BUILDS" in
   true|false) ;;
   *) die "ENABLE_IMAGE_BUILDS must be true or false, got '$ENABLE_IMAGE_BUILDS'" ;;
+esac
+case "$GPU_DESIRED_SIZE" in
+  ''|*[!0-9]*) die "GPU_DESIRED_SIZE must be a whole number (0 or more), got '$GPU_DESIRED_SIZE'" ;;
 esac
 case "$POD_GRANT_FOUNDATION_BUCKET" in
   ''|true|false) ;;
@@ -262,11 +270,13 @@ else
 fi
 
 #-----------------------------------------------------------------------------------
-# 2. Terraform: EKS cluster with a PRE-WARMED GPU node group
+# 2. Terraform: EKS cluster with a scale-from-zero GPU node group
 #
-# The node group starts at desired=GPU_DESIRED_SIZE rather than 0 so the first job an
-# attendee submits schedules immediately, instead of waiting ~5 min for Cluster
-# Autoscaler to bring a node up (and another ~4 min to pull a 30 GB image).
+# The GPU node group starts at desired=GPU_DESIRED_SIZE, 0 by default. A node launched
+# here does not stay warm for attendees: it sits idle while the weights are relayed,
+# and Cluster Autoscaler removes it after scale-down-unneeded-time (10 min). The first
+# Cosmos workload brings a node up and fetches the archive from S3 either way, so the
+# default avoids paying for an idle GPU and frees the G-instance quota for AWS Batch.
 #
 # Remote state lives in STATE_BUCKET so attendees can later run
 # `terraform init && terraform plan` from the workstation and see "No changes" -
@@ -633,9 +643,8 @@ fi
 #
 # hostPath, deliberately not EFS: the cluster runs in the workshop VPC, so the stack's
 # EFS is reachable on the network, but efs-csi is not installed (out of scope; the
-# cluster installs ebs-csi only). The GPU node is pre-warmed and
-# long-lived, so /opt/cosmos3 persists for every pod that lands on it. If the node is
-# ever replaced, re-run this script (or just re-apply the Job).
+# cluster installs ebs-csi only). /opt/cosmos3 persists for every pod that lands on
+# the node, but only for as long as that node exists.
 #
 # Running the real Cosmos image here is what warms the kubelet image cache, so the
 # 30 GB pre-pull and the weight copy are the same operation.
@@ -643,6 +652,17 @@ fi
 # The official aws-cli image supports only direct `aws` execution; its shell and
 # archive utilities are not a stable interface. Use AL2023 for the default staging
 # path and install the two packages this Job requires before downloading 35 GiB.
+#
+# The cache lives on the node's own disk, so it only helps while a GPU node stays up.
+# With GPU_DESIRED_SIZE=0 (the default) there is no node to stage onto: the Job would
+# launch one, and Cluster Autoscaler would remove it, cache included, after it idles.
+# The Cosmos chart fetches and verifies the archive from S3 on a cold node instead.
+if [ "$GPU_DESIRED_SIZE" -eq 0 ]; then
+  log "GPU_DESIRED_SIZE=0 - skipping the staging Job; the first Cosmos workload scales up a GPU node and fetches the weights from S3"
+  log "Pre-provisioning complete - account is event-ready"
+  exit 0
+fi
+
 STAGE_IMAGE="${COSMOS_IMAGE_URI:-public.ecr.aws/amazonlinux/amazonlinux:2023}"
 log "Staging with image ${STAGE_IMAGE}"
 

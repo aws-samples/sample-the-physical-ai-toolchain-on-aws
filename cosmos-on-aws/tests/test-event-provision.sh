@@ -244,7 +244,7 @@ WORKSHOP_ENV=(
 #-----------------------------------------------------------------------------------
 
 # (a) datasets-bucket parameter missing -> relay into DATA_BUCKET
-run_case a "CENTRAL_WEIGHTS_S3=$CENTRAL" "DATA_BUCKET=$DATA"
+run_case a "CENTRAL_WEIGHTS_S3=$CENTRAL" "DATA_BUCKET=$DATA" "GPU_DESIRED_SIZE=1"
 expect "exit 0" rc_is 0
 expect "relay to DATA_BUCKET" has "$LOG" "aws s3 sync $CENTRAL s3://$DATA/cosmos3-assets/weights/"
 expect "extra buckets = [DATA_BUCKET]" tfvar "$TFV" eks_pod_extra_s3_buckets "[\"$DATA\"]"
@@ -304,7 +304,8 @@ expect "existing entry logged" has "$OUT" "Additional EKS viewer access entry al
 finish "b5  existing admin viewer -> preserved and policy reconciled"
 
 # (c2) presigned archive -> verified, relayed to participant S3, then extracted on node
-run_case c2 "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" "DATA_BUCKET=$DATA"
+run_case c2 "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" "DATA_BUCKET=$DATA" \
+  "GPU_DESIRED_SIZE=1"
 expect "exit 0" rc_is 0
 expect "URL absent from stdout" hasnt "$OUT" "$PRESIGNED"
 expect "presigned archive downloaded" has "$LOG" "curl --fail --location --silent --show-error"
@@ -472,6 +473,29 @@ expect "no publish" hasnt "$LOG" "aws s3 cp"
 expect "no terraform init" hasnt "$LOG" "terraform init"
 expect "no terraform apply" hasnt "$LOG" "terraform apply"
 finish "i   EKS_API_INGRESS_SG_IDS='sg-bad!' -> exit 1, cause on stderr"
+
+# (l) GPU_DESIRED_SIZE: 0 by default, staging only when a node is kept warm
+run_case l-unset "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" "DATA_BUCKET=$DATA"
+expect "exit 0" rc_is 0
+expect "eks_gpu_node_desired_size = 0" tfvar "$TFV" eks_gpu_node_desired_size 0
+expect "archive still relayed" has "$LOG" "s3://$DATA/cosmos3-assets/archives/cosmos3-nano.tar"
+expect "staging skip logged" has "$OUT" "GPU_DESIRED_SIZE=0 - skipping the staging Job"
+expect "no staging Job applied" hasnt "$LOG.stdin" "name: cosmos3-staging"
+expect "no staging wait" hasnt "$LOG" "kubectl wait"
+finish "l   GPU_DESIRED_SIZE unset -> 0, no staging Job"
+
+run_case l-one "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" "DATA_BUCKET=$DATA" \
+  "GPU_DESIRED_SIZE=1"
+expect "exit 0" rc_is 0
+expect "eks_gpu_node_desired_size = 1" tfvar "$TFV" eks_gpu_node_desired_size 1
+expect "staging Job applied" has "$LOG.stdin" "name: cosmos3-staging"
+finish "l   GPU_DESIRED_SIZE=1 -> staging Job runs"
+
+run_case l-bad "${WORKSHOP_ENV[@]}" "GPU_DESIRED_SIZE=one"
+expect "exit 1" rc_is 1
+expect "ERROR on stderr" has "$ERR" "ERROR: GPU_DESIRED_SIZE must be a whole number (0 or more), got 'one'"
+expect "no describe-subnets" hasnt "$LOG" "describe-subnets"
+finish "l   GPU_DESIRED_SIZE=one -> exit 1 before describe-subnets"
 
 # (j) ENABLE_IMAGE_BUILDS
 run_case j-unset "DATA_BUCKET=$DATA"
