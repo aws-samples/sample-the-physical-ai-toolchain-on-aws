@@ -1,0 +1,11 @@
+# Terraform working files
+**/.terraform/
+**/.terraform.lock.hcl
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+**/.build/
+
+# Python by-products
+__pycache__/
+*.pyc

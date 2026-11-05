@@ -1,0 +1,370 @@
+{
+  "Comment": "VAMS bridge runner: SageMaker Training Job. Input is the VAMS EventBridge event; $.detail.body carries TaskToken, inputManifestS3Location, inputConfigurationS3Location. Every VAMS callback runs as the VAMS-account control role via Credentials.RoleArn. Dollar-brace placeholders are substituted by Terraform (templatefile) (templatefile).",
+  "StartAt": "ReadManifest",
+  "States": {
+    "ReadManifest": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${read_manifest_function_arn}",
+        "Payload": {
+          "body.$": "$.detail.body",
+          "engine": "sagemaker-training",
+          "runnerExecutionArn.$": "$$.Execution.Id"
+        }
+      },
+      "ResultSelector": {
+        "job.$": "$.Payload"
+      },
+      "ResultPath": "$.resolved",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "RegisterRunner"
+    },
+    "RegisterRunner": {
+      "Type": "Task",
+      "Comment": "Tell VAMS which runner execution owns this step so abort and the execution-detail view can see it. The only event the VAMS bus policy admits from the bridge: detail-type pipeline.execution.register on this execution's own source.",
+      "Resource": "arn:${partition}:states:::aws-sdk:eventbridge:putEvents",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "Entries": [
+          {
+            "EventBusName": "${vams_orchestration_bus_arn}",
+            "Source.$": "$.resolved.job.orchestrationEventPrefix",
+            "DetailType": "pipeline.execution.register",
+            "Detail": {
+              "pipelineExecutionId.$": "$.resolved.job.pipelineExecutionId",
+              "subExecution": {
+                "resourceType": "stepFunctionsExecution",
+                "stateMachineArn.$": "$$.StateMachine.Id",
+                "executionArn.$": "$$.Execution.Id",
+                "label": "PAI Toolchain training-job runner"
+              },
+              "logs": [
+                {
+                  "logGroupArn": "${runner_log_group_arn}",
+                  "logGroupName": "${runner_log_group_name}",
+                  "logStreamName": "",
+                  "logStreamPrefix": "",
+                  "sourceType": "stateMachine",
+                  "label": "runner state machine"
+                },
+                {
+                  "logGroupArn": "${vams_bridge_log_group_arn}",
+                  "logGroupName": "${vams_bridge_log_group_name}",
+                  "logStreamName.$": "$.resolved.job.pipelineExecutionId",
+                  "logStreamPrefix": "",
+                  "sourceType": "custom",
+                  "label": "job log tail (copied into the VAMS account)"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.registerError",
+          "Next": "Submit",
+          "Comment": "Registration is best-effort; the run proceeds without it."
+        }
+      ],
+      "Next": "Submit"
+    },
+    "Submit": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::aws-sdk:sagemaker:createTrainingJob",
+      "Parameters": {
+        "TrainingJobName.$": "$.resolved.job.jobName",
+        "AlgorithmSpecification.$": "$.resolved.job.algorithmSpecification",
+        "RoleArn": "${sagemaker_execution_role_arn}",
+        "InputDataConfig.$": "$.resolved.job.inputDataConfig",
+        "OutputDataConfig.$": "$.resolved.job.outputDataConfig",
+        "ResourceConfig.$": "$.resolved.job.resourceConfig",
+        "StoppingCondition.$": "$.resolved.job.stoppingCondition",
+        "Environment.$": "$.resolved.job.environment",
+        "Tags": [
+          {
+            "Key": "vams:pipelineExecutionId",
+            "Value.$": "$.resolved.job.pipelineExecutionId"
+          }
+        ]
+      },
+      "ResultSelector": {
+        "trainingJobArn.$": "$.TrainingJobArn"
+      },
+      "ResultPath": "$.submitted",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "RegisterJob"
+    },
+    "RegisterJob": {
+      "Type": "Task",
+      "Comment": "Re-register with the job itself as an abortable sub-execution (VAMS 2.7+: the Abort button calls StopPipelineExecution; the handler merges by location) and the job's own log group (readable from VAMS once cross-account log reads land).",
+      "Resource": "arn:${partition}:states:::aws-sdk:eventbridge:putEvents",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "Entries": [
+          {
+            "EventBusName": "${vams_orchestration_bus_arn}",
+            "Source.$": "$.resolved.job.orchestrationEventPrefix",
+            "DetailType": "pipeline.execution.register",
+            "Detail": {
+              "pipelineExecutionId.$": "$.resolved.job.pipelineExecutionId",
+              "subExecution": {
+                "resourceType": "sageMakerTrainingJob",
+                "trainingJobArn.$": "$.submitted.trainingJobArn",
+                "stageName": "Train",
+                "label": "SageMaker training job"
+              },
+              "logs": [
+                {
+                  "logGroupArn": "arn:${partition}:logs:${region}:${account_id}:log-group:/aws/sagemaker/TrainingJobs",
+                  "logGroupName": "/aws/sagemaker/TrainingJobs",
+                  "logStreamName": "",
+                  "logStreamPrefix.$": "$.resolved.job.jobName",
+                  "stageName": "Train",
+                  "sourceType": "custom",
+                  "label": "Train container (toolchain account)"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.registerError",
+          "Next": "Wait"
+        }
+      ],
+      "Next": "Wait"
+    },
+    "Wait": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "Describe"
+    },
+    "Describe": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::aws-sdk:sagemaker:describeTrainingJob",
+      "Parameters": {
+        "TrainingJobName.$": "$.resolved.job.jobName"
+      },
+      "ResultSelector": {
+        "status.$": "$.TrainingJobStatus",
+        "secondaryStatus.$": "$.SecondaryStatus"
+      },
+      "ResultPath": "$.job",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "SageMaker.ThrottlingException",
+            "SageMaker.InternalFailure"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "StopJobThenFail"
+        }
+      ],
+      "Next": "Heartbeat",
+      "Comment": "Select only fields present in every job state: a reason or log-stream field is absent while the job runs, and a missing JSONPath in ResultSelector is an uncatchable States.Runtime. Collect reads the reason and the log stream itself once the job is final."
+    },
+    "Heartbeat": {
+      "Type": "Task",
+      "Comment": "A rejected heartbeat (TaskTimedOut / TaskDoesNotExist) means VAMS aborted or timed out the step. Stop the job and fail; do not retry.",
+      "Resource": "arn:${partition}:states:::aws-sdk:sfn:sendTaskHeartbeat",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "TaskToken.$": "$.detail.body.TaskToken"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.heartbeatError",
+          "Next": "StopJobThenFail"
+        }
+      ],
+      "Next": "IsDone"
+    },
+    "IsDone": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.job.status",
+          "StringEquals": "Completed",
+          "Next": "Collect"
+        },
+        {
+          "Variable": "$.job.status",
+          "StringEquals": "Failed",
+          "Next": "NotifyFailure"
+        },
+        {
+          "Variable": "$.job.status",
+          "StringEquals": "Stopped",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Default": "Wait"
+    },
+    "StopJobThenFail": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::aws-sdk:sagemaker:stopTrainingJob",
+      "Parameters": {
+        "TrainingJobName.$": "$.resolved.job.jobName"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.stopError",
+          "Next": "AbortedByVams"
+        }
+      ],
+      "Next": "AbortedByVams"
+    },
+    "AbortedByVams": {
+      "Type": "Fail",
+      "Comment": "VAMS already recorded the abort/timeout; no callback is possible on a rejected token.",
+      "Error": "VamsAbortedOrTimedOut",
+      "Cause": "The VAMS task token was rejected during heartbeat; the job was stopped."
+    },
+    "Collect": {
+      "Type": "Task",
+      "Resource": "arn:${partition}:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${collect_function_arn}",
+        "Payload": {
+          "resolved.$": "$.resolved.job",
+          "engine": "sagemaker-training",
+          "trainingJobArn.$": "$.submitted.trainingJobArn"
+        }
+      },
+      "ResultSelector": {
+        "summary.$": "$.Payload"
+      },
+      "ResultPath": "$.collected",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "NotifySuccess"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Comment": "Report the outcome, never the job's output: the output lands in the VAMS execution record.",
+      "Resource": "arn:${partition}:states:::aws-sdk:sfn:sendTaskSuccess",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "TaskToken.$": "$.detail.body.TaskToken",
+        "Output.$": "States.JsonToString($.collected.summary)"
+      },
+      "ResultPath": null,
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Comment": "Cause is bounded to a short classification; details stay in this account's logs.",
+      "Resource": "arn:${partition}:states:::aws-sdk:sfn:sendTaskFailure",
+      "Credentials": {
+        "RoleArn": "${vams_control_role_arn}"
+      },
+      "Parameters": {
+        "TaskToken.$": "$.detail.body.TaskToken",
+        "Error": "PaiToolchainJobFailed",
+        "Cause.$": "States.Format('The toolchain job did not complete. See the toolchain account runner execution {}.', $$.Execution.Id)"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Failed",
+          "Comment": "Token already consumed or expired; VAMS has the outcome."
+        }
+      ],
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "Error": "PaiToolchainJobFailed"
+    }
+  }
+}

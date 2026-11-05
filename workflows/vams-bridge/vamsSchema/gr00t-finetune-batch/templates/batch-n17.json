@@ -1,0 +1,56 @@
+{
+    "templateId": "batch-n17",
+    "templateName": "AWS Batch (GR00T N1.7)",
+    "description": "Runs the N1.7 training container as a single AWS Batch job on the toolchain's GPU compute environment. Every setting travels as a containerOverrides.environment entry, matching training/gr00t/submit_batch_training_n17.py; the job definition is never re-registered.",
+    "isDefault": true,
+    "configFormat": "json",
+    "configBody": "{\"engine\":\"batch\",\"maxSteps\":{{MAX_STEPS}},\"batchSize\":{{BATCH_SIZE}},\"gradAccumSteps\":{{GRAD_ACCUM_STEPS}},\"embodimentConfig\":\"{{EMBODIMENT_CONFIG}}\",\"tuneVisual\":{{TUNE_VISUAL}}}",
+    "allowCustomEdit": false,
+    "inputInstructions": "Select the asset holding a LeRobot v2 dataset. The whole asset is staged to the toolchain's datasets bucket and validated with validate_lerobot_gr00t_dataset.py before the Batch job is submitted; a global batch size the job definition's GPU count cannot divide is rejected before submission. Checkpoints are written back to this asset under a per-run folder.\n\nThe Hugging Face token is read from the toolchain account's Secrets Manager (HF_TOKEN_SECRET_ID) by the container when the secret exists; it is never a form field. The defaults are the job definition's validated single-GPU (g6e.4xlarge) settings.",
+    "tagSchema": [
+        {
+            "tagKey": "MAX_STEPS",
+            "type": "integer",
+            "required": false,
+            "default": 100,
+            "label": "Max training steps",
+            "description": "Number of optimiser steps. 100 is a smoke test; a full run is 10000."
+        },
+        {
+            "tagKey": "BATCH_SIZE",
+            "type": "integer",
+            "required": false,
+            "default": 2,
+            "label": "Global batch size",
+            "description": "Must be divisible by the job definition's GPU count; the runner rejects a value that is not."
+        },
+        {
+            "tagKey": "GRAD_ACCUM_STEPS",
+            "type": "integer",
+            "required": false,
+            "default": 8,
+            "label": "Gradient accumulation steps",
+            "description": "Effective batch = global batch size x this value."
+        },
+        {
+            "tagKey": "EMBODIMENT_CONFIG",
+            "type": "enum",
+            "required": false,
+            "default": "ur3",
+            "enumValues": [
+                "ur3",
+                "g1_dex3"
+            ],
+            "label": "Embodiment",
+            "description": "Modality configuration the N1.7 container loads (ur3 or g1_dex3)."
+        },
+        {
+            "tagKey": "TUNE_VISUAL",
+            "type": "boolean",
+            "required": false,
+            "default": false,
+            "label": "Tune the vision tower",
+            "description": "Unfreezes the vision tower during fine-tuning. Needs more GPU memory; usually off."
+        }
+    ]
+}
