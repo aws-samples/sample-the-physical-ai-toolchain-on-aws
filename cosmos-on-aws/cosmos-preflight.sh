@@ -130,8 +130,25 @@ check_outputs() {
 check_outputs && ok_outputs=1
 
 # 3-4. Staged input videos --------------------------------------------------------
+# Download a video from the URL in stack parameter $1, check SHA-256 $2, upload to $3.
+restage_video() {
+  local param="$1" sha="$2" key="$3" url tmp
+  url=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+    --query "Stacks[0].Parameters[?ParameterKey=='$param'].ParameterValue | [0]" \
+    --output text 2>> "$LOG") || return 1
+  case "$url" in https://*) ;; *) echo "stack parameter $param is empty" >> "$LOG"; return 1 ;; esac
+  tmp=$(mktemp) || return 1
+  echo "re-staging $key from $param" >> "$LOG"
+  quiet curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 \
+    -o "$tmp" "$url" || { rm -f "$tmp"; return 1; }
+  printf '%s  %s\n' "$sha" "$tmp" | quiet sha256sum -c - || { rm -f "$tmp"; return 1; }
+  quiet aws s3 cp "$tmp" "s3://$DATA_BUCKET/$key" --region "$REGION" --sse AES256 --only-show-errors \
+    || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+
 check_video() {
-  local label="$1" uri="$2" key bytes
+  local label="$1" uri="$2" param="$3" sha="$4" key bytes
   step "$label"
   [ "$ok_outputs" = 1 ] || { skip " stack outputs (check 2)"; return 1; }
   case "$uri" in
@@ -141,13 +158,24 @@ check_video() {
   key="${uri#s3://$DATA_BUCKET/}"
   if ! bytes=$(aws s3api head-object --bucket "$DATA_BUCKET" --key "$key" --region "$REGION" \
       --query ContentLength --output text 2>> "$LOG"); then
-    fail "not found: $uri (the stack did not stage this video)"; return 1
+    # The workstation bootstrap stages these videos but treats a failed download as a
+    # warning. Repair it here from the same stack parameter and checksum.
+    restage_video "$param" "$sha" "$key" \
+      || { fail "not found: $uri, and it could not be staged again"; return 1; }
+    bytes=$(aws s3api head-object --bucket "$DATA_BUCKET" --key "$key" --region "$REGION" \
+      --query ContentLength --output text 2>> "$LOG") \
+      || { fail "staged again but still not readable: $uri"; return 1; }
+    case "$bytes" in ''|*[!0-9]*|0) fail "empty or unreadable: $uri"; return 1 ;; esac
+    pass "$key ($(( bytes / 1024 )) KiB, staged again)"; return 0
   fi
   case "$bytes" in ''|*[!0-9]*|0) fail "empty or unreadable: $uri"; return 1 ;; esac
   pass "$key ($(( bytes / 1024 )) KiB)"
 }
-check_video "Source video in S3" "$COSMOS_SOURCE_VIDEO_S3_URI"
-check_video "Edge-control video in S3" "$COSMOS_EDGE_VIDEO_S3_URI"
+# Checksums of the hosted workshop videos; they match the workstation bootstrap.
+check_video "Source video in S3" "$COSMOS_SOURCE_VIDEO_S3_URI" CosmosSourceVideoUrl \
+  ba61f16179fd4f9e889700452769a8d9efbee2400b04cdbbb787d046e9a18d7e
+check_video "Edge-control video in S3" "$COSMOS_EDGE_VIDEO_S3_URI" CosmosEdgeControlVideoUrl \
+  bee6ca1693cbe7a9d38456ad1597403b8cbad2191b0ce500625791d48344599c
 
 # 5. EKS access -------------------------------------------------------------------
 check_eks() {
