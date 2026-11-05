@@ -46,7 +46,9 @@
 #   CENTRAL_WEIGHTS_URL Presigned HTTPS URL for a Cosmos 3 Nano tar archive (optional;
 #                       mutually exclusive with CENTRAL_WEIGHTS_S3)
 #   CENTRAL_WEIGHTS_SHA256  Required SHA-256 for CENTRAL_WEIGHTS_URL
-#   COSMOS_IMAGE_URI    ECR image for vllm-omni cosmos3; also warms the node's image cache
+#   COSMOS_IMAGE_URI    ECR image for vllm-omni cosmos3. When GPU_DESIRED_SIZE is above
+#                       0, the staging Job runs it, which pre-pulls it into that node's
+#                       image cache. At the default 0 it is not pulled during provisioning.
 #   DATA_BUCKET         Workshop data bucket (optional). The pod IRSA policy grants it,
 #                       and CENTRAL_WEIGHTS_S3 is relayed into it when the account has no
 #                       /physical-ai/datasets-bucket SSM parameter.
