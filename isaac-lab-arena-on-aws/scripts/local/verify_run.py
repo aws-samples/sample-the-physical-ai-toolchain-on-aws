@@ -6,12 +6,51 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 
 import boto3
+
+
+def read_dataset_reference(url):
+    """Keep the independent lookup, allowing at most five minutes for HTTP 429."""
+    deadline = time.monotonic() + 300
+    for attempt in range(6):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Dataset verification retry allowance exhausted; retry the verifier "
+                               "against this completed run. Training does not need to restart.")
+        try:
+            with urlopen(url, timeout=min(30, remaining)) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            if exc.code != 429:
+                raise
+            delay = min(30 * 2**attempt, 60)
+            retry_after = exc.headers.get("Retry-After", "")
+            try:
+                delay = max(1, int(retry_after))
+            except ValueError:
+                try:
+                    delay = max(1, (parsedate_to_datetime(retry_after)
+                                   - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            if attempt == 5 or delay >= deadline - time.monotonic():
+                raise RuntimeError(
+                    "Hugging Face could not serve the independent dataset lookup (HTTP 429). "
+                    "Verification is incomplete; retry the verifier against this completed run "
+                    "after the service recovers. Training does not need to restart."
+                ) from exc
+            print(f"Hugging Face dataset lookup returned HTTP 429; verification retry "
+                  f"{attempt + 1}/5 in {delay:.0f}s. Completed training is retained.",
+                  file=sys.stderr, flush=True)
+            time.sleep(delay)
 
 
 def verify_run(root):
@@ -21,6 +60,14 @@ def verify_run(root):
 
 
     def save(name, value):
+        if name == "independent-verification.json":
+            from check_run_evidence import run_checks
+            checks = run_checks(root)
+            value["contract_checks"] = checks
+            if checks["status"] != "passed":
+                value["status"] = "VerificationFailed"
+                (root / name).write_text(json.dumps(value, indent=2, default=str) + "\n")
+                raise RuntimeError("Named pipeline checks failed; see contract-checks.json")
         (root / name).write_text(json.dumps(value, indent=2, default=str) + "\n")
 
 
@@ -227,9 +274,8 @@ def verify_run(root):
         if requested_revision == "__FROM_SUITE_MANIFEST__":
             requested_revision = "main"
         url = ("https://huggingface.co/api/datasets/" + repo_id + "/revision/"
-               + quote(requested_revision, safe=""))
-        with urlopen(url, timeout=30) as response:
-            dataset_reference = json.load(response)
+               + quote(requested_revision, safe="") + "?expand=sha")
+        dataset_reference = read_dataset_reference(url)
         assert dataset_reference["sha"] == revision["observed"]
     else:
         assert lineage["matched"] == ["train_steps"]

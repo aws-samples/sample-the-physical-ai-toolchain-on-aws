@@ -23,5 +23,32 @@
     "instanceType": "g6.12xlarge",
     "numNodes": 2,
     "maxvCpus": 96
+  },
+  "arena": {
+    "_comment": "Fill account_id and create both token files on the machine running the notebook. Tokens stay outside this repository. The notebook and ordinary pai arena commands read this section; explicit CLI flags override these defaults.",
+    "account_id": "YOUR_12_DIGIT_ACCOUNT_ID",
+    "hf_token_file": "/absolute/private/path/hf-token",
+    "ngc_token_file": "/absolute/private/path/ngc-token",
+    "_optional": "Use a named AWS profile if needed; null retains the environment or instance-role credentials. Other values below are editable defaults.",
+    "profile": null,
+    "region": "us-east-1",
+    "deployment_name": "arena-notebook",
+    "prepare_cells": [
+      "gr00t-n16-arena"
+    ],
+    "local": {
+      "cell": "gr00t-n16-arena",
+      "instance_type": "g6e.8xlarge"
+    },
+    "managed": {
+      "cell": "gr00t-n16-arena",
+      "train_instance_type": "ml.g6e.8xlarge",
+      "eval_instance_type": "ml.g6e.8xlarge"
+    },
+    "run": {
+      "max_runtime_seconds": 21600,
+      "record_video": "auto"
+    },
+    "_video": "Auto records Arena evaluation and reports video unavailable for other simulators. Only recordings belonging to the reported run are shown."
   }
 }

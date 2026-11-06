@@ -8,27 +8,88 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from urllib.parse import urlparse
 
+from . import managed_checks as checks
 from .backend import script
 from .deployment import aws_session, discover
+from .managed_checks import require, check_environment
 from .operations import timestamp, write_json
 
-VERIFICATION_VERSION = 2
+VERIFICATION_VERSION = 4
 
 
-def check_environment(job, params, fields, label):
-    environment = job.get("Environment", {})
-    for variable, parameter in fields.items():
-        if parameter in params:
-            require(environment.get(variable) == str(params[parameter]),
-                    f"{label} {variable} differs from requested {parameter}")
+class CheckResults:
+    """Record every expected check, including checks not reached after a failure."""
+
+    def __init__(self, directory, steps):
+        self.path = directory / "contract-checks.json"
+        selected = set(steps)
+        functions = [
+            (checks.check_verification_account, None),
+            (checks.check_requested_managed_steps_succeeded, None),
+            (checks.check_executed_parameters_match_request, None),
+            (checks.check_finetune_job_completed_as_requested, "FineTune"),
+            (checks.check_simulation_job_completed_as_requested, "SimEval"),
+            (check_versioned_job_outputs, None),
+            (checks.check_simulation_consumed_selected_checkpoint, "SimEval"),
+            (checks.check_validation_job_completed_with_selected_inputs, "Validate"),
+            (checks.check_validated_metrics_match_simulation_and_request, "Validate"),
+            (checks.check_training_lineage_matches_requested_mode, "Validate"),
+            (checks.check_validated_checkpoint_identity, "Validate"),
+            (check_checkpoint_version_readback, "Validate"),
+            (checks.check_validation_used_packaged_sdk, "Validate"),
+            (checks.check_conditional_publication_is_real, "Validate"),
+            (checks.check_downloaded_attestation_matches_execution, "Validate"),
+            (checks.check_promoted_checkpoint_matches_validated_artifact, "Validate"),
+            (checks.check_success_gate_threshold, "SuccessGate"),
+            (checks.check_registered_model_matches_publication, "RegisterModel"),
+        ]
+        self.rows = {
+            fn.__name__: {"name": fn.__name__, "description": fn.__doc__,
+                          "status": "not_run" if step is None or step in selected else "not_applicable"}
+            for fn, step in functions
+        }
+        self.save()
+
+    def summary(self):
+        states = {row["status"] for row in self.rows.values()}
+        return {"scope": "Actual SageMaker descriptions and independently read S3 evidence; "
+                         "checkpoint-content and training claims retain Validate's stated scope",
+                "status": "failed" if "failed" in states else "pending" if "not_run" in states else "passed",
+                "checks": list(self.rows.values())}
+
+    def save(self):
+        write_json(self.path, self.summary())
+
+    def run(self, function, *args, **kwargs):
+        row = self.rows[function.__name__]
+        try:
+            result = function(*args, **kwargs)
+        except Exception as exc:
+            row.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
+            raise
+        else:
+            row["status"] = "passed"
+            return result
+        finally:
+            self.save()
+            print(f"{row['status'].upper():14} {row['name']}" +
+                  (": " + row["reason"] if row.get("reason") else ""), flush=True)
 
 
-def require(condition, reason):
-    if not condition:
-        raise ValueError(reason)
+def check_versioned_job_outputs(directory, s3, manifest, params, rows, output_buckets):
+    """Re-read nonempty job output versions and validate the actual simulation archive and checkpoint linkage."""
+    return script("local/local_outputs.py").verify_outputs(
+        directory, s3, manifest, params, rows, expected_output_buckets=output_buckets)
+
+
+def check_checkpoint_version_readback(s3, checkpoint, identity):
+    """S3 still serves the nonempty checkpoint version identified by validation."""
+    actual = object_identity(s3, checkpoint, version=identity["version_id"])
+    require(actual["etag"].strip('"') == identity["etag"].strip('"'),
+            "S3 checkpoint version differs from validation evidence")
+    return actual
 
 
 def object_identity(s3, uri, *, bucket=None, version=None):
@@ -57,65 +118,52 @@ def read_json(s3, identity):
 
 
 def verify(record, store):
-    from .execution import check_managed_steps
-    from .registry import resolve_suite
+    directory = store.path("runs", record["id"]).parent
+    results = CheckResults(directory, record["request"]["steps"])
+    try:
+        return verify_and_record(record, directory, results)
+    except Exception as exc:
+        failure = results.summary()
+        failure.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        write_json(results.path, failure)
+        record["contract_checks"] = failure
+        raise
 
+
+def verify_and_record(record, directory, results):
     session = aws_session(record.get("profile"), record["region"])
-    require(session.client("sts").get_caller_identity()["Account"] == record["account_id"],
-            "Verification credentials belong to another account")
+    results.run(checks.check_verification_account,
+                session.client("sts").get_caller_identity()["Account"], record["account_id"])
     cfg = discover(session, record["project"])
     sm, s3 = session.client("sagemaker"), session.client("s3")
     arn, request = record["execution_arn"], record["request"]
     execution = sm.describe_pipeline_execution(PipelineExecutionArn=arn)
     rows = [row for page in sm.get_paginator("list_pipeline_execution_steps").paginate(
         PipelineExecutionArn=arn) for row in page["PipelineExecutionSteps"]]
-    passed, reason = check_managed_steps(execution, rows, request["steps"])
-    require(passed, reason or "Requested managed steps did not succeed")
+    results.run(checks.check_requested_managed_steps_succeeded, execution, rows, request["steps"])
     actual = {item["Name"]: item["Value"] for page in sm.get_paginator(
         "list_pipeline_parameters_for_execution").paginate(PipelineExecutionArn=arn)
         for item in page["PipelineParameters"]}
-    require(all(actual.get(key) == str(value) for key, value in request["parameters"].items()),
-            "Executed parameters differ from the CLI request")
+    results.run(checks.check_executed_parameters_match_request, actual, request["parameters"])
+    write_json(directory / "managed-execution.json",
+               {"execution": execution, "steps": rows, "parameters": actual})
     params = request["parameters"]
     by_name = {row["StepName"]: row for row in rows}
     outputs, jobs = {}, {}
     output_buckets = {"FineTune": cfg.bucket, "SimEval": cfg.handoff_bucket}
-    for step, image_key, type_key, volume_key in (
-        ("FineTune", "TrainImageUri", "TrainInstanceType", "VolumeSizeInGB"),
-        ("SimEval", "EvalImageUri", "EvalInstanceType", "EvalVolumeSizeInGB"),
+    for step, function in (
+        ("FineTune", checks.check_finetune_job_completed_as_requested),
+        ("SimEval", checks.check_simulation_job_completed_as_requested),
     ):
         if step not in request["steps"]:
             continue
         job_arn = by_name[step]["Metadata"]["TrainingJob"]["Arn"]
         name = job_arn.rsplit("/", 1)[1]
         job = sm.describe_training_job(TrainingJobName=name)
-        require(job["TrainingJobStatus"] == "Completed", f"{step} job did not complete")
-        require(job["AlgorithmSpecification"]["TrainingImage"] == params[image_key],
-                f"{step} used a different image")
-        require(job["ResourceConfig"]["InstanceType"] == params[type_key]
-                and job["ResourceConfig"]["VolumeSizeInGB"] == params[volume_key],
-                f"{step} resources differ from the request")
-        require(job["StoppingCondition"]["MaxRuntimeInSeconds"] == params["MaxRuntimeSeconds"],
-                f"{step} runtime budget differs from the request")
-        check_environment(job, params, {
-            "VLA_MAX_RUNTIME_SECONDS": "MaxRuntimeSeconds",
-            **({
-                "TRAIN_MODEL_FAMILY": "ModelFamily", "TRAIN_MAX_STEPS": "TrainSteps",
-                "TRAIN_SAVE_STEPS": "TrainSaveSteps", "TRAIN_SUITE": "TrainSuite",
-                "TRAIN_DATASET_S3URI": "DatasetS3Uri", "TRAIN_DATASET_REVISION": "DatasetRevision",
-                "GR00T_VERSION": "Gr00tVersion",
-            } if step == "FineTune" else {
-                "EVAL_MODEL_FAMILY": "ModelFamily", "EVAL_SUITE": "Suite",
-                "EVAL_SEED": "EvalSeed", "EVAL_TRIALS": "EvalTrials",
-                "EVAL_TASK_IDS": "EvalTaskIds", "EVAL_DOSE_STEPS": "EvalDoseSteps",
-                "EVAL_GR00T_VERSION": "Gr00tVersion", "EVAL_SIM_CONFIG": "EvalSimConfig",
-                "USE_GROOT_SERVER": "UseGrootServer", "ARENA_CONNECTOR": "ArenaConnector",
-            }),
-        }, step)
+        results.run(function, job, params)
         outputs[step] = {**object_identity(
             s3, job["ModelArtifacts"]["S3ModelArtifacts"], bucket=output_buckets[step]), "job_name": name}
         jobs[step] = job
-    directory = store.path("runs", record["id"]).parent
     write_json(directory / "managed-jobs.json", jobs)
     write_json(directory / "job-outputs.json", outputs)
     manifest = {"development_bucket": cfg.bucket,
@@ -124,8 +172,8 @@ def verify(record, store):
     for row in adapted_rows:
         if row["StepName"] in outputs:
             row["Metadata"]["TrainingJob"]["Arn"] = outputs[row["StepName"]]["job_name"]
-    proof, report = script("local/local_outputs.py").verify_outputs(
-        directory, s3, manifest, params, adapted_rows, expected_output_buckets=output_buckets)
+    proof, report = results.run(
+        check_versioned_job_outputs, directory, s3, manifest, params, adapted_rows, output_buckets)
     result = {"independently_verified": True, "verification_status": "passed",
               "verification_version": VERIFICATION_VERSION,
               "verification_scope": proof["scope"], "outputs": outputs,
@@ -134,128 +182,42 @@ def verify(record, store):
     if report:
         result.update(episodes=report["episodes"], success_rate=report["success_rate"])
         checkpoint = request.get("checkpoint_s3") or outputs["FineTune"]["uri"]
-        channels = [item for item in jobs["SimEval"]["InputDataConfig"] if item["ChannelName"] == "model"]
-        require(len(channels) == 1 and
-                channels[0]["DataSource"]["S3DataSource"]["S3Uri"] == checkpoint,
-                "SimEval did not consume this execution's selected checkpoint")
+        results.run(checks.check_simulation_consumed_selected_checkpoint, jobs["SimEval"], checkpoint)
     if "Validate" in request["steps"]:
         processing = sm.describe_processing_job(
             ProcessingJobName=by_name["Validate"]["Metadata"]["ProcessingJob"]["Arn"].rsplit("/", 1)[1])
-        require(processing["ProcessingJobStatus"] == "Completed", "Validate job did not complete")
-        check_environment(processing, params, {
-            "EXPECTED_EVAL_SEED": "EvalSeed", "EXPECTED_EVAL_TRIALS": "EvalTrials",
-            "EXPECTED_EVAL_TASK_IDS": "EvalTaskIds", "EXPECTED_MODEL_FAMILY": "ModelFamily",
-            "EXPECTED_SUITE": "Suite", "EVALUATOR_IMAGE_URI": "EvalImageUri",
-            "EXPECTED_FAMILY_VERSION": "Gr00tVersion",
-            "EXPECTED_EMBODIMENT_TAG": "ExpectedEmbodimentTag",
-            "EXPECTED_ARENA_EMBODIMENT": "ExpectedArenaEmbodiment",
-            "EXPECTED_ARENA_OBJECT": "ExpectedArenaObject",
-            "EXPECTED_POLICY_CONFIG": "ExpectedPolicyConfig",
-            "EXPECTED_TRAIN_STEPS": "TrainSteps", "EXPECTED_TRAIN_SUITE": "TrainSuite",
-            "EXPECTED_DATASET_S3URI": "DatasetS3Uri", "EXPECTED_DATASET_REVISION": "DatasetRevision",
-            "EXPECTED_SUCCESS_THRESHOLD": "SuccessThreshold",
-        }, "Validate")
-        require(processing.get("Environment", {}).get("EXPECTED_TRAIN_PATH") ==
-                ("train" if "FineTune" in request["steps"] else "eval_only"),
-                "Validate training/checkpoint-only mode differs from the request")
-        require(processing["Environment"].get("EXPECTED_MODEL_SOURCE_URI") == checkpoint,
-                "Validate expected source differs from the selected checkpoint")
-        inputs = {item["S3Input"]["LocalPath"]: item["S3Input"]["S3Uri"]
-                  for item in processing["ProcessingInputs"] if "S3Input" in item}
-        require(inputs.get("/opt/ml/processing/checkpoint") == checkpoint
-                and inputs.get("/opt/ml/processing/eval_output") == outputs["SimEval"]["uri"],
-                "Validate input linkage differs from this execution")
-        destinations = [item["S3Output"]["S3Uri"] for item in processing[
-            "ProcessingOutputConfig"]["Outputs"] if item["OutputName"] == "validated"]
-        require(len(destinations) == 1 and destinations[0].rstrip("/").endswith("/" + arn.rsplit("/", 1)[1]),
-                "Validate output must be scoped to this execution")
-        receipt_uri = destinations[0].rstrip("/") + "/validated_metrics.json"
+        write_json(directory / "managed-validation-job.json", processing)
+        receipt_uri = results.run(checks.check_validation_job_completed_with_selected_inputs,
+            processing, params, request["steps"], checkpoint, outputs["SimEval"]["uri"], arn)
         receipt_identity = object_identity(s3, receipt_uri, bucket=cfg.handoff_bucket)
         receipt, receipt_sha = read_json(s3, receipt_identity)
-        require(receipt.get("validation_passed") is True and receipt.get("policy_type") == "checkpoint",
-                "Validate did not publish successful real-checkpoint evidence")
-        for field, parameter in (("model_family", "ModelFamily"), ("suite", "Suite"),
-                                 ("eval_seed", "EvalSeed"), ("eval_trials", "EvalTrials")):
-            require(receipt.get(field) == params[parameter],
-                    f"Validate receipt {field} differs from requested {parameter}")
-        suite = resolve_suite(params["Suite"])
-        require(receipt.get("task_ids") == list(suite.canonical_task_ids)
-                and receipt.get("episodes") == params["EvalTrials"] * len(suite.canonical_task_ids),
-                "Validate did not report the requested episodes/tasks")
-        require(receipt.get("success_rate") == report["success_rate"]
-                and receipt.get("episodes") == report["episodes"],
-                "Validate and simulation report different results")
-        lineage = script("local/local_profiles.py").check_training_contract(receipt, params)
-        if "FineTune" in request["steps"]:
-            comparisons = [item for item in lineage["fields"] if item["field"] == "train_steps"]
-            require(len(comparisons) == 1
-                    and comparisons[0]["expected"] == comparisons[0]["observed"] == str(params["TrainSteps"]),
-                    "Training lineage does not contain the requested training-step count")
+        results.run(checks.check_validated_metrics_match_simulation_and_request, receipt, params, report)
+        lineage = results.run(checks.check_training_lineage_matches_requested_mode,
+                              receipt, params, request["steps"])
         identity = receipt["model_artifact_identity"]
         expected = request.get("checkpoint_identity") or outputs["FineTune"]
-        source = urlparse(checkpoint)
-        require((identity["bucket"], identity["key"], identity["version_id"], identity["etag"].strip('"')) ==
-                (source.netloc, source.path.lstrip("/"), expected["version_id"], expected["etag"].strip('"')),
-                "Validate's checkpoint identity differs from the selected checkpoint")
-        checkpoint_identity = object_identity(s3, checkpoint, version=identity["version_id"])
-        require(checkpoint_identity["etag"].strip('"') == identity["etag"].strip('"'),
-                "S3 checkpoint version differs from validation evidence")
+        results.run(checks.check_validated_checkpoint_identity, identity, checkpoint, expected)
+        checkpoint_identity = results.run(check_checkpoint_version_readback, s3, checkpoint, identity)
         runtime = receipt["validation_runtime"]
-        from .validation_sdk import sdk_bundle
-        sdk_digest = hashlib.sha256(sdk_bundle()).hexdigest()
-        require(runtime.get("boto3_version") == runtime.get("botocore_version") == "1.42.97"
-                and runtime.get("sdk_bundle_sha256") == sdk_digest, "Validate SDK identity differs")
+        results.run(checks.check_validation_used_packaged_sdk, runtime)
         promotion = receipt["promotion"]
-        require(not promotion.get("local_test_publication"), "Managed receipt contains a publication stub")
-        require(promotion.get("artifact_publication") in {"created_multipart", "already_present_identical"}
-                and promotion.get("attestation_publication") in {"created", "already_present_identical"},
-                "Unexpected conditional-publication evidence")
+        results.run(checks.check_conditional_publication_is_real, promotion)
         attestation_identity = object_identity(s3, promotion["attestation_uri"], bucket=cfg.trust_bucket)
         attestation, digest = read_json(s3, attestation_identity)
-        require(promotion["attestation_content_digest"] == "sha256:" + digest
-                and promotion["attestation_sha256"] == digest, "Downloaded attestation digest mismatch")
-        require(attestation["lineage"] == lineage
-                and attestation["validated_metrics"]["validation_runtime"] == runtime
-                and attestation["execution"]["pipeline_execution_id"] == arn.rsplit("/", 1)[1],
-                "Attestation is not bound to this validation/execution")
-        require(attestation.get("attestation_version") == 1
-                and attestation["validated_metrics"] ==
-                {key: value for key, value in receipt.items() if key != "promotion"},
-                "Attestation does not contain the complete validated receipt")
-        require(attestation["source_artifact"]["identity"] == identity
-                and attestation["source_artifact"]["expected_source_uri"] == checkpoint,
-                "Attestation identifies a different source checkpoint")
+        results.run(checks.check_downloaded_attestation_matches_execution,
+                    attestation, digest, receipt, lineage, checkpoint, arn)
         promoted = object_identity(s3, promotion["model_uri"], bucket=cfg.trust_bucket)
-        artifact = attestation["promoted_artifact"]
-        require(promoted["bytes"] == checkpoint_identity["bytes"] == artifact["size_bytes"]
-                and artifact["archive_sha256"] == promotion["archive_sha256"]
-                and artifact["weights_digest_recomputed_by_validate"] ==
-                receipt["weights_digest_recomputed_by_validate"]
-                and promoted["key"] == f"artifacts/v1/sha256/{promotion['archive_sha256']}/model.tar.gz",
-                "Promoted artifact linkage differs")
+        results.run(checks.check_promoted_checkpoint_matches_validated_artifact,
+                    promoted, checkpoint_identity, attestation, receipt)
         if "SuccessGate" in request["steps"]:
-            rate = receipt["success_rate"]
-            require(type(rate) in (int, float) and math.isfinite(rate)
-                    and 1 >= rate >= params["SuccessThreshold"] >= 0, "Success threshold was not met")
+            results.run(checks.check_success_gate_threshold, receipt, params)
         if "RegisterModel" in request["steps"]:
             package_arn = by_name["RegisterModel-RegisterModel"]["Metadata"]["RegisterModel"]["Arn"]
             package = sm.describe_model_package(ModelPackageName=package_arn)
-            containers = package["InferenceSpecification"]["Containers"]
-            metadata = package.get("CustomerMetadataProperties", {})
-            metrics = package.get("ModelMetrics", {}).get("ModelQuality", {}).get("Statistics", {})
-            require(package["ModelPackageStatus"] == "Completed"
-                    and package["ModelApprovalStatus"] == "PendingManualApproval"
-                    and package["ModelPackageGroupName"] == params["ModelPackageGroupName"]
-                    and len(containers) == 1 and containers[0]["ModelDataUrl"] == promotion["model_uri"]
-                    and containers[0]["Image"] == params[
-                        "TrainImageUri" if "FineTune" in request["steps"] else "EvalImageUri"],
-                    "Registered package differs from this execution's promoted model")
-            require(metrics.get("S3Uri") == promotion["attestation_uri"]
-                    and metrics.get("ContentDigest") == "sha256:" + digest,
-                    "Registered metrics do not identify the downloaded attestation")
-            require((metadata.get("eval_only") == "true" and metadata.get("input_checkpoint_uri") == checkpoint)
-                    if request.get("checkpoint_s3") else "eval_only" not in metadata,
-                    "Registered training/evaluation-only mode differs")
+            write_json(directory / "managed-registration.json", package)
+            results.run(checks.check_registered_model_matches_publication,
+                        package, params, request["steps"], promotion, digest, checkpoint,
+                        bool(request.get("checkpoint_s3")))
             result["model_package_arn"] = package_arn
         proof.update(receipt=receipt, receipt_identity=receipt_identity, receipt_sha256=receipt_sha,
                      attestation=attestation, attestation_identity=attestation_identity,
@@ -266,6 +228,8 @@ def verify(record, store):
                       "and training lineage retain Validate's stated verification/attestation scope.")
     proof["output_verification_scope"] = proof["scope"]
     proof["scope"] = result["verification_scope"]
+    result["contract_checks"] = results.summary()
+    require(result["contract_checks"]["status"] == "passed", "A required managed check was not completed")
     write_json(directory / "managed-evidence.json", proof)
     write_json(directory / "independent-verification.json", result)
     return result

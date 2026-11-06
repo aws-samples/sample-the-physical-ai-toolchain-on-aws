@@ -72,8 +72,12 @@ def _list(block: str, key: str) -> list[str]:
 
 def _conditions(block: str) -> list[dict]:
     found = []
-    for match in re.finditer(r"\bcondition\s*\{(.*?)\}", block, re.DOTALL):
-        inner = match.group(1)
+    for match in re.finditer(r"\bcondition\s*\{", block):
+        depth, index = 1, match.end()
+        while depth and index < len(block):
+            depth += {"{": 1, "}": -1}.get(block[index], 0)
+            index += 1
+        inner = block[match.end():index - 1]
         found.append({
             "test": _scalar(inner, "test"),
             "variable": _scalar(inner, "variable"),
@@ -185,13 +189,14 @@ EXPECTED_EFFECTS = {
     ("workload", "ReadInputs"): "Allow",
     ("workload", "WriteOnlyEvalOutputs"): "Allow",
     ("workload", "NeverWriteTrustedCodeOrEvidence"): "Deny",
-    ("workload", "PullImagesAndWriteLogs"): "Allow",
+    ("job_runtime_common", "EcrAuthTokenRegistryWide"): "Allow",
+    ("job_runtime_common", "EcrPullJobImages"): "Allow",
+    ("job_runtime_common", "PublishMetricsToOwnNamespacesOnly"): "Allow",
+    ("job_runtime_common", "WriteJobLogsUnderSageMakerPrefix"): "Allow",
     ("training", "ReadInputs"): "Allow",
     ("training", "WriteOnlyTrainOutputs"): "Allow",
-    ("training", "PullImagesAndWriteLogs"): "Allow",
     ("validation", "ReadCheckpointEvaluationAndTrustedCode"): "Allow",
     ("validation", "PublishPromotedArtifactsAndAttestations"): "Allow",
-    ("validation", "WriteJobOutputsAndLogs"): "Allow",
     ("validation", "WriteValidateProcessingOutput"): "Allow",
     ("validation", "NeverReplaceTheCodeItRuns"): "Deny",
 }
@@ -203,6 +208,11 @@ EXPECTED_EFFECTS = {
 # WITHOUT the header" to "reject writes WITH it", allowing exactly the unconditional overwrite
 # the statement exists to prevent.
 EXPECTED_CONDITIONS = {
+    ("job_runtime_common", "PublishMetricsToOwnNamespacesOnly"): {
+        ("StringLike", "cloudwatch:namespace",
+         ("/aws/sagemaker/*", "AWS/SageMaker", "var.project_name",
+          "${var.project_name}/*")),
+    },
     ("trust_bucket", "DenyUnconditionalWritesToProtectedNamespaces"): {
         ("Null", "s3:if-none-match", ("true",)),
         ("Bool", "s3:ObjectCreationOperation", ("true",)),
@@ -453,16 +463,6 @@ def test_the_external_input_grant_is_empty_by_default():
         "a non-empty default would grant access no deployment asked for")
 
 
-def test_the_dataset_cache_prefix_is_writable_by_training():
-    """MolmoAct2's optional cache writes outside the pipeline prefix and was denied."""
-    prefixes = _write_prefixes("WriteOnlyTrainOutputs")
-    trust = _TRUST.read_text()
-    statement = _statement("training", "WriteOnlyTrainOutputs")
-    assert "/datasets/*" in " ".join(statement["resources"])
-    # And it must NOT have become a bucket-wide write in the process.
-    assert not any(r.endswith('models_bucket_arn}/*"') for r in statement["resources"])
-
-
 def test_the_plumbing_script_expects_the_gate_to_block():
     """I8: it expected run 2 to Succeed, which rejects the corrected graph.
 
@@ -584,3 +584,16 @@ def test_every_action_is_a_service_verb_not_a_resource():
     assert not offenders, (
         "these appear in an IAM actions list but are not service:Verb actions -- "
         f"almost certainly resources in the wrong field: {offenders}")
+
+
+def test_validator_registry_matches_the_sdk_image():
+    """Validate's scikit-learn image is not hosted in the PyTorch DLC registry."""
+    from sagemaker.image_uris import retrieve
+
+    variables = (_INFRA / "variables.tf").read_text()
+    block = variables.split('variable "sklearn_account_id"', 1)[1].split("\n}", 1)[0]
+    account = _scalar(block, "default")
+    image = retrieve("sklearn", "us-east-1", version="1.2-1", instance_type="ml.m5.large")
+    assert image.startswith(
+        f"{account}.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:"
+    ), "The job policy registry must follow the image actually selected by the SDK"

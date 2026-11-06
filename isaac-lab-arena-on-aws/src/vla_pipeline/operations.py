@@ -9,6 +9,7 @@ import re
 import shlex
 import uuid
 from pathlib import Path
+from .cli_context import command_name
 
 
 def timestamp():
@@ -45,7 +46,7 @@ class Store:
         )).expanduser().resolve()
 
     def follow_command(self, run_id):
-        command = ["vla"]
+        command = shlex.split(command_name())
         if self.root != (Path.home() / ".local/state/vla").resolve():
             command += ["--state-dir", str(self.root)]
         return shlex.join([*command, "status", validate_name(run_id), "--follow"])
@@ -61,7 +62,9 @@ class Store:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
             except BlockingIOError as exc:
-                raise OperationBusy(f"Another command is coordinating {name}; use vla status") from exc
+                raise OperationBusy(
+                    f"Another command is coordinating {name}; use {command_name()} status"
+                ) from exc
             try:
                 yield
             finally:
@@ -90,7 +93,8 @@ class Store:
             path.parent.mkdir(parents=True, exist_ok=False, mode=0o700)
         except FileExistsError as exc:
             raise ValueError(
-                f"Run {data['id']} already exists; inspect it with vla status, or use a new ID"
+                f"Run {data['id']} already exists; inspect it with "
+                f"{command_name()} status, or use a new ID"
             ) from exc
         self.save("runs", data)
         return path.parent
