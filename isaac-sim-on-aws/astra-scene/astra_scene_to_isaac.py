@@ -204,9 +204,14 @@ try:
     report["saved_stage"] = out_usd
 
     if not args.headless and args.hold_seconds > 0:
-        for _ in range(int(args.hold_seconds * 60)):
-            if not simulation_app.is_running():
-                break
+        # Hold by wall-clock time. Counting 60 frames per second closed the window
+        # early because the GUI renders faster than 60 fps on these GPUs.
+        import time
+
+        print(f"ASTRA_ISAAC_HOLD viewing for {args.hold_seconds:.0f} s; close the window to stop sooner",
+              flush=True)
+        deadline = time.monotonic() + args.hold_seconds
+        while time.monotonic() < deadline and simulation_app.is_running():
             simulation_app.update()
 except Exception as exc:  # noqa: BLE001
     import traceback
