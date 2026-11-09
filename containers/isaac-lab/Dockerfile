@@ -18,6 +18,10 @@
 # during renderer initialization on that driver branch.
 FROM nvcr.io/nvidia/isaac-lab:3.0.0-beta2
 
+# The current 3.0.0-beta2 image defaults to a non-root user, which cannot chmod the
+# copied entrypoints or link into /usr/local/bin. The validated image ran as root.
+USER root
+
 # Isaac Lab 3 uses the Python 3.12 runtime bundled under _isaac_sim.
 ARG ISAAC_LAB_PYTHON=/workspace/isaaclab/_isaac_sim/kit/python/bin/python3
 
