@@ -375,14 +375,28 @@ try:
 
     start = np.asarray(START_STATE, np.float32).reshape(1, -1)
 
+    first_frame = {"pending": True}
+
     def grab(annot):
-        for _ in range(3):
+        # The first frame can take minutes while RTX compiles shaders on a new
+        # workstation, so wait by wall-clock time instead of a few updates.
+        import time
+
+        limit = 300.0 if first_frame["pending"] else 10.0
+        deadline = time.monotonic() + limit
+        warned = False
+        while True:
             data = annot.get_data()
             if data is not None and getattr(data, "size", 0):
+                first_frame["pending"] = False
                 arr = np.asarray(data)
                 return np.ascontiguousarray(arr[..., :3].astype(np.uint8))
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"camera returned no data after {limit:.0f} s")
+            if first_frame["pending"] and not warned:
+                log("waiting for the first camera frame (RTX shader compile, up to 5 minutes)")
+                warned = True
             simulation_app.update()
-        raise RuntimeError("camera returned no data")
 
     def joints():
         return robot.get_dof_positions(dof_indices=idx).numpy().reshape(-1).astype(np.float32)
