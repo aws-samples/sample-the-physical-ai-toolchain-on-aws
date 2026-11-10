@@ -1,0 +1,62 @@
+{
+  "jobDefinitionName": "arena-smoke-a",
+  "type": "container",
+  "platformCapabilities": [
+    "EC2"
+  ],
+  "containerProperties": {
+    "image": "__IMAGE_URI__",
+    "command": [
+      "set -uo pipefail\nOMNI_KIT_ACCEPT_EULA=YES; ACCEPT_EULA=Y; PRIVACY_CONSENT=Y\nexport OMNI_KIT_ACCEPT_EULA ACCEPT_EULA PRIVACY_CONSENT\nif [ -f /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0 ]; then LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0; export LD_PRELOAD; fi\nldconfig 2>/dev/null || true\necho \"SMOKE_A_START $(date -u +%FT%TZ)\"\nnvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader\ncd /workspace\nt0=$(date +%s)\n/isaac-sim/python.sh isaaclab_arena/evaluation/policy_runner.py --policy_type zero_action \\\n  --num_episodes 1 --num_envs 1 --seed 100 --headless --enable_cameras \\\n  put_item_in_fridge_and_close_door --embodiment gr1_joint > /tmp/smokeA.log 2>&1\nrc=$?\ngrep -vE \"^\\s*$\" /tmp/smokeA.log | tail -80\necho \"SMOKE_A_EXIT rc=$rc seconds=$(( $(date +%s) - t0 ))\"\nexit $rc\n"
+    ],
+    "resourceRequirements": [
+      {
+        "value": "16",
+        "type": "VCPU"
+      },
+      {
+        "value": "122880",
+        "type": "MEMORY"
+      },
+      {
+        "value": "1",
+        "type": "GPU"
+      }
+    ],
+    "environment": [
+      {
+        "name": "OMNI_KIT_ACCEPT_EULA",
+        "value": "YES"
+      },
+      {
+        "name": "ACCEPT_EULA",
+        "value": "Y"
+      },
+      {
+        "name": "DOCKER_RUN_GROUP_NAME",
+        "value": "ubuntu"
+      },
+      {
+        "name": "DOCKER_RUN_GROUP_ID",
+        "value": "1000"
+      },
+      {
+        "name": "DOCKER_RUN_USER_ID",
+        "value": "1000"
+      },
+      {
+        "name": "DOCKER_RUN_USER_NAME",
+        "value": "ubuntu"
+      }
+    ],
+    "linuxParameters": {
+      "sharedMemorySize": 16384
+    }
+  },
+  "retryStrategy": {
+    "attempts": 1
+  },
+  "timeout": {
+    "attemptDurationSeconds": 3600
+  }
+}
