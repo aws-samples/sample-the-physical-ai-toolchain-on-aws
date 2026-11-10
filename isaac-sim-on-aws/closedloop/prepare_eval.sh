@@ -145,6 +145,32 @@ for name, ok in checks.items():
 sys.exit(0 if all(checks.values()) else 1)
 PY
 
+# 7. GR00T image and robot start pose ---------------------------------------------
+# Bootstrap normally pre-stages both (prestage_eval.sh). If it has not finished, pull
+# the image and export the start pose here so the lab still works.
+ECR_REGISTRY="${IMAGE_URI%%/*}"
+ECR_REGION=$(echo "$ECR_REGISTRY" | cut -d. -f4)
+aws ecr get-login-password --region "$ECR_REGION" \
+  | docker login --username AWS --password-stdin "$ECR_REGISTRY" >> "$LOG" 2>&1 \
+  || fail "ECR login for the GR00T image failed"
+if docker image inspect "$IMAGE_URI" >/dev/null 2>&1; then
+  pass "GR00T image already on the workstation"
+else
+  echo "Pulling the GR00T image (about 12 minutes on a cold workstation)..."
+  quiet docker pull --quiet "$IMAGE_URI" || fail "GR00T image pull failed"
+  pass "GR00T image pulled"
+fi
+if [ -s out/trace_ep0.json ]; then
+  pass "robot start pose already exported (out/trace_ep0.json)"
+else
+  quiet docker run --rm -v "$EVAL_DIR:/eval" -v "$(cd "$(dirname "$0")" && pwd):/code:ro" \
+    --entrypoint /workspace/gr00t-repo/.venv/bin/python \
+    "$IMAGE_URI" /code/export_trace.py --episode 0 --no-policy \
+    || fail "robot start pose export failed"
+  [ -s out/trace_ep0.json ] || fail "out/trace_ep0.json was not written"
+  pass "robot start pose exported (out/trace_ep0.json)"
+fi
+
 printf 'export AWS_REGION=%q\nexport IMAGE_URI=%q\nexport DATA_BUCKET=%q\nexport REASON2_ARCHIVE_S3_URI=%q\nexport REASON2_SHA256=%q\nexport JOB_ID=%q\nexport CHECKPOINT_PREFIX=%q\nexport CHECKPOINT_STEPS=%q\n' \
   "$AWS_REGION" "$IMAGE_URI" "$DATA_BUCKET" "$REASON2_ARCHIVE_S3_URI" "$REASON2_SHA256" \
   "$JOB_ID" "$CHECKPOINT_PREFIX" "$STEPS_FOUND" > "$EVAL_DIR/eval.env"
