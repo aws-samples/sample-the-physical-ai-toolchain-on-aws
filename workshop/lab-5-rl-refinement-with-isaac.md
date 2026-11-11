@@ -2,7 +2,7 @@
 
 **Goal:** Train a robust robot policy via reinforcement learning (RL) in Isaac Lab simulation with domain randomization (validated on the built-in Anymal locomotion task)
 **Time:** 3 hours (30 min hands-on + training runs in background)
-**Cost:** ~$3 for smoke test (50 iterations), ~$28 for full training (2000 iterations). Full cost breakdown is in the [main README](../README.md#cost-summary).
+**Cost:** ~$3 for smoke test (50 iterations), ~$28 for full training (2000 iterations). Full cost breakdown is in the [main README](../README.md#estimated-costs).
 
 > **New to RL?** Reinforcement learning trains a policy through trial-and-error in
 > simulation — the robot tries millions of times, guided by a reward signal, until it

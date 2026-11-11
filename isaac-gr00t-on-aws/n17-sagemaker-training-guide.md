@@ -81,7 +81,7 @@ aws codebuild start-build \
 
 ## Step 2: Upload Training Data to S3
 
-Same LeRobot v2.0 UR3 dataset as N1.6 — see [Step 4 in the Batch guide](batch-training-guide.md#step-4-upload-training-data). No format changes for N1.7.
+Same LeRobot v2.0 UR3 dataset as N1.6 — see [Step 4 in the Batch guide](batch-training-guide.md#step-4-prepare-and-stage-the-dataset). No format changes for N1.7.
 
 ---
 

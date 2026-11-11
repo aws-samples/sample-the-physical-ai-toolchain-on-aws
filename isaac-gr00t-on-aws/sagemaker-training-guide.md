@@ -33,7 +33,7 @@ Fine-tune GR00T N1.6 on Amazon SageMaker. SageMaker provisions GPU instances on 
 
 ## Step 1: Upload Training Data to S3
 
-Follow [Step 4 in the Batch guide](batch-training-guide.md#step-4-upload-training-data) to prepare and upload the UR3 dataset.
+Follow [Step 4 in the Batch guide](batch-training-guide.md#step-4-prepare-and-stage-the-dataset) to prepare and upload the UR3 dataset.
 
 ---
 

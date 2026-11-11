@@ -62,8 +62,8 @@ Use **Cosmos Transfer 2.5** to restyle your existing training videos — pixel-f
 ### [Lab 5: RL Policy Training with Isaac Lab](lab-5-rl-refinement-with-isaac.md)
 Train a robot policy from scratch with reinforcement learning using **Isaac Lab** (an RL training framework on top of Isaac Sim that runs 4096 parallel robot copies on one GPU). **PPO** (Proximal Policy Optimization — the standard RL algorithm for robotics) discovers robust strategies through trial-and-error guided by reward signals. Domain randomization makes the policy generalize to real hardware.
 
-### [Lab 6: OSMO Orchestration (Placeholder)](lab-6-osmo-orchestration.md)
-Chain multiple stages (generate → train → evaluate → deploy) into an automated production pipeline on EKS. Contributions welcome.
+### Lab 6: OSMO Orchestration (Placeholder)
+Chain multiple stages (generate → train → evaluate → deploy) into an automated production pipeline on EKS. The lab is not written yet; the OSMO deployment it would build on is in [osmo-on-aws](../osmo-on-aws/). Contributions welcome.
 
 ---
 

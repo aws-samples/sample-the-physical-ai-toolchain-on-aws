@@ -37,7 +37,7 @@
 - [ ] You completed the Marketplace **subscription** (Step 0 / *Prerequisite* below)
 - [ ] Foundation stack already deployed (so the `isaac-lab` image is in your ECR) — needed only for Step 5
 
-> 💸 **Cost reminder:** this instance bills ~$3.00/hr while running. Run Step 8 (`pai workstation stop`) the moment you walk away. Full cost breakdown is in the [main README](../README.md#cost-summary).
+> 💸 **Cost reminder:** this instance bills ~$3.00/hr while running. Run Step 8 (`pai workstation stop`) the moment you walk away. Full cost breakdown is in the [main README](../README.md#estimated-costs).
 
 ---
 
@@ -69,7 +69,7 @@ The Isaac Sim workstation gives you a full visual desktop with GPU rendering, co
 
 ## Prerequisite: Subscribe to the Isaac Sim Marketplace AMI (one time)
 
-> Instance sizing, monthly cost estimates, and the architecture diagram for this workstation live in the [main README](../README.md#cost-summary). This lab stays focused on the hands-on steps.
+> Instance sizing, monthly cost estimates, and the architecture diagram for this workstation live in the [main README](../README.md#estimated-costs). This lab stays focused on the hands-on steps.
 
 This workstation boots the **NVIDIA Isaac Sim AMI** from AWS Marketplace, which ships with the NVIDIA driver, NICE DCV, Docker, and Isaac Sim **pre-installed**. You must subscribe to it **once per account** before deploying, or the EC2 launch fails with a subscription/opt-in error:
 
