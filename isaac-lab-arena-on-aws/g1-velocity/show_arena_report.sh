@@ -23,6 +23,8 @@ echo "PASS - report downloaded to $DEST"
 echo
 column -s, -t < "$DEST/summary.csv"
 echo
+# The workstation image has no web browser; install Firefox once (about a minute).
+command -v firefox >/dev/null || sudo snap install firefox >/dev/null
 if command -v firefox >/dev/null; then
   (DISPLAY="${DISPLAY:-:0}" firefox --new-window "file://$DEST/index.html" >/dev/null 2>&1 &)
   echo "Opened $DEST/index.html in Firefox"
