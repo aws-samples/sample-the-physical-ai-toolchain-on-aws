@@ -92,7 +92,7 @@ export class FoundationStack extends cdk.Stack {
 
     // GR00T fine-tuning container (Path A)
     this.grootTrainingRepo = new ecr.Repository(this, 'GrootTrainingRepo', {
-      repositoryName: `${projectName}/groot-training`,
+      repositoryName: `${projectName}/gr00t-training`,
       imageScanOnPush: true,
       lifecycleRules: [{ maxImageCount: 5 }],
       removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -102,7 +102,7 @@ export class FoundationStack extends cdk.Stack {
     // GR00T inference/serving container — serves a fine-tuned GR00T model as a
     // SageMaker real-time endpoint (Lab 1 deployment step).
     this.grootInferenceRepo = new ecr.Repository(this, 'GrootInferenceRepo', {
-      repositoryName: `${projectName}/groot-inference`,
+      repositoryName: `${projectName}/gr00t-inference`,
       imageScanOnPush: true,
       lifecycleRules: [{ maxImageCount: 5 }],
       removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -386,13 +386,13 @@ export class FoundationStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'GrootTrainingRepoUri', {
       value: this.grootTrainingRepo.repositoryUri,
       description: 'ECR URI for the GR00T training container',
-      exportName: `${projectName}-${environment}-groot-training-ecr`,
+      exportName: `${projectName}-${environment}-gr00t-training-ecr`,
     });
 
     new cdk.CfnOutput(this, 'GrootInferenceRepoUri', {
       value: this.grootInferenceRepo.repositoryUri,
       description: 'ECR URI for the GR00T inference/serving container (Lab 1 deploy)',
-      exportName: `${projectName}-${environment}-groot-inference-ecr`,
+      exportName: `${projectName}-${environment}-gr00t-inference-ecr`,
     });
 
     new cdk.CfnOutput(this, 'InferenceRepoUri', {
