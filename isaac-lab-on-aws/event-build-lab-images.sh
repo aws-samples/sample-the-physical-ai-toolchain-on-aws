@@ -11,7 +11,9 @@
 #   arena-base-0.2.1           Arena 0.2.1 recipe              (intermediate)
 #   arena-base-0.2.1-torchfix  Arena with Isaac Sim's PyTorch  (Arena smoke test)
 #   arena-gr00t-9468a3b        torchfix + GR00T policy servers (intermediate)
-#   arena-g1-dex3              G1 Dex3 GR00T scoring image     (Arena scoring)
+#   arena-g1-dex3              G1 Dex3 GR00T scoring image     (Arena GR00T evaluation)
+#   arena-base-0.3.0           Arena 0.3.0, NVIDIA's recipe    (intermediate)
+#   arena-g1-velocity          G1 velocity RL scoring image    (Arena RL evaluation)
 #
 # Environment:
 #   ECR_REPO_URI        (required) <account>.dkr.ecr.<region>.amazonaws.com/physical-ai/isaac-lab
@@ -37,6 +39,9 @@ ARENA_COMMIT="8b4a3a47fc53de23e8205089d71109a2e2348acd"
 CONNECTOR_COMMIT="9468a3bae1c1711b2d85d45ce222cfbc68dd832d"
 GROOT_COMMIT="1a1837f20538b7d7e21f977a11a5aee14f99803c"
 TOOLCHAIN_REPO="https://github.com/aws-samples/sample-the-physical-ai-toolchain-on-aws.git"
+# Arena 0.3.0 adds experiment_runner and the RSL-RL policy used by the RL evaluation.
+ARENA_RL_REF="release/0.3.0"
+ARENA_RL_COMMIT="8737b4ceb25f99f81a81786b7fde73139b52f324"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 has_tag() {
@@ -153,6 +158,32 @@ EOF
   docker build -t "$ECR_REPO_URI:arena-g1-dex3" "$ctx"
   push arena-g1-dex3
   rm -rf "$ctx"
+fi
+
+# 5. Arena 0.3.0 and the G1 velocity RL scoring image --------------------------------
+if has_tag arena-g1-velocity; then
+  log "SKIP arena-base-0.3.0 and arena-g1-velocity: already in ECR"
+else
+  if has_tag arena-base-0.3.0; then
+    log "SKIP arena-base-0.3.0: already in ECR"
+    docker pull --quiet "$ECR_REPO_URI:arena-base-0.3.0"
+  else
+    log "BUILD arena-base-0.3.0 from Arena $ARENA_RL_REF @ $ARENA_RL_COMMIT"
+    git config --global url."https://github.com/".insteadOf "git@github.com:"
+    rm -rf "$WORK/IsaacLab-Arena-0.3.0"
+    git clone --branch "$ARENA_RL_REF" "$ARENA_REPO" "$WORK/IsaacLab-Arena-0.3.0"
+    git -C "$WORK/IsaacLab-Arena-0.3.0" checkout "$ARENA_RL_COMMIT"
+    git -C "$WORK/IsaacLab-Arena-0.3.0" submodule update --init --recursive --depth 1
+    (cd "$WORK/IsaacLab-Arena-0.3.0" && docker build -t "$ECR_REPO_URI:arena-base-0.3.0" \
+      --file docker/Dockerfile.isaaclab_arena .)
+    push arena-base-0.3.0
+    rm -rf "$WORK/IsaacLab-Arena-0.3.0"
+  fi
+  log "BUILD arena-g1-velocity from isaac-lab-arena-on-aws/g1-velocity"
+  (cd "$TOOLKIT_DIR/isaac-lab-arena-on-aws/g1-velocity" && docker build \
+    --build-arg BASE_IMAGE="$ECR_REPO_URI:arena-base-0.3.0" -t "$ECR_REPO_URI:arena-g1-velocity" .)
+  push arena-g1-velocity
+  prune
 fi
 
 log "DONE all Isaac Lab and Arena images are in $ECR_REPO_URI"

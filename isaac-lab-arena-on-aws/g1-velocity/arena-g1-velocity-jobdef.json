@@ -1,0 +1,23 @@
+{
+  "jobDefinitionName": "arena-g1-velocity",
+  "type": "container",
+  "platformCapabilities": ["EC2"],
+  "containerProperties": {
+    "image": "__IMAGE_URI__",
+    "resourceRequirements": [
+      {"type": "VCPU", "value": "16"},
+      {"type": "MEMORY", "value": "122880"},
+      {"type": "GPU", "value": "1"}
+    ],
+    "environment": [
+      {"name": "DATA_BUCKET", "value": "__DATA_BUCKET__"},
+      {"name": "CHECKPOINT_PREFIX", "value": "__CHECKPOINT_PREFIX__"},
+      {"name": "REGION", "value": "us-east-2"},
+      {"name": "NUM_EPISODES", "value": "16"},
+      {"name": "NUM_ENVS", "value": "16"}
+    ],
+    "linuxParameters": {"sharedMemorySize": 16384}
+  },
+  "retryStrategy": {"attempts": 1},
+  "timeout": {"attemptDurationSeconds": 3600}
+}
