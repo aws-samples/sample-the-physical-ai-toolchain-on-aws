@@ -62,8 +62,10 @@ Orchestrated by: SageMaker Pipeline (groot-finetune-pipeline)
 - The `pai` CLI installed (`pip install -e .` from the repo root — see Lab 0). Every
   step below leads with `pai groot ...`; the raw `python training/gr00t/...` commands
   are in the "Under the hood" drop-downs if you prefer them.
-- `HF_TOKEN` environment variable set (HuggingFace token for the GR00T base-model
-  download; set one to avoid anonymous rate limits during the multi-GB download)
+- A HuggingFace token for the GR00T base-model download (avoids anonymous rate
+  limits during the multi-GB download): either `export HF_TOKEN=...` in the terminal
+  you launch from, or store it once as the `physical-ai/hf-token` secret (Lab 0
+  Step 6), which `pai groot launch` falls back to
   - Get one at https://huggingface.co/settings/tokens
   - Review the model card / license at https://huggingface.co/nvidia/GR00T-N1.6-3B
 - Python 3.11+ with `boto3` and `huggingface-hub` installed
@@ -94,16 +96,15 @@ You should see:
 | SageMakerRoleArn | `arn:aws:iam::<ACCOUNT_ID>:role/physical-ai-dev-sagemaker-role` |
 | GrootTrainingRepoUri | `<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/physical-ai/gr00t-training` |
 
-Save these values — the `pai` commands resolve them for you, but the
-"Under the hood" raw commands and the Step 9 `MODEL_S3` path use `$BUCKET`/`$ECR_URI`:
+The `pai` commands resolve these for you, but the "Under the hood" raw commands
+and Steps 7 and 9 use shell variables. Set them with one command:
+
 ```bash
-export BUCKET=$(aws cloudformation describe-stacks --stack-name PhysicalAi-dev-Foundation \
-  --query 'Stacks[0].Outputs[?OutputKey==`DatasetsBucketName`].OutputValue' --output text)
-export ROLE_ARN=$(aws cloudformation describe-stacks --stack-name PhysicalAi-dev-Foundation \
-  --query 'Stacks[0].Outputs[?OutputKey==`SageMakerRoleArn`].OutputValue' --output text)
-export ECR_URI=$(aws cloudformation describe-stacks --stack-name PhysicalAi-dev-Foundation \
-  --query 'Stacks[0].Outputs[?OutputKey==`GrootTrainingRepoUri`].OutputValue' --output text)
+eval "$(pai env)"   # exports AWS_REGION, BUCKET, ROLE_ARN, ECR_URI (+ JOB_NAME, MODEL_S3 once a job has run)
 ```
+
+> **New terminal?** Shell variables don't carry over. Run
+> `source .venv/bin/activate && eval "$(pai env)"` first, in any step below.
 
 ---
 
@@ -156,7 +157,8 @@ Check what you captured with `python -m robot.ur3.recorder list`.
 # 2a. Pull the dataset from Git LFS and extract it.
 #     The zip's internal root is `episodes/`, so this yields
 #     training/data/episodes/episodes/episode_*.
-git lfs pull
+#     Needs Git LFS (Lab 0 prerequisites): without it the zip is a 135-byte pointer.
+git lfs pull --include="training/data/ur3_episodes_001_027.zip"
 unzip -o training/data/ur3_episodes_001_027.zip -d training/data/episodes
 
 # 2b. Convert Zarr episodes → LeRobot v2 format
@@ -271,7 +273,7 @@ aws codebuild list-builds-for-project --project-name physical-ai-groot-training-
 
 # Is the image in ECR yet? (build takes ~10 min)
 aws ecr describe-images --repository-name physical-ai/gr00t-training \
-  --query 'imageDetails[?contains(imageTags, `latest`)].imagePushedAt' --output text
+  --image-ids imageTag=latest --query 'imageDetails[0].imagePushedAt' --output text
 ```
 
 If the image isn't there yet, watch the build in the [CodeBuild console](https://console.aws.amazon.com/codesuite/codebuild/projects)
@@ -392,8 +394,9 @@ directly with `pai rl status <job-name>` (works for any SageMaker training job).
 <summary>Under the hood (raw command)</summary>
 
 ```bash
-JOB_NAME=$(aws sagemaker list-training-jobs --sort-by CreationTime \
-  --sort-order Descending --max-results 1 \
+# `eval "$(pai env)"` sets this too. The pipeline's training jobs contain "TrainGR00T".
+export JOB_NAME=$(aws sagemaker list-training-jobs --name-contains TrainGR00T \
+  --sort-by CreationTime --sort-order Descending --max-results 1 \
   --query 'TrainingJobSummaries[0].TrainingJobName' --output text)
 
 aws sagemaker describe-training-job --training-job-name $JOB_NAME \
@@ -409,13 +412,22 @@ Status progression: `Pending` → `Downloading` → `Training` → `Uploading` �
 ## Step 7: Review Results
 
 ```bash
-# Download the model artifact (pipeline output path)
-aws s3 cp "s3://$BUCKET/pipeline-output/$JOB_NAME/output/model.tar.gz" /tmp/
-tar -xzf /tmp/model.tar.gz -C /tmp/model-output/
+eval "$(pai env)"   # BUCKET + JOB_NAME (latest GR00T training job)
+
+# The eval report and training metadata are also uploaded as a small
+# output.tar.gz (a few KB) next to the multi-GB model.tar.gz:
+aws s3 cp "s3://$BUCKET/pipeline-output/$JOB_NAME/output/output.tar.gz" /tmp/
+mkdir -p /tmp/model-output
+tar -xzf /tmp/output.tar.gz -C /tmp/model-output/
 
 # View eval report
 cat /tmp/model-output/eval_report.json
 ```
+
+> Jobs trained before this change have the report only inside `model.tar.gz`, as
+> its last file. To read it without downloading the archive, stream it in AWS
+> CloudShell (same region):
+> `aws s3 cp "s3://$BUCKET/pipeline-output/$JOB_NAME/output/model.tar.gz" - | tar -xzO --occurrence=1 --wildcards '*eval_report.json'`
 
 **What the eval report shows:**
 - `baseline_mse_overall` — error if you always predicted the mean action (worst reasonable)
@@ -477,28 +489,60 @@ robot) can ask it for actions. The endpoint runs the `groot-inference` container
 (built in Lab 0 alongside the training image) and loads your `model.tar.gz`.
 
 ```bash
-# The S3 path of a completed training job's model.tar.gz (from Step 7):
-MODEL_S3="s3://$BUCKET/groot-data/ur3/output/<JOB_NAME>/output/model.tar.gz"
+# The model.tar.gz of the latest completed training job. `pai env` reads it from
+# the job (ModelArtifacts.S3ModelArtifacts), under s3://$BUCKET/pipeline-output/:
+eval "$(pai env)" && echo "$MODEL_S3"
 
 # Preview exactly what gets created (no AWS calls):
 pai groot deploy --model-s3 "$MODEL_S3" --endpoint-name groot-ur3 --dry-run
 
 # Deploy (creates model → endpoint-config → endpoint; ~10–30 min to come InService):
 pai groot deploy --model-s3 "$MODEL_S3" --endpoint-name groot-ur3
+
+# Wait until it can take requests. While it's still "Creating", invoke fails with
+# a misleading "Endpoint groot-ur3 ... not found":
+aws sagemaker wait endpoint-in-service --endpoint-name groot-ur3
 ```
+
+If the endpoint ends up `Failed` with `InsufficientInstanceCapacity`, the region had
+no free capacity for that GPU type: `pai groot delete --endpoint-name groot-ur3`,
+then redeploy with another type (`--instance-type ml.g6.2xlarge` or `ml.g5.4xlarge`)
+or try again later.
 
 The endpoint runs on `ml.g5.2xlarge` (GR00T inference needs a GPU). GR00T loads
 slowly, so the container's startup health-check timeout is set to 30 minutes.
 
-**Call the endpoint** — give it a wrist image + the 7D robot state + the task:
+**Call the endpoint** — give it a wrist image + the 7D robot state + the task.
+Take a real one from your converted dataset (episode 0, first frame), so the input
+looks like what the model trained on:
+
+```bash
+eval "$(python - <<'PY'
+import cv2, json, shlex, pandas as pd
+root = "training/data/ur3_lerobot_dataset"
+ok, frame = cv2.VideoCapture(f"{root}/videos/chunk-000/observation.images.wrist/episode_000000.mp4").read()
+cv2.imwrite("wrist.jpg", frame)
+df = pd.read_parquet(f"{root}/data/chunk-000/episode_000000.parquet")
+tasks = [json.loads(line)["task"] for line in open(f"{root}/meta/tasks.jsonl")]
+print("export STATE=" + ",".join(f"{v:.4f}" for v in df["observation.state"].iloc[0]))
+print("export TASK=" + shlex.quote(tasks[int(df["task_index"].iloc[0])]))
+PY
+)"
+echo "$STATE | $TASK"
+```
+
+Then call it:
 
 ```bash
 pai groot invoke --endpoint-name groot-ur3 \
   --image-path wrist.jpg \
-  --state "0,-1.57,1.57,-1.57,-1.57,0,0" \
-  --task "pick up the red cube"
+  --state "$STATE" \
+  --task "$TASK"
 # → {"actions": [[vx, vy, vz, rx, ry, rz, gripper], ...], "action_dim": 7}
 ```
+
+After a 100-step smoke run the actions only show the endpoint works; judge policy
+quality after the full run (Step 8).
 
 **Tear it down** when finished (a running GPU endpoint bills continuously):
 
@@ -515,7 +559,7 @@ python training/gr00t/deploy_endpoint.py --model-s3 "$MODEL_S3" \
 python training/gr00t/deploy_endpoint.py --model-s3 "$MODEL_S3" --endpoint-name groot-ur3
 
 python training/gr00t/deploy_endpoint.py --invoke --endpoint-name groot-ur3 \
-  --image-path wrist.jpg --state "0,-1.57,1.57,-1.57,-1.57,0,0" --task "pick up the red cube"
+  --image-path wrist.jpg --state "$STATE" --task "$TASK"
 
 python training/gr00t/deploy_endpoint.py --delete --endpoint-name groot-ur3
 ```

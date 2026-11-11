@@ -64,6 +64,12 @@ def main():
         pass
 
     try:
+        from pai.commands import env
+        env.register(cli)
+    except ImportError:
+        pass
+
+    try:
         from pai.commands import rl
         rl.register(cli)
     except ImportError:

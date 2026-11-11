@@ -30,6 +30,7 @@ to train, refine, and deploy a pick-and-place robot policy.
 | AWS CDK CLI | Deploy stacks | `npx cdk --version` |
 | NVIDIA NGC API key | CodeBuild pulls Isaac Sim/Lab/Cosmos base images from NGC (NVIDIA's container registry) | Generate at https://ngc.nvidia.com/setup/api-key |
 | Hugging Face token | Pull GR00T base model (during training) | Create at https://huggingface.co/settings/tokens |
+| Git LFS | Lab 1 pulls the UR3 demo dataset (`training/data/*.zip`) from Git LFS | `git lfs version` (install: `brew install git-lfs` or `sudo apt-get install git-lfs`, then `git lfs install`) |
 
 > **No Docker required.** All container images are built in **AWS CodeBuild** and
 > pushed to ECR automatically when you deploy the Foundation stack. You never run
@@ -101,6 +102,15 @@ aws secretsmanager create-secret --name physical-ai/ngc-api-key \
 
 (The GR00T training image builds from a public base and needs no NGC key — so if
 you only plan to do Lab 1, this step is optional.)
+
+Optionally, store your Hugging Face token the same way. `pai groot launch` reads
+`HF_TOKEN` from your shell first and falls back to this secret, so a new terminal
+doesn't lose it. `read -rs` keeps the token out of your screen and shell history:
+
+```bash
+read -rs HF_TOKEN && aws secretsmanager create-secret --name physical-ai/hf-token \
+  --secret-string "$HF_TOKEN" --region $CDK_DEFAULT_REGION && unset HF_TOKEN
+```
 
 ### 7. Verify
 
