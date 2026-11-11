@@ -1,50 +1,48 @@
 #!/bin/bash
 # =============================================================================
-# Isaac Lab AWS Batch Multi-Node Parallel Training Entrypoint
+# Isaac Lab 3 AWS Batch Multi-Node Parallel Training Entrypoint
 #
-# Translates AWS Batch MNP environment variables to torchrun, mirroring the
-# SageMaker entrypoint's distributed logic but reading from Batch's runtime
-# env instead of resourceconfig.json.
+# Translates AWS Batch MNP environment variables to torchrun. The validated
+# workshop path is one g6e.4xlarge, one L40S GPU, and the built-in G1 task.
 #
 # Environment variables (set by AWS Batch MNP):
 #   AWS_BATCH_JOB_NUM_NODES                - Total number of nodes
 #   AWS_BATCH_JOB_NODE_INDEX               - This node's index (0-based)
-#   AWS_BATCH_JOB_MAIN_NODE_INDEX          - Main node index (typically 0)
 #   AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS - Main node IP for rendezvous
 #
-# Environment variables (set by job definition or nodeOverrides):
-#   TASK              - Isaac Lab task name (default: Isaac-Velocity-Flat-Anymal-D-v0)
+# Environment variables (set by the job definition or node overrides):
+#   TASK              - Isaac Lab task (default: Isaac-Velocity-Flat-G1-v0)
 #   NUM_ENVS          - Parallel environments (default: 4096)
 #   MAX_ITERATIONS    - Training iterations (default: 100)
-#   PROC_PER_NODE     - Processes (GPUs) per node (default: 4)
+#   PROC_PER_NODE     - Processes/GPUs per node (default: 1)
 #   FRAMEWORK         - RL framework: skrl | rsl_rl | rl_games (default: rsl_rl)
-#   CHECKPOINT_BUCKET - S3 bucket for persisting checkpoints (default: none)
+#   CHECKPOINT_BUCKET - S3 bucket for checkpoints (default: none)
 #   CHECKPOINT_PREFIX - S3 key prefix (default: checkpoints/<job_id>)
 #
-# NOTE: Multi-node NCCL convergence is UNVALIDATED on hardware. This script
-# wires the topology correctly but has not been run end-to-end on g6 instances.
+# Single-node, single-GPU G1 training is validated on g6e.4xlarge. Multi-node
+# NCCL convergence remains unvalidated on hardware.
 # =============================================================================
 
-set -e
+set -euo pipefail
+
+ISAAC_LAB_ROOT="/workspace/isaaclab"
+ISAAC_LAB_PYTHON="$ISAAC_LAB_ROOT/_isaac_sim/python.sh"
 
 # --- Read AWS Batch MNP topology ---
 NNODES=${AWS_BATCH_JOB_NUM_NODES:-1}
 NODE_RANK=${AWS_BATCH_JOB_NODE_INDEX:-0}
-MAIN_NODE_INDEX=${AWS_BATCH_JOB_MAIN_NODE_INDEX:-0}
 MAIN_IP=${AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS:-localhost}
 
-# --- Count GPUs ---
-NPROC=${PROC_PER_NODE:-4}  # job def sets this to match the instance's GPU count
-
-# --- Read hyperparameters from ENV (set by job def or node overrides) ---
-TASK="${TASK:-Isaac-Velocity-Flat-Anymal-D-v0}"
+# --- Read runtime configuration ---
+NPROC=${PROC_PER_NODE:-1}
+TASK="${TASK:-Isaac-Velocity-Flat-G1-v0}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 FRAMEWORK="${FRAMEWORK:-rsl_rl}"
 
-# --- Print info ---
+# --- Print the effective request ---
 echo "============================================================"
-echo "  Isaac Lab RL Training (AWS Batch MNP)"
+echo "  Isaac Lab 3 RL Training (AWS Batch)"
 echo "  Main node IP:   $MAIN_IP"
 echo "  Nodes:          $NNODES"
 echo "  Node rank:      $NODE_RANK"
@@ -55,28 +53,20 @@ echo "  Max iterations: $MAX_ITERATIONS"
 echo "  Framework:      $FRAMEWORK"
 echo "============================================================"
 
-# --- Set Isaac Sim environment ---
 export ACCEPT_EULA=Y
+export PRIVACY_CONSENT=Y
 export OMNI_ENV_PRIVACY_CONSENT=Y
 
-# --- NCCL_SOCKET_IFNAME: prefer autodetect ---
-# Some ECS-optimized AMIs use eth0, others use ens5. If you hit NCCL errors like
-# "no usable NICs found", uncomment the auto-detect line or set it to the correct
-# interface name. Leaving this UNSET lets NCCL autodetect, which usually works.
-# To force autodetect at runtime:
-# export NCCL_SOCKET_IFNAME=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
-# echo "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
-
-# --- Determine training script based on framework ---
-case $FRAMEWORK in
+# --- Determine the training script ---
+case "$FRAMEWORK" in
     skrl)
-        TRAIN_SCRIPT="scripts/reinforcement_learning/skrl/train.py"
+        TRAIN_SCRIPT="$ISAAC_LAB_ROOT/scripts/reinforcement_learning/skrl/train.py"
         ;;
     rsl_rl)
-        TRAIN_SCRIPT="scripts/reinforcement_learning/rsl_rl/train.py"
+        TRAIN_SCRIPT="$ISAAC_LAB_ROOT/scripts/reinforcement_learning/rsl_rl/train.py"
         ;;
     rl_games)
-        TRAIN_SCRIPT="scripts/reinforcement_learning/rl_games/train.py"
+        TRAIN_SCRIPT="$ISAAC_LAB_ROOT/scripts/reinforcement_learning/rl_games/train.py"
         ;;
     *)
         echo "ERROR: Unknown framework: $FRAMEWORK"
@@ -84,18 +74,13 @@ case $FRAMEWORK in
         ;;
 esac
 
-# --- EFS symlink for persistent checkpoints ---
-# The job definition mounts EFS at /efs. Symlink the framework's output dir to
-# /efs/models/<job_id> so checkpoints + tensorboard persist beyond the container
-# and are visible from all nodes.
+# --- Persist checkpoints outside the container ---
 JOB_ID=${AWS_BATCH_JOB_ID:-local}
-OUTPUT_DIR="/tmp/checkpoints/${JOB_ID}"
+export OUTPUT_DIR="/tmp/checkpoints/${JOB_ID}"
 mkdir -p "$OUTPUT_DIR"
 
-# The RL scripts write logs/rsl_rl/<run> or logs/skrl/<run>. Link that to local dir:
-cd /workspace/isaaclab
+cd "$ISAAC_LAB_ROOT"
 mkdir -p logs
-# Point the framework's log dir to output
 FRAMEWORK_LOG_DIR="logs/${FRAMEWORK}"
 if [ ! -L "$FRAMEWORK_LOG_DIR" ]; then
     mkdir -p "$OUTPUT_DIR/$FRAMEWORK"
@@ -103,46 +88,49 @@ if [ ! -L "$FRAMEWORK_LOG_DIR" ]; then
     echo "Linked $FRAMEWORK_LOG_DIR -> $OUTPUT_DIR/$FRAMEWORK"
 fi
 
-# --- Launch training via torchrun ---
-echo "Launching torchrun (rendezvous endpoint: $MAIN_IP:29500) ..."
+TRAIN_ARGS=(
+    "$TRAIN_SCRIPT"
+    "--task=$TASK"
+    "--num_envs=$NUM_ENVS"
+    "--max_iterations=$MAX_ITERATIONS"
+    "--headless"
+)
 
-# rsl_rl/skrl/rl_games only enable multi-GPU gradient sync when --distributed is
-# passed. Without it, all torchrun procs collide on cuda:0 with no NCCL init.
-# Single-GPU single-node runs (the validated path) don't need it.
-DIST_FLAG=""
-if [ "$NNODES" -gt 1 ] || [ "$NPROC" -gt 1 ]; then
-    DIST_FLAG="--distributed"
+# Match the DCV-validated path for the workshop's single-GPU job. Keep torchrun
+# only for explicitly configured multi-process or multi-node jobs.
+if [ "$NNODES" -eq 1 ] && [ "$NPROC" -eq 1 ]; then
+    echo "Launching validated single-GPU Isaac Lab 3 training..."
+    "$ISAAC_LAB_ROOT/isaaclab.sh" -p "${TRAIN_ARGS[@]}"
+else
+    echo "Launching distributed training via torchrun ($NNODES node(s), $NPROC process(es) per node)..."
+    TRAIN_ARGS+=("--distributed")
+    "$ISAAC_LAB_PYTHON" -m torch.distributed.run \
+        --nproc_per_node="$NPROC" \
+        --nnodes="$NNODES" \
+        --node_rank="$NODE_RANK" \
+        --rdzv_id=isaaclab-batch-job \
+        --rdzv_backend=c10d \
+        --rdzv_endpoint="$MAIN_IP:29500" \
+        "${TRAIN_ARGS[@]}"
 fi
-
-/isaac-sim/python.sh -m torch.distributed.run \
-    --nproc_per_node=$NPROC \
-    --nnodes=$NNODES \
-    --node_rank=$NODE_RANK \
-    --rdzv_id=isaaclab-batch-job \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint=$MAIN_IP:29500 \
-    $TRAIN_SCRIPT \
-    --task=$TASK \
-    --num_envs=$NUM_ENVS \
-    --max_iterations=$MAX_ITERATIONS \
-    --headless \
-    $DIST_FLAG
 
 echo "Training complete. Checkpoints saved to $OUTPUT_DIR"
 
-# --- Upload checkpoints to S3 (using boto3 — aws CLI not installed) ---
+# --- Upload checkpoints to S3 (the image includes boto3; AWS CLI is not required) ---
 if [ -n "${CHECKPOINT_BUCKET:-}" ]; then
     S3_PREFIX="${CHECKPOINT_PREFIX:-checkpoints/${JOB_ID}}"
     echo "Uploading checkpoints to s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}/ ..."
     python3 -c "
-import os, boto3, pathlib
+import os
+import pathlib
+import boto3
 
 bucket = os.environ['CHECKPOINT_BUCKET']
 prefix = os.environ.get('CHECKPOINT_PREFIX', f'checkpoints/{os.environ.get(\"AWS_BATCH_JOB_ID\", \"local\")}')
 s3 = boto3.client('s3')
 uploaded = 0
+seen_files = set()
 
-# Search known checkpoint locations
 search_dirs = [
     os.environ.get('OUTPUT_DIR', '/tmp/checkpoints'),
     '/workspace/isaaclab/logs',
@@ -153,25 +141,23 @@ for search_dir in search_dirs:
     base = pathlib.Path(search_dir)
     if not base.exists():
         continue
-    for f in base.rglob('*'):
-        if f.is_file():
-            key = f'{prefix}/{f.relative_to(base)}'
-            print(f'  Uploading {f} -> s3://{bucket}/{key}')
-            s3.upload_file(str(f), bucket, key)
-            uploaded += 1
+    for file_path in base.rglob('*'):
+        if not file_path.is_file():
+            continue
+        resolved = file_path.resolve()
+        if resolved in seen_files:
+            continue
+        seen_files.add(resolved)
+        key = f'{prefix}/{file_path.relative_to(base)}'
+        print(f'  Uploading {file_path} -> s3://{bucket}/{key}')
+        s3.upload_file(str(file_path), bucket, key)
+        uploaded += 1
 
 if uploaded == 0:
-    # Fallback: search for model files anywhere
-    import glob
-    for pattern in ['**/*.pt', '**/*.pth', '**/*.onnx', '**/*.csv']:
-        for f in glob.glob(f'/workspace/{pattern}', recursive=True):
-            key = f'{prefix}/{os.path.basename(f)}'
-            print(f'  Uploading {f} -> s3://{bucket}/{key}')
-            s3.upload_file(f, bucket, key)
-            uploaded += 1
+    raise RuntimeError('No Isaac Lab training artifacts were found to upload')
 
 print(f'Done. Uploaded {uploaded} files to s3://{bucket}/{prefix}/')
 "
 else
-    echo "WARNING: CHECKPOINT_BUCKET not set. Checkpoints will be lost when container exits."
+    echo "WARNING: CHECKPOINT_BUCKET not set. Checkpoints will be lost when the container exits."
 fi

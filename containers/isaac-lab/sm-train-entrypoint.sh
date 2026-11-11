@@ -9,13 +9,16 @@
 # Isaac Lab RL training via torchrun.
 #
 # Environment variables (set by SageMaker or hyperparameters):
-#   TASK              - Isaac Lab task name (default: Isaac-Velocity-Flat-Anymal-D-v0)
+#   TASK              - Isaac Lab task name (default: Isaac-Velocity-Flat-G1-v0)
 #   NUM_ENVS          - Parallel environments (default: 4096)
 #   MAX_ITERATIONS    - Training iterations (default: 100)
 #   FRAMEWORK         - RL framework: skrl | rsl_rl | rl_games (default: rsl_rl)
 # =============================================================================
 
-set -e
+set -euo pipefail
+
+ISAAC_LAB_ROOT="/workspace/isaaclab"
+ISAAC_LAB_PYTHON="$ISAAC_LAB_ROOT/_isaac_sim/python.sh"
 
 # --- Read SageMaker resource config for multi-node setup ---
 RESOURCE_CONFIG="/opt/ml/input/config/resourceconfig.json"
@@ -39,14 +42,14 @@ NPROC=$(nvidia-smi -L | wc -l)
 # --- Read hyperparameters ---
 HYPERPARAMS="/opt/ml/input/config/hyperparameters.json"
 if [ -f "$HYPERPARAMS" ]; then
-    TASK=$(python3 -c "import json; print(json.load(open('$HYPERPARAMS')).get('task', 'Isaac-Velocity-Flat-Anymal-D-v0'))")
+    TASK=$(python3 -c "import json; print(json.load(open('$HYPERPARAMS')).get('task', 'Isaac-Velocity-Flat-G1-v0'))")
     NUM_ENVS=$(python3 -c "import json; print(json.load(open('$HYPERPARAMS')).get('num_envs', '4096'))")
     MAX_ITERATIONS=$(python3 -c "import json; print(json.load(open('$HYPERPARAMS')).get('max_iterations', '100'))")
     FRAMEWORK=$(python3 -c "import json; print(json.load(open('$HYPERPARAMS')).get('framework', 'rsl_rl'))")
     MODE=$(python3 -c "import json; print(json.load(open('$HYPERPARAMS')).get('mode', 'train'))")
     VIDEO_LENGTH=$(python3 -c "import json; print(json.load(open('$HYPERPARAMS')).get('video_length', '400'))")
 else
-    TASK="${TASK:-Isaac-Velocity-Flat-Anymal-D-v0}"
+    TASK="${TASK:-Isaac-Velocity-Flat-G1-v0}"
     NUM_ENVS="${NUM_ENVS:-4096}"
     MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
     FRAMEWORK="${FRAMEWORK:-rsl_rl}"
@@ -71,6 +74,7 @@ echo "============================================================"
 
 # --- Set Isaac Sim environment ---
 export ACCEPT_EULA=Y
+export PRIVACY_CONSENT=Y
 export OMNI_ENV_PRIVACY_CONSENT=Y
 
 # =============================================================================
@@ -101,12 +105,12 @@ if [ "$MODE" = "play" ] || [ "$MODE" = "video" ]; then
     fi
     echo "Using checkpoint: $CKPT"
 
-    cd /workspace/isaaclab
-    PLAY_SCRIPT="scripts/reinforcement_learning/${FRAMEWORK}/play.py"
+    cd "$ISAAC_LAB_ROOT"
+    PLAY_SCRIPT="$ISAAC_LAB_ROOT/scripts/reinforcement_learning/${FRAMEWORK}/play.py"
 
     # Single env for a clean, watchable video. play.py writes the MP4 to
     # <checkpoint_dir>/videos/play/, which we then copy to the SM output dir.
-    /isaac-sim/python.sh "$PLAY_SCRIPT" \
+    "$ISAAC_LAB_PYTHON" "$PLAY_SCRIPT" \
         --task="$TASK" \
         --num_envs=1 \
         --checkpoint="$CKPT" \
@@ -142,7 +146,7 @@ case $FRAMEWORK in
 esac
 
 # --- Launch training via torchrun ---
-cd /workspace/isaaclab
+cd "$ISAAC_LAB_ROOT"
 
 # rsl_rl/skrl/rl_games only enable multi-GPU gradient sync when --distributed is
 # passed. Without it, all torchrun procs collide on cuda:0 with no NCCL init.
@@ -152,7 +156,7 @@ if [ "$NNODES" -gt 1 ] || [ "$NPROC" -gt 1 ]; then
     DIST_FLAG="--distributed"
 fi
 
-/isaac-sim/python.sh -m torch.distributed.run \
+"$ISAAC_LAB_PYTHON" -m torch.distributed.run \
     --nproc_per_node=$NPROC \
     --nnodes=$NNODES \
     --node_rank=$NODE_RANK \

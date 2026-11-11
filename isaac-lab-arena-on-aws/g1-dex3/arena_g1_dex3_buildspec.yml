@@ -1,0 +1,68 @@
+version: 0.2
+# Adds the G1 Dex3 blue-box evaluation to the Arena GR00T connector image:
+#   * the Isaac-GR00T commit the g1_dex3 checkpoint was trained with (1a1837f2), as
+#     /workspace/gr00t-repo, so policy_bridge.py loads the checkpoint exactly as in training
+#   * the AWS CLI, for staging the checkpoint from S3 inside the Batch job
+#   * the Arena environment, the policy adapter, the bridge and the job script
+#
+# Required environment variables:
+#   ECR_REPO_URI  <account>.dkr.ecr.<region>.amazonaws.com/physical-ai/isaac-lab
+#   BASE_TAG      arena-gr00t-9468a3b
+#   IMAGE_TAG     arena-g1-dex3
+#   FILES_B64     base64 of a .tar.gz holding arena_g1_bluebox_env.py, arena_g1_dex3_policy.py,
+#                 policy_bridge.py and arena_g1_eval.sh
+env:
+  shell: bash
+  variables:
+    SRC_REPO: "https://github.com/aws-samples/sample-the-physical-ai-toolchain-on-aws.git"
+    SRC_COMMIT: "9468a3bae1c1711b2d85d45ce222cfbc68dd832d"
+    GROOT_COMMIT: "1a1837f20538b7d7e21f977a11a5aee14f99803c"
+phases:
+  pre_build:
+    commands:
+      - set -euo pipefail
+      - REGISTRY=${ECR_REPO_URI%%/*}
+      - REGION=$(echo "$REGISTRY" | cut -d. -f4)
+      - aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+      - mkdir -p ctx/files && cd ctx
+      - echo "$FILES_B64" | base64 -d | tar -xz -C files
+      - git clone --filter=blob:none "$SRC_REPO" src && git -C src checkout "$SRC_COMMIT"
+      - cp src/containers/gr00t-training/g1_dex3_modality_config.py files/
+      - ls -l files
+  build:
+    commands:
+      - set -euo pipefail
+      - cd "$CODEBUILD_SRC_DIR/ctx"
+      - |
+        cat > Dockerfile <<EOF
+        FROM $ECR_REPO_URI:$BASE_TAG
+        USER root
+        RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip curl && rm -rf /var/lib/apt/lists/* \
+         && curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscli.zip \
+         && unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip && aws --version
+        RUN GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/NVIDIA/Isaac-GR00T.git /workspace/gr00t-repo \
+         && git -C /workspace/gr00t-repo checkout $GROOT_COMMIT \
+         && test "\$(git -C /workspace/gr00t-repo rev-parse HEAD)" = "$GROOT_COMMIT" \
+         && git lfs install --skip-repo \
+         && git -C /workspace/gr00t-repo lfs pull --include "scripts/deployment/**/wheels/*.whl"
+        RUN cd /workspace/gr00t-repo && export UV_HTTP_RETRIES=10 UV_HTTP_TIMEOUT=120 \
+         && (uv sync --no-dev --no-install-package deepspeed --python 3.12 || uv sync --no-dev --no-install-package deepspeed --python 3.12)
+        RUN /workspace/gr00t-repo/.venv/bin/python -c "import pyarrow; from gr00t.policy.gr00t_policy import Gr00tPolicy; print('BRIDGE_VENV_OK')"
+        COPY files/ /opt/g1dex3/
+        RUN mkdir -p /opt/ml/code && cp /opt/g1dex3/g1_dex3_modality_config.py /opt/ml/code/ \
+         && SP=\$(/isaac-sim/python.sh -c "import site; print(site.getsitepackages()[0])") \
+         && cp /opt/g1dex3/arena_g1_bluebox_env.py /opt/g1dex3/arena_g1_dex3_policy.py "\$SP/" \
+         && chmod +x /opt/g1dex3/arena_g1_eval.sh \
+         && /isaac-sim/python.sh -m py_compile "\$SP/arena_g1_bluebox_env.py" "\$SP/arena_g1_dex3_policy.py" \
+         && grep -c "return Qwen3VLProcessor.from_pretrained(model_name, \*\*transformers_loading_kwargs)" /workspace/gr00t-repo/gr00t/model/gr00t_n1d7/processing_gr00t_n1d7.py
+        ENTRYPOINT ["/bin/bash", "/opt/g1dex3/arena_g1_eval.sh"]
+        CMD []
+        EOF
+      - cat Dockerfile
+      - docker build -t "$ECR_REPO_URI:$IMAGE_TAG" .
+  post_build:
+    commands:
+      - set -euo pipefail
+      - test "$CODEBUILD_BUILD_SUCCEEDING" = 1
+      - docker push "$ECR_REPO_URI:$IMAGE_TAG"
+      - echo "DONE $ECR_REPO_URI:$IMAGE_TAG"

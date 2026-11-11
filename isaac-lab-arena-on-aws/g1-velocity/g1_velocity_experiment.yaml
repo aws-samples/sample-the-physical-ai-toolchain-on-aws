@@ -1,0 +1,72 @@
+# Arena Experiment: evaluate the workshop's G1 velocity policy (RSL-RL) in closed loop.
+#
+#   /isaac-sim/python.sh arena_run.py experiment_runner --headless \
+#       --experiment_config g1_velocity_experiment.yaml \
+#       shared.policy.checkpoint_path=<run dir>/model_<N>.pt
+#
+# Values under shared apply to every run. A run lists only what differs.
+# Override a shared value on the command line with shared.<path>=<value>; only keys
+# declared below can be overridden. The checkpoint's folder must also contain
+# params/agent.yaml, which Isaac Lab's train.py writes next to the checkpoints.
+shared:
+  environment:
+    type: g1_flat_velocity
+    # Short evaluation episodes in simulated seconds. Training used 20.
+    episode_length_s: 10.0
+    # Command ranges of the training task (Isaac-Velocity-Flat-G1-v0).
+    lin_vel_x_min: 0.0
+    lin_vel_x_max: 1.0
+    lin_vel_y_min: -0.5
+    lin_vel_y_max: 0.5
+    ang_vel_z_min: -1.0
+    ang_vel_z_max: 1.0
+    rel_standing_envs: 0.02
+    heading_command: true
+    vel_xy_success_threshold: 0.5
+    vel_yaw_success_threshold: 0.8
+  policy:
+    type: rsl_rl
+    checkpoint_path: /path/to/model_99.pt
+    device: cuda:0
+  environment_builder:
+    num_envs: 16
+    env_spacing: 2.5
+    # No objects to place: each robot spawns where Isaac Lab's reset event puts it.
+    solve_relations: false
+    seed: 42
+  rollout_limit:
+    num_episodes: 16
+runs:
+  # The headline score: commands sampled from the training ranges.
+  train_distribution: {}
+  # Straight walk at 1 m/s.
+  forward_1p0:
+    environment:
+      lin_vel_x_min: 1.0
+      lin_vel_x_max: 1.0
+      lin_vel_y_min: 0.0
+      lin_vel_y_max: 0.0
+      ang_vel_z_min: 0.0
+      ang_vel_z_max: 0.0
+      rel_standing_envs: 0.0
+      heading_command: false
+  # Rotate in place, a command the policy rarely sees in training.
+  turn_in_place:
+    environment:
+      lin_vel_x_min: 0.0
+      lin_vel_x_max: 0.0
+      lin_vel_y_min: 0.0
+      lin_vel_y_max: 0.0
+      rel_standing_envs: 0.0
+      heading_command: false
+  # Zero command for every robot: does it stay upright?
+  stand_still:
+    environment:
+      lin_vel_x_min: 0.0
+      lin_vel_x_max: 0.0
+      lin_vel_y_min: 0.0
+      lin_vel_y_max: 0.0
+      ang_vel_z_min: 0.0
+      ang_vel_z_max: 0.0
+      rel_standing_envs: 1.0
+      heading_command: false

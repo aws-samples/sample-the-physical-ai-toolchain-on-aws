@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cosmos3.fullname" . }}-server
+  labels:
+    {{- include "cosmos3.labels" . | nindent 4 }}
+data:
+  start-server.sh: |
+    set -euo pipefail
+    mkdir -p /models/hf-cache
+
+    COSMOS_GUARDRAIL_REVISION="cf03c0395fac8c4de386c0bdab12cc4fc8d66362"
+    COSMOS_GUARDRAIL1_REVISION="d6d4bfa899a71454a700907664f3e88f503950cf"
+    QWEN3_GUARD_REVISION="fada3b2f655b89601929198343c94cd2f64d93cc"
+    guardrail_cache_ready() {
+      test -s "/models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/snapshots/${COSMOS_GUARDRAIL_REVISION}/config.json" \
+        && test -s "/models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/snapshots/${COSMOS_GUARDRAIL1_REVISION}/video_content_safety_filter/safety_filter.pt" \
+        && test -s "/models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/snapshots/${QWEN3_GUARD_REVISION}/config.json" \
+        && test -s "/models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/snapshots/${QWEN3_GUARD_REVISION}/model.safetensors"
+    }
+
+    case "${COSMOS_MODEL}" in
+      super)
+        MODEL_ID="nvidia/Cosmos3-Super"
+        SERVE_ARGS="--cfg-parallel-size 2 --ulysses-degree 4 --use-hsdp --hsdp-shard-size 8"
+        ;;
+      nano)
+        MODEL_ID="nvidia/Cosmos3-Nano"
+        LOCAL_MODEL_DIR="/models/cosmos3-nano"
+        SERVE_ARGS="--vae-use-tiling"
+        ;;
+      *)
+        echo "ERROR: Unknown COSMOS_MODEL '${COSMOS_MODEL}'" >&2
+        exit 1
+        ;;
+    esac
+
+    if ! command -v aws >/dev/null 2>&1; then
+      echo "=== Installing AWS CLI ==="
+      pip3 install --quiet awscli==1.46.2
+    fi
+
+    if [ -n "${LOCAL_MODEL_DIR:-}" ] \
+       && { [ ! -d "$LOCAL_MODEL_DIR" ] \
+            || [ -z "$(ls -A "$LOCAL_MODEL_DIR" 2>/dev/null)" ] \
+            || ! guardrail_cache_ready; } \
+       && [ -n "${COSMOS_ARCHIVE_S3_URI:-}" ]; then
+      [ -n "${COSMOS_ARCHIVE_SHA256:-}" ] || {
+        echo "ERROR: COSMOS_ARCHIVE_SHA256 is required" >&2
+        exit 1
+      }
+      ARCHIVE=/models/cosmos3-nano.tar
+      NEXT_DIR=/models/cosmos3-nano.next
+      NEXT_HF_HOME=/models/hf-cache.next
+      echo "=== Restoring Cosmos runtime bundle from participant S3 ==="
+      aws s3 cp "$COSMOS_ARCHIVE_S3_URI" "$ARCHIVE" \
+        --region "$AWS_REGION" --only-show-errors
+      printf '%s  %s\n' "$COSMOS_ARCHIVE_SHA256" "$ARCHIVE" | sha256sum -c -
+      rm -rf "$NEXT_DIR" "$NEXT_HF_HOME"
+      mkdir -p "$NEXT_DIR"
+      tar -xf "$ARCHIVE" -C "$NEXT_DIR"
+      test -s "$NEXT_DIR/config.json"
+      test -s "$NEXT_DIR/model.safetensors.index.json"
+      test -s "$NEXT_DIR/transformer/diffusion_pytorch_model.safetensors.index.json"
+      test -s "$NEXT_DIR/vae/diffusion_pytorch_model.safetensors"
+      test -s "$NEXT_DIR/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/snapshots/${COSMOS_GUARDRAIL_REVISION}/config.json"
+      test -s "$NEXT_DIR/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/snapshots/${COSMOS_GUARDRAIL1_REVISION}/video_content_safety_filter/safety_filter.pt"
+      test -s "$NEXT_DIR/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/snapshots/${QWEN3_GUARD_REVISION}/model.safetensors"
+      mv "$NEXT_DIR/hf-cache" "$NEXT_HF_HOME"
+      rm -rf "$LOCAL_MODEL_DIR" /models/hf-cache
+      mv "$NEXT_DIR" "$LOCAL_MODEL_DIR"
+      mv "$NEXT_HF_HOME" /models/hf-cache
+      rm -f "$ARCHIVE"
+      echo "=== Restored and verified Cosmos model and guardrails ==="
+    fi
+
+    if [ "${REQUIRE_LOCAL_WEIGHTS:-false}" = "true" ]; then
+      guardrail_cache_ready || {
+        echo "ERROR: pinned offline guardrail snapshots are incomplete" >&2
+        exit 1
+      }
+      mkdir -p \
+        /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs \
+        /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs \
+        /models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/refs
+      printf '%s' "$COSMOS_GUARDRAIL_REVISION" \
+        > /models/hf-cache/hub/models--nvidia--Cosmos-1.0-Guardrail/refs/main
+      printf '%s' "$COSMOS_GUARDRAIL1_REVISION" \
+        > /models/hf-cache/hub/models--nvidia--Cosmos-Guardrail1/refs/main
+      printf '%s' "$QWEN3_GUARD_REVISION" \
+        > /models/hf-cache/hub/models--Qwen--Qwen3Guard-Gen-0.6B/refs/main
+    fi
+
+    if [ -n "${LOCAL_MODEL_DIR:-}" ] && [ -d "$LOCAL_MODEL_DIR" ] \
+       && [ -n "$(ls -A "$LOCAL_MODEL_DIR" 2>/dev/null)" ]; then
+      MODEL_ID="$LOCAL_MODEL_DIR"
+    elif [ "${REQUIRE_LOCAL_WEIGHTS:-false}" = "true" ]; then
+      echo "ERROR: staged Cosmos weights are required" >&2
+      exit 1
+    fi
+
+    echo "=== Starting reusable vLLM-Omni server: ${MODEL_ID} ==="
+    exec vllm serve "$MODEL_ID" --omni $SERVE_ARGS \
+      --init-timeout 2400 --stage-init-timeout 1800 \
+      --host 0.0.0.0 --port 8000

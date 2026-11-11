@@ -116,7 +116,7 @@ You should see one `t3.medium` node, `Ready`.
 
 ### Install the NVIDIA device plugin (one-time, cluster-wide)
 
-The GPU node's AMI (`AL2_x86_64_GPU`) has drivers baked in, but Kubernetes still needs the device plugin to expose GPUs as an allocatable resource:
+The GPU node's AMI (`AL2023_x86_64_NVIDIA`) has drivers baked in, but Kubernetes still needs the device plugin to expose GPUs as an allocatable resource:
 
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.0/deployments/static/nvidia-device-plugin.yml

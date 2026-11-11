@@ -1,6 +1,6 @@
 # Isaac Lab on AWS
 
-Train reinforcement learning policies with [NVIDIA Isaac Lab](https://developer.nvidia.com/isaac/lab) on AWS GPU infrastructure. Isaac Lab runs thousands of parallel simulation environments on a single GPU, training robust robot policies through trial-and-error guided by reward signals.
+Train reinforcement learning policies with [NVIDIA Isaac Lab](https://developer.nvidia.com/isaac/lab) on AWS GPU infrastructure. The validated G1 path uses the `3.0.0-beta2` container because its Isaac Sim renderer is compatible with the NVIDIA R595 driver on the current AWS Marketplace workstation. Isaac Lab runs thousands of parallel simulation environments on a single GPU, training robust robot policies through trial-and-error guided by reward signals.
 
 ---
 
@@ -101,7 +101,7 @@ Both paths accept the same training configuration via environment variables:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `TASK` | `Isaac-Velocity-Flat-Anymal-D-v0` | Isaac Lab task name |
+| `TASK` | `Isaac-Velocity-Flat-G1-v0` | Isaac Lab task name |
 | `NUM_ENVS` | `4096` | Parallel simulation environments per GPU |
 | `MAX_ITERATIONS` | `100` | PPO training iterations |
 | `PROC_PER_NODE` | `1` | GPUs per node (match your instance) |
@@ -113,7 +113,8 @@ Both paths accept the same training configuration via environment variables:
 
 | Task | Type | Description |
 |------|------|-------------|
-| `Isaac-Velocity-Flat-Anymal-D-v0` | Locomotion | Quadruped walking on flat terrain (validated) |
+| `Isaac-Velocity-Flat-G1-v0` | Locomotion | Unitree G1 walking on flat terrain (validated on L40S) |
+| `Isaac-Velocity-Flat-Anymal-D-v0` | Locomotion | Quadruped walking on flat terrain |
 | `Isaac-Velocity-Rough-Anymal-D-v0` | Locomotion | Quadruped on rough terrain |
 | `Isaac-Reach-Franka-v0` | Manipulation | Franka arm reaching |
 | `PickAndPlaceUR3-v0` | Manipulation | UR3 pick-and-place (registered, not yet container-wired) |

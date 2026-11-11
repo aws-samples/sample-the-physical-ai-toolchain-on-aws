@@ -108,7 +108,7 @@ You'll see a Franka robot arm performing a pick-and-place task — reaching, gra
 
 After training in [Isaac Lab](../isaac-lab-on-aws/) or [GR00T](../isaac-gr00t-on-aws/), you can visualize policies and run training with the GUI viewport inside a Docker container on the workstation.
 
-> **Important:** GUI mode requires `nvcr.io/nvidia/isaac-lab:3.0.0-beta2` from NGC. The ECR-hosted container (`physical-ai/isaac-lab:latest`, based on Isaac Lab 2.1.0) crashes with a segfault in `librtx.scenedb.plugin.so` when rendering due to driver incompatibility with the host's NVIDIA driver (595.71.05). Only the 3.0.0-beta2 container is validated for GUI rendering on this AMI.
+> **Important:** GUI mode requires Isaac Lab `3.0.0-beta2` on the current workstation AMI. Legacy ECR images based on Isaac Lab 2.1.0 and the NGC 2.3.2 image crash in `librtx.scenedb.plugin.so` with driver 595.71.05. Use `nvcr.io/nvidia/isaac-lab:3.0.0-beta2` directly or rebuild `physical-ai/isaac-lab:3.0.0-beta2-g1` from the current Dockerfile.
 
 ### Pull the Isaac Lab 3.0.0-beta2 container
 
@@ -147,19 +147,22 @@ The Isaac Sim viewport opens showing the cartpole environments rendering in real
 aws s3 cp s3://physical-ai-dev-checkpoints-<ACCOUNT_ID>/checkpoints/<JOB_ID>/ \
   ~/checkpoints/ --recursive --region us-east-2
 
-# Inside the container — play the trained policy with rendering
-./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
-  --task Isaac-Velocity-Flat-Anymal-D-v0 \
+# Inside the container — play the version-matched G1 checkpoint with Kit rendering
+./isaaclab.sh play \
+  --rl_library rsl_rl \
+  --task Isaac-Velocity-Flat-G1-v0 \
   --checkpoint /workspace/checkpoints/model_99.pt \
-  --num_envs 16
+  --num_envs 1 \
+  --viz kit
 ```
 
 ### Container compatibility matrix
 
 | Container | Headless Training | GUI Rendering | Notes |
 |-----------|:-:|:-:|-------|
-| `nvcr.io/nvidia/isaac-lab:3.0.0-beta2` | ✅ | ✅ | Validated — use for GUI mode |
-| ECR `physical-ai/isaac-lab:latest` (2.1.0) | ✅ | ❌ Segfault | RTX renderer incompatible with driver 595.71.05 |
+| `nvcr.io/nvidia/isaac-lab:3.0.0-beta2` | ✅ | ✅ | Validated on L40S with driver 595.71.05 |
+| ECR `physical-ai/isaac-lab:3.0.0-beta2-g1` | ✅ | ✅ | Built from the same validated base image |
+| Legacy ECR `physical-ai/isaac-lab:2.1.0-g1` | ✅ | ❌ Segfault | Keep only for reproducing legacy 2.1 checkpoints |
 | `nvcr.io/nvidia/isaac-lab:2.3.2` | ✅ | ❌ Segfault | Same driver incompatibility |
 
 ---

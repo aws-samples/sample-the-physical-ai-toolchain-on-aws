@@ -1,0 +1,45 @@
+fullnameOverride: ""
+
+image:
+  ref: vllm/vllm-omni:cosmos3
+  pullPolicy: IfNotPresent
+
+aws:
+  region: ""
+
+serviceAccount:
+  name: cosmos3-generator
+
+model:
+  variant: nano
+  requireLocalWeights: true
+  archiveS3Uri: ""
+  archiveSha256: ""
+
+gpu:
+  count: 1
+
+nodeSelector:
+  node.kubernetes.io/purpose: gpu
+
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+modelCache:
+  hostPath: /opt/cosmos3
+
+sharedMemory:
+  sizeLimit: 64Gi
+
+probes:
+  startup:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 180
+  readiness:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3

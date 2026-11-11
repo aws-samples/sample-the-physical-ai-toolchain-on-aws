@@ -181,7 +181,7 @@ Or watch in the [CodeBuild console](https://us-east-2.console.aws.amazon.com/cod
 
 **Build time:** 30-60 minutes (pulling 16 GB NGC base image is the bottleneck).
 
-**What it produces:** A ~16 GB container image at `<ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/physical-ai/isaac-lab:latest`
+**What it produces:** A ~16 GB container image at `<ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/physical-ai/isaac-lab:3.0.0-beta2-g1`
 
 ---
 
@@ -195,7 +195,7 @@ aws batch register-job-definition \
   --type container \
   --region us-east-2 \
   --container-properties '{
-    "image": "<ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/physical-ai/isaac-lab:latest",
+    "image": "<ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/physical-ai/isaac-lab:3.0.0-beta2-g1",
     "command": ["/opt/ml/code/batch-train"],
     "resourceRequirements": [
       {"type": "VCPU", "value": "16"},

@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "fullnameOverride": {"type": "string", "maxLength": 63},
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "pullPolicy"],
+      "properties": {
+        "ref": {"type": "string", "minLength": 1},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "aws": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["region"],
+      "properties": {
+        "region": {"type": "string", "pattern": "^$|^[a-z]{2}(?:-gov)?-[a-z]+-[0-9]+$"}
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant", "requireLocalWeights", "archiveS3Uri", "archiveSha256"],
+      "properties": {
+        "variant": {"type": "string", "enum": ["nano", "super"]},
+        "requireLocalWeights": {"type": "boolean"},
+        "archiveS3Uri": {"type": "string", "pattern": "^$|^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/.+$"},
+        "archiveSha256": {"type": "string", "pattern": "^$|^[0-9a-f]{64}$"}
+      }
+    },
+    "gpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count"],
+      "properties": {"count": {"type": "integer", "minimum": 1, "maximum": 8}}
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "operator", "effect"],
+        "properties": {
+          "key": {"type": "string"},
+          "operator": {"type": "string"},
+          "value": {"type": "string"},
+          "effect": {"type": "string"}
+        }
+      }
+    },
+    "modelCache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostPath"],
+      "properties": {"hostPath": {"type": "string", "pattern": "^/.*$"}}
+    },
+    "sharedMemory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sizeLimit"],
+      "properties": {"sizeLimit": {"type": "string", "pattern": "^[1-9][0-9]*(?:Mi|Gi)$"}}
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startup", "readiness"],
+      "properties": {
+        "startup": {"$ref": "#/definitions/probe"},
+        "readiness": {"$ref": "#/definitions/probe"}
+      }
+    }
+  },
+  "required": ["image", "aws", "serviceAccount", "model", "gpu", "nodeSelector", "tolerations", "modelCache", "sharedMemory", "probes"],
+  "definitions": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "periodSeconds": {"type": "integer", "minimum": 1},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "failureThreshold": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

@@ -1,4 +1,19 @@
-data "aws_caller_identity" "current" {}
+# Uncounted, so it is read on every plan (EKS, EC2-only and both-off). The network
+# preconditions live here for that reason: they hold on every path.
+data "aws_caller_identity" "current" {
+  lifecycle {
+    # All-or-nothing: mixing an explicit VPC with SSM subnets (or vice versa) would put
+    # the cluster/server in one VPC and its nodes/subnet in another.
+    precondition {
+      condition     = (var.vpc_id == "") == (length(var.private_subnet_ids) == 0)
+      error_message = "Set vpc_id and private_subnet_ids together, or leave both empty to read them from SSM."
+    }
+    precondition {
+      condition     = length(var.eks_control_plane_subnet_ids) == 0 || var.vpc_id != ""
+      error_message = "eks_control_plane_subnet_ids requires vpc_id and private_subnet_ids to be set."
+    }
+  }
+}
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
@@ -6,17 +21,44 @@ locals {
   prefix     = "${var.project_name}-${var.environment}"
 }
 
-# Read shared resources from foundation
+# Foundation-created ECR repositories and instance profile, read only when needed
 data "aws_ssm_parameter" "cosmos_transfer_ecr" {
-  name = "/${var.project_name}/ecr/cosmos-transfer"
+  count = var.enable_image_builds ? 1 : 0
+  name  = "/${var.project_name}/ecr/cosmos-transfer"
 }
 
 data "aws_ssm_parameter" "cosmos3_ecr" {
-  name = "/${var.project_name}/ecr/cosmos3"
+  count = var.enable_image_builds ? 1 : 0
+  name  = "/${var.project_name}/ecr/cosmos3"
 }
 
+# Read whenever today's code would need it: image builds on (default, keeps the standalone
+# data-source set identical) or the EC2 server on without an explicit profile.
 data "aws_ssm_parameter" "cosmos_instance_profile" {
-  name = "/${var.project_name}/cosmos-instance-profile"
+  count = (var.enable_image_builds || var.enable_ec2_server) && var.server_instance_profile == "" ? 1 : 0
+  name  = "/${var.project_name}/cosmos-instance-profile"
+}
+
+# The image-build resources below became count-gated on enable_image_builds. These let
+# existing standalone state move to the [0] addresses without a destroy and recreate.
+moved {
+  from = aws_codebuild_project.cosmos_transfer
+  to   = aws_codebuild_project.cosmos_transfer[0]
+}
+
+moved {
+  from = aws_codebuild_project.cosmos3
+  to   = aws_codebuild_project.cosmos3[0]
+}
+
+moved {
+  from = aws_iam_role.codebuild
+  to   = aws_iam_role.codebuild[0]
+}
+
+moved {
+  from = aws_iam_role_policy.codebuild
+  to   = aws_iam_role_policy.codebuild[0]
 }
 
 # =============================================================================
@@ -24,9 +66,10 @@ data "aws_ssm_parameter" "cosmos_instance_profile" {
 # =============================================================================
 
 resource "aws_codebuild_project" "cosmos_transfer" {
+  count        = var.enable_image_builds ? 1 : 0
   name         = "${local.prefix}-cosmos-transfer-build"
   description  = "Build Cosmos Transfer 2.5 container from source"
-  service_role = aws_iam_role.codebuild.arn
+  service_role = aws_iam_role.codebuild[0].arn
 
   artifacts {
     type = "NO_ARTIFACTS"
@@ -40,7 +83,7 @@ resource "aws_codebuild_project" "cosmos_transfer" {
 
     environment_variable {
       name  = "ECR_REPO_URI"
-      value = data.aws_ssm_parameter.cosmos_transfer_ecr.value
+      value = data.aws_ssm_parameter.cosmos_transfer_ecr[0].value
     }
 
     environment_variable {
@@ -83,9 +126,10 @@ resource "aws_codebuild_project" "cosmos_transfer" {
 # =============================================================================
 
 resource "aws_codebuild_project" "cosmos3" {
+  count        = var.enable_image_builds ? 1 : 0
   name         = "${local.prefix}-cosmos3-build"
   description  = "Build Cosmos 3 (cosmos-framework) container from source"
-  service_role = aws_iam_role.codebuild.arn
+  service_role = aws_iam_role.codebuild[0].arn
 
   artifacts {
     type = "NO_ARTIFACTS"
@@ -99,7 +143,7 @@ resource "aws_codebuild_project" "cosmos3" {
 
     environment_variable {
       name  = "ECR_REPO_URI"
-      value = data.aws_ssm_parameter.cosmos3_ecr.value
+      value = data.aws_ssm_parameter.cosmos3_ecr[0].value
     }
 
     environment_variable {
@@ -142,7 +186,8 @@ resource "aws_codebuild_project" "cosmos3" {
 # =============================================================================
 
 resource "aws_iam_role" "codebuild" {
-  name = "${local.prefix}-cosmos-codebuild-role"
+  count = var.enable_image_builds ? 1 : 0
+  name  = "${local.prefix}-cosmos-codebuild-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -155,8 +200,9 @@ resource "aws_iam_role" "codebuild" {
 }
 
 resource "aws_iam_role_policy" "codebuild" {
-  name = "${local.prefix}-cosmos-codebuild-policy"
-  role = aws_iam_role.codebuild.id
+  count = var.enable_image_builds ? 1 : 0
+  name  = "${local.prefix}-cosmos-codebuild-policy"
+  role  = aws_iam_role.codebuild[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"

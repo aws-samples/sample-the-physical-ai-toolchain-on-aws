@@ -1,0 +1,28 @@
+{
+  "jobDefinitionName": "arena-g1-dex3",
+  "type": "container",
+  "platformCapabilities": ["EC2"],
+  "containerProperties": {
+    "image": "__IMAGE_URI__",
+    "resourceRequirements": [
+      {"type": "VCPU", "value": "16"},
+      {"type": "MEMORY", "value": "122880"},
+      {"type": "GPU", "value": "1"}
+    ],
+    "environment": [
+      {"name": "DATA_BUCKET", "value": "__DATA_BUCKET__"},
+      {"name": "CHECKPOINT_PREFIX", "value": "__CHECKPOINT_PREFIX__"},
+      {"name": "REASON2_KEY", "value": "model-artifacts/cosmos-reason2-2b.tar"},
+      {"name": "REASON2_SHA256", "value": "__REASON2_SHA256__"},
+      {"name": "REGION", "value": "us-east-2"},
+      {"name": "EPISODES", "value": "10"},
+      {"name": "SAMPLES", "value": "4"},
+      {"name": "MODE", "value": "eval"},
+      {"name": "OMNI_KIT_ACCEPT_EULA", "value": "YES"},
+      {"name": "ACCEPT_EULA", "value": "Y"}
+    ],
+    "linuxParameters": {"sharedMemorySize": 16384}
+  },
+  "retryStrategy": {"attempts": 1},
+  "timeout": {"attemptDurationSeconds": 7200}
+}

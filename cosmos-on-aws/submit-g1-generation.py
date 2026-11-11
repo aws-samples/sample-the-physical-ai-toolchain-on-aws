@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""Submit one G1 V2V generation to a port-forwarded Cosmos 3 service."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import urlopen
+
+DEFAULT_INPUT_KEY = (
+    "teleoperation-data/pick_place_data/videos/chunk-000/"
+    "observation.images.cam_high/episode_000000.mp4"
+)
+DEFAULT_NEGATIVE_PROMPT = (
+    "blurry, distorted, low quality, jittery, jerky motion, sudden acceleration, "
+    "deformed hands, fused fingers, extra fingers, floating objects, deforming box, "
+    "slipping grasp, camera shake, camera movement, scene cuts, flicker"
+)
+RUN_ID = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,47}[a-z0-9])?$")
+KUBERNETES_NAME = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
+
+
+def run(command: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        check=True,
+        text=True,
+        capture_output=capture,
+    )
+
+
+def load_stack_outputs(stack_name: str, region: str) -> dict[str, str]:
+    try:
+        result = run(
+            [
+                "aws",
+                "cloudformation",
+                "describe-stacks",
+                "--stack-name",
+                stack_name,
+                "--region",
+                region,
+                "--output",
+                "json",
+            ],
+            capture=True,
+        )
+        rows = json.loads(result.stdout)["Stacks"][0]["Outputs"]
+    except FileNotFoundError as exc:
+        raise RuntimeError("AWS CLI is not installed or is not on PATH") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(exc.stderr.strip() or "AWS CLI returned an error") from exc
+    except (json.JSONDecodeError, KeyError, IndexError) as exc:
+        raise RuntimeError("CloudFormation returned an unexpected response") from exc
+    return {row["OutputKey"]: row["OutputValue"] for row in rows}
+
+
+def validate_settings(
+    run_id: str,
+    prompt: str,
+    seed: int,
+    server_url: str,
+    deployment_name: str = "cosmos3-g1-server",
+) -> None:
+    if not RUN_ID.fullmatch(run_id):
+        raise ValueError(
+            "run ID must use lowercase letters, numbers, and hyphens (maximum 49 characters)"
+        )
+    if not prompt.strip():
+        raise ValueError("prompt must not be empty")
+    if not 0 <= seed <= 4_294_967_295:
+        raise ValueError("seed must be between 0 and 4294967295")
+    if not KUBERNETES_NAME.fullmatch(deployment_name):
+        raise ValueError(
+            "deployment name must be a lowercase Kubernetes DNS label of at most 63 characters"
+        )
+    parsed = urlparse(server_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port:
+        raise ValueError("server URL must be an explicit http://127.0.0.1:<port> URL")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("server URL must not contain a path, query, or fragment")
+
+
+def output_names(run_id: str) -> tuple[str, str]:
+    return (
+        f"g1_pick_blue_box_{run_id}.mp4",
+        f"g1_pick_blue_box_{run_id}_reference.mp4",
+    )
+
+
+def object_exists(bucket: str, key: str, region: str) -> bool:
+    result = subprocess.run(
+        [
+            "aws",
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--region",
+            region,
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True
+    detail = result.stderr
+    if "404" in detail or "Not Found" in detail or "NoSuchKey" in detail:
+        return False
+    raise RuntimeError(detail.strip() or f"unable to inspect s3://{bucket}/{key}")
+
+
+def parse_s3_uri(uri: str) -> tuple[str, str]:
+    parsed = urlparse(uri)
+    key = parsed.path.lstrip("/")
+    if (
+        parsed.scheme != "s3"
+        or not parsed.netloc
+        or not key
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"invalid S3 URI: {uri}")
+    return parsed.netloc, key
+
+
+def download_s3_object(
+    bucket: str,
+    key: str,
+    destination: Path,
+    region: str,
+) -> None:
+    run(
+        [
+            "aws",
+            "s3",
+            "cp",
+            f"s3://{bucket}/{key}",
+            str(destination),
+            "--region",
+            region,
+            "--only-show-errors",
+        ]
+    )
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError(f"S3 input is empty: s3://{bucket}/{key}")
+
+
+def normalize_video(
+    source: Path,
+    destination: Path,
+    deployment_name: str,
+    run_id: str,
+) -> str:
+    ffmpeg_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        str(destination),
+    ]
+    if shutil.which("ffmpeg") is not None:
+        run(ffmpeg_command)
+        return "workstation ffmpeg"
+
+    if shutil.which("kubectl") is None:
+        raise RuntimeError(
+            "ffmpeg is unavailable locally and kubectl is required for in-Pod normalization"
+        )
+    pod_result = run(
+        [
+            "kubectl",
+            "get",
+            "pod",
+            "-l",
+            f"app={deployment_name}",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+        capture=True,
+    )
+    pod = pod_result.stdout.strip()
+    if not pod:
+        raise RuntimeError(f"no ready Pod found for Deployment {deployment_name}")
+
+    remote_directory = f"/tmp/cosmos3-client-{run_id}"
+    remote_source = f"{remote_directory}/reference-source.mp4"
+    remote_destination = f"{remote_directory}/reference-h264.mp4"
+    try:
+        run(["kubectl", "exec", pod, "--", "mkdir", "-p", remote_directory])
+        run(["kubectl", "cp", str(source), f"{pod}:{remote_source}"])
+        run(
+            [
+                "kubectl",
+                "exec",
+                pod,
+                "--",
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                remote_source,
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                remote_destination,
+            ]
+        )
+        run(["kubectl", "cp", f"{pod}:{remote_destination}", str(destination)])
+    finally:
+        subprocess.run(
+            ["kubectl", "exec", pod, "--", "rm", "-rf", remote_directory],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError("in-Pod video normalization produced no output")
+    return f"Cosmos Pod {pod}"
+
+
+def get_json(url: str, timeout: int = 15) -> dict:
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            return json.load(response)
+    except (HTTPError, URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cosmos service request failed: {exc}") from exc
+
+
+def get_model_id(server_url: str) -> str:
+    document = get_json(server_url.rstrip("/") + "/v1/models")
+    models = document.get("data", [])
+    if not models or not models[0].get("id"):
+        raise RuntimeError("Cosmos service returned no model ID")
+    return str(models[0]["id"])
+
+
+def build_create_command(
+    server_url: str,
+    model_id: str,
+    prompt: str,
+    negative_prompt: str,
+    seed: int,
+    video_path: Path,
+    edge_control_path: Path | None = None,
+) -> list[str]:
+    if edge_control_path is None:
+        size = "1280x720"
+        num_frames = 189
+        fps = 24
+        num_inference_steps = 35
+        guidance_scale = 6.0
+        extra_params = {
+            "condition_frame_indexes_vision": [0, 1],
+            "condition_video_keep": "first",
+        }
+    else:
+        # Match Jathavan's recorded Cosmos3-Nano transfer configuration.
+        size = "1104x832"
+        num_frames = 121
+        fps = 30
+        num_inference_steps = 50
+        guidance_scale = 3.0
+        extra_params = {
+            "condition_frame_indexes_vision": [0, 1],
+            "condition_video_keep": "first",
+            "edge": {"control_weight": 1.0},
+            "control_guidance": 2.0,
+            "max_frames": 121,
+            "num_video_frames_per_chunk": 121,
+            "num_conditional_frames": 1,
+            "num_first_chunk_conditional_frames": 0,
+            "share_vision_temporal_positions": True,
+            "emphasize_control_in_prompt": False,
+            "transfer_resize_mode": "center_crop",
+            "transfer_output_size": "model",
+            "resolution": "720",
+        }
+
+    command = [
+        "curl",
+        "-fsS",
+        "-X",
+        "POST",
+        server_url.rstrip("/") + "/v1/videos",
+        "-H",
+        "Accept: application/json",
+        "--form-string",
+        f"model={model_id}",
+        "--form-string",
+        f"prompt={prompt}",
+        "--form-string",
+        f"negative_prompt={negative_prompt}",
+        "--form-string",
+        f"size={size}",
+        "--form-string",
+        f"num_frames={num_frames}",
+        "--form-string",
+        f"fps={fps}",
+        "--form-string",
+        f"num_inference_steps={num_inference_steps}",
+        "--form-string",
+        f"guidance_scale={guidance_scale}",
+        "--form-string",
+        "max_sequence_length=4096",
+        "--form-string",
+        "flow_shift=10.0",
+        "--form-string",
+        "extra_params=" + json.dumps(extra_params, separators=(",", ":")),
+        "--form-string",
+        f"seed={seed}",
+        "-F",
+        f"input_reference=@{video_path};type=video/mp4",
+    ]
+    if edge_control_path is not None:
+        command.extend(
+            [
+                "-F",
+                f"control_reference=@{edge_control_path};type=video/mp4",
+                "--form-string",
+                "control_type=edge",
+            ]
+        )
+    return command
+
+
+def wait_for_completion(server_url: str, video_id: str, timeout_minutes: int) -> None:
+    deadline = time.monotonic() + timeout_minutes * 60
+    poll = 0
+    while time.monotonic() < deadline:
+        poll += 1
+        document = get_json(server_url.rstrip("/") + f"/v1/videos/{video_id}")
+        status = document.get("status", "unknown")
+        print(f"[{poll}] status={status}")
+        if status == "completed":
+            return
+        if status in {"failed", "cancelled"}:
+            raise RuntimeError(f"Cosmos generation {status}: {document}")
+        time.sleep(10)
+    raise RuntimeError(f"Cosmos generation exceeded {timeout_minutes} minutes")
+
+
+def download_content(server_url: str, video_id: str, destination: Path) -> None:
+    url = server_url.rstrip("/") + f"/v1/videos/{video_id}/content"
+    try:
+        with urlopen(url, timeout=120) as response, destination.open("wb") as target:
+            shutil.copyfileobj(response, target)
+    except (HTTPError, URLError, OSError) as exc:
+        raise RuntimeError(f"Unable to download generated video: {exc}") from exc
+    if destination.stat().st_size == 0:
+        raise RuntimeError("Generated video is empty")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Submit one sequential G1 V2V request to the reusable Cosmos service"
+    )
+    parser.add_argument("--region", required=True)
+    parser.add_argument("--stack-name", default="physical-ai-toolchain")
+    parser.add_argument(
+        "--data-bucket",
+        help="Validated participant data bucket; otherwise read from stack outputs",
+    )
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
+    parser.add_argument("--server-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--deployment-name", default="cosmos3-g1-server")
+    parser.add_argument("--input-key", default=DEFAULT_INPUT_KEY)
+    parser.add_argument(
+        "--input-s3-uri",
+        help="S3 URI for the prepared source video; overrides --input-key",
+    )
+    parser.add_argument(
+        "--input-file",
+        type=Path,
+        help="Local prepared source video; overrides --input-key",
+    )
+    parser.add_argument(
+        "--edge-control-s3-uri",
+        help="S3 URI for the paired 121-frame edge control video",
+    )
+    parser.add_argument(
+        "--edge-control-file",
+        type=Path,
+        help="Local 121-frame edge control video paired with the prepared source",
+    )
+    parser.add_argument("--output-prefix", default="cosmos3-generated")
+    parser.add_argument("--timeout-minutes", type=int, default=30)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        validate_settings(
+            args.run_id,
+            args.prompt,
+            args.seed,
+            args.server_url,
+            args.deployment_name,
+        )
+        if args.timeout_minutes < 1 or args.timeout_minutes > 60:
+            raise ValueError("timeout must be between 1 and 60 minutes")
+        if args.input_file is not None and args.input_s3_uri:
+            raise ValueError("use only one of --input-file and --input-s3-uri")
+        if args.edge_control_file is not None and args.edge_control_s3_uri:
+            raise ValueError(
+                "use only one of --edge-control-file and --edge-control-s3-uri"
+            )
+        for label, path in (
+            ("input file", args.input_file),
+            ("edge control file", args.edge_control_file),
+        ):
+            if path is not None and not path.expanduser().is_file():
+                raise ValueError(f"{label} does not exist: {path}")
+        for executable in ("aws", "curl"):
+            if shutil.which(executable) is None:
+                raise RuntimeError(f"required command is not installed: {executable}")
+        if shutil.which("ffmpeg") is None and shutil.which("kubectl") is None:
+            raise RuntimeError("either ffmpeg or kubectl is required for video normalization")
+
+        lock_path = Path.home() / ".cache" / "cosmos3-generation.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = lock_path.open("w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "another Cosmos generation client is already running on this workstation"
+            ) from exc
+
+        if args.data_bucket:
+            bucket = args.data_bucket
+        else:
+            outputs = load_stack_outputs(args.stack_name, args.region)
+            bucket = outputs.get("DataBucketName")
+            if not bucket:
+                raise RuntimeError("DataBucketName was not found in stack outputs")
+
+        input_s3 = None
+        if args.input_file is None:
+            input_s3 = (
+                parse_s3_uri(args.input_s3_uri)
+                if args.input_s3_uri
+                else (bucket, args.input_key)
+            )
+        edge_s3 = (
+            parse_s3_uri(args.edge_control_s3_uri)
+            if args.edge_control_s3_uri
+            else None
+        )
+        for label, location in (
+            ("prepared source video", input_s3),
+            ("edge control video", edge_s3),
+        ):
+            if location is not None and not object_exists(
+                location[0], location[1], args.region
+            ):
+                raise RuntimeError(
+                    f"{label} was not found at s3://{location[0]}/{location[1]}"
+                )
+
+        generated_name, reference_name = output_names(args.run_id)
+        for name in (generated_name, reference_name):
+            key = f"{args.output_prefix}/{name}"
+            if object_exists(bucket, key, args.region):
+                raise RuntimeError(
+                    f"run ID '{args.run_id}' already has output at s3://{bucket}/{key}"
+                )
+
+        model_id = get_model_id(args.server_url)
+        print(f"PASS - Cosmos service ready: {model_id}")
+        print(f"Run ID: {args.run_id}")
+        print(f"Generated object: s3://{bucket}/{args.output_prefix}/{generated_name}")
+
+        with tempfile.TemporaryDirectory(prefix=f"cosmos3-{args.run_id}-") as directory:
+            work = Path(directory)
+            source = work / "reference-source.mp4"
+            normalized = work / "reference-h264.mp4"
+            edge_normalized = work / "edge-control-h264.mp4"
+            generated = work / "generated.mp4"
+
+            if args.input_file is not None:
+                shutil.copyfile(args.input_file.expanduser(), source)
+            else:
+                assert input_s3 is not None
+                download_s3_object(
+                    input_s3[0], input_s3[1], source, args.region
+                )
+            normalization_path = normalize_video(
+                source,
+                normalized,
+                args.deployment_name,
+                args.run_id,
+            )
+            print(f"PASS - Input normalized with {normalization_path}")
+
+            edge_path = None
+            if args.edge_control_file is not None or edge_s3 is not None:
+                edge_source = work / "edge-control-source.mp4"
+                if args.edge_control_file is not None:
+                    shutil.copyfile(args.edge_control_file.expanduser(), edge_source)
+                else:
+                    assert edge_s3 is not None
+                    download_s3_object(
+                        edge_s3[0], edge_s3[1], edge_source, args.region
+                    )
+                edge_normalization_path = normalize_video(
+                    edge_source,
+                    edge_normalized,
+                    args.deployment_name,
+                    args.run_id,
+                )
+                edge_path = edge_normalized
+                print(f"PASS - Edge control normalized with {edge_normalization_path}")
+                print(
+                    "PASS - Edge profile: 121 frames, 30 FPS, 50 steps, "
+                    "guidance 3.0, control guidance 2.0, edge weight 1.0"
+                )
+
+            response = run(
+                build_create_command(
+                    args.server_url,
+                    model_id,
+                    args.prompt,
+                    args.negative_prompt,
+                    args.seed,
+                    normalized,
+                    edge_path,
+                ),
+                capture=True,
+            )
+            try:
+                video_id = json.loads(response.stdout)["id"]
+            except (json.JSONDecodeError, KeyError) as exc:
+                raise RuntimeError(
+                    f"Cosmos returned an unexpected submission response: {response.stdout}"
+                ) from exc
+            print(f"Submitted video ID: {video_id}")
+            wait_for_completion(args.server_url, video_id, args.timeout_minutes)
+            download_content(args.server_url, video_id, generated)
+
+            destination = f"s3://{bucket}/{args.output_prefix}"
+            run(
+                [
+                    "aws",
+                    "s3",
+                    "cp",
+                    str(generated),
+                    f"{destination}/{generated_name}",
+                    "--region",
+                    args.region,
+                    "--sse",
+                    "AES256",
+                    "--only-show-errors",
+                ]
+            )
+            run(
+                [
+                    "aws",
+                    "s3",
+                    "cp",
+                    str(source),
+                    f"{destination}/{reference_name}",
+                    "--region",
+                    args.region,
+                    "--sse",
+                    "AES256",
+                    "--only-show-errors",
+                ]
+            )
+            print(f"PASS - Generated video bytes: {generated.stat().st_size}")
+            print(f"PASS - Uploaded reference: {reference_name}")
+            print("GENERATION_COMPLETE")
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+        detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
+        print(f"FAIL - {detail}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

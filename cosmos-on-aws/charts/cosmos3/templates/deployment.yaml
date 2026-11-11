@@ -1,0 +1,118 @@
+{{- $expectedArchiveSha := "a0660a0494018fff848fda34ecf0e8a823a360502a0254b5f5068f2e1c7f82ff" -}}
+{{- if not .Values.aws.region -}}
+{{- fail "aws.region is required" -}}
+{{- end -}}
+{{- if and .Values.model.requireLocalWeights (not .Values.model.archiveS3Uri) -}}
+{{- fail "model.archiveS3Uri is required when model.requireLocalWeights=true" -}}
+{{- end -}}
+{{- if and .Values.model.requireLocalWeights (ne .Values.model.archiveSha256 $expectedArchiveSha) -}}
+{{- fail (printf "model.archiveSha256 must equal the validated Cosmos archive checksum %s" $expectedArchiveSha) -}}
+{{- end -}}
+{{- if and (eq .Values.model.variant "nano") (ne (int .Values.gpu.count) 1) -}}
+{{- fail "gpu.count must be 1 for the validated Nano configuration" -}}
+{{- end -}}
+{{- if and (eq .Values.model.variant "super") (ne (int .Values.gpu.count) 8) -}}
+{{- fail "gpu.count must be 8 for the validated Super configuration" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cosmos3.fullname" . }}
+  labels:
+    {{- include "cosmos3.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  progressDeadlineSeconds: 1800
+  selector:
+    matchLabels:
+      {{- include "cosmos3.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cosmos3.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/server-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ required "serviceAccount.name is required" .Values.serviceAccount.name | quote }}
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: vllm-omni
+          image: {{ required "image.ref is required" .Values.image.ref | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["bash", "/opt/cosmos/bin/start-server.sh"]
+          env:
+            - name: HF_HOME
+              value: /models/hf-cache
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+            - name: COSMOS_MODEL
+              value: {{ .Values.model.variant | quote }}
+            - name: REQUIRE_LOCAL_WEIGHTS
+              value: {{ .Values.model.requireLocalWeights | quote }}
+            - name: COSMOS_ARCHIVE_S3_URI
+              value: {{ .Values.model.archiveS3Uri | quote }}
+            - name: COSMOS_ARCHIVE_SHA256
+              value: {{ .Values.model.archiveSha256 | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.aws.region | quote }}
+            {{- if .Values.model.requireLocalWeights }}
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            requests:
+              nvidia.com/gpu: {{ .Values.gpu.count | quote }}
+            limits:
+              nvidia.com/gpu: {{ .Values.gpu.count | quote }}
+          volumeMounts:
+            - name: server-script
+              mountPath: /opt/cosmos/bin
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: server-script
+          configMap:
+            name: {{ include "cosmos3.fullname" . }}-server
+            defaultMode: 0444
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.sharedMemory.sizeLimit | quote }}
+        - name: models
+          hostPath:
+            path: {{ .Values.modelCache.hostPath | quote }}
+            type: DirectoryOrCreate

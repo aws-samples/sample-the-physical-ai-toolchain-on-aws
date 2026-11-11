@@ -12,26 +12,55 @@ version: 0.2
 #   ECR_REPO_URI        - full ECR repo URI
 #   AWS_ACCOUNT_ID      - account ID
 #   AWS_DEFAULT_REGION  - region
-#   NGC_API_KEY         - NGC key for base image
+#
+# The NGC key is read from Secrets Manager at build time (same as the CodeBuild
+# project's own inline buildspec). Do NOT pass it in with
+# --environment-variables-override: a PLAINTEXT override is stored in the build
+# record. The CodeBuild role is already scoped to
+# secretsmanager:GetSecretValue on physical-ai/ngc-api-key*.
+#
+# The project is NO_SOURCE with an inline N1.6 buildspec, so this file has to be
+# supplied as an override, and the default LARGE compute has too little memory
+# for `uv sync` + flash-attn:
+#
+#   aws codebuild start-build \
+#     --project-name physical-ai-dev-gr00t-training-build \
+#     --source-type-override S3 \
+#     --source-location-override "<datasets-bucket>/codebuild-source/source-n17.zip" \
+#     --buildspec-override containers/gr00t-training/buildspec-n17.yml \
+#     --compute-type-override BUILD_GENERAL1_2XLARGE
+#
+# Tags pushed: n17 (consumed by the Batch job definition) and an immutable dated
+# n17-YYYYMMDD for traceability. The floating "latest" tag is deliberately NOT
+# touched here — it belongs to the N1.6 inline buildspec.
 
 phases:
   pre_build:
     commands:
       - echo "Build started on $(date)"
+      # The dated tag goes to a file rather than a shell variable so it is
+      # identical in every phase and cannot drift if the build spans midnight.
+      - date +%Y%m%d > /tmp/n17_build_date
+      # Single-quoted: an unquoted plain scalar containing ": " is parsed by the
+      # buildspec YAML loader as a mapping, not as a command string.
+      - 'echo "Image tags to publish: n17 and n17-$(cat /tmp/n17_build_date)"'
       - echo "Logging in to ECR..."
       - REGISTRY=$(echo "$ECR_REPO_URI" | cut -d/ -f1)
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
-      - echo "Logging in to NGC..."
+      - echo "Logging in to NGC (nvcr.io) with the key from Secrets Manager..."
+      - NGC_API_KEY=$(aws secretsmanager get-secret-value --secret-id "physical-ai/ngc-api-key" --region "$AWS_DEFAULT_REGION" --query SecretString --output text)
       - echo "$NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
   build:
     commands:
       - echo "Building GR00T N1.7 training container..."
-      - docker build -f containers/gr00t-training/Dockerfile.n17 -t groot-training-n17 .
-      - docker tag groot-training-n17:latest "$ECR_REPO_URI:n17"
-      - docker tag groot-training-n17:latest "$ECR_REPO_URI:latest"
+      # Build context is the repo root: Dockerfile.n17's COPY paths are
+      # repo-root-relative (containers/gr00t-training/...).
+      - docker build -f containers/gr00t-training/Dockerfile.n17 -t groot-training-n17:n17 .
+      - docker tag groot-training-n17:n17 "$ECR_REPO_URI:n17"
+      - docker tag groot-training-n17:n17 "$ECR_REPO_URI:n17-$(cat /tmp/n17_build_date)"
   post_build:
     commands:
       - echo "Pushing to ECR..."
       - docker push "$ECR_REPO_URI:n17"
-      - docker push "$ECR_REPO_URI:latest"
-      - echo "Done. Image pushed as $ECR_REPO_URI:n17 and $ECR_REPO_URI:latest"
+      - docker push "$ECR_REPO_URI:n17-$(cat /tmp/n17_build_date)"
+      - echo "Done. Pushed $ECR_REPO_URI:n17 and $ECR_REPO_URI:n17-$(cat /tmp/n17_build_date)"

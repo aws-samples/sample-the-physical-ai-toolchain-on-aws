@@ -49,7 +49,7 @@ variable "eks_view_principal_arns" {
 }
 
 variable "eks_pod_extra_s3_buckets" {
-  description = "Additional S3 bucket NAMES (not ARNs) the Cosmos3 generation pod may read and write, beyond the Foundation datasets bucket. Set this to the per-participant data bucket created by the workshop CloudFormation stack (physical-ai-data-<account>), which does not follow this module's <project>-<environment>-datasets-<account> naming and would otherwise be unreachable from the pod."
+  description = "S3 bucket NAMES (not ARNs) the Cosmos3 generation pod may read and write, in addition to the Foundation datasets bucket when eks_pod_grant_foundation_datasets_bucket is true. Set this to the per-participant data bucket created by the workshop CloudFormation stack (physical-ai-data-<account>), which does not follow this module's <project>-<environment>-datasets-<account> naming and would otherwise be unreachable from the pod."
   type        = list(string)
   default     = []
 }
@@ -102,13 +102,40 @@ variable "eks_gpu_availability_zone" {
   default     = ""
 }
 
+variable "eks_control_plane_subnet_ids" {
+  description = "Subnets for the EKS control plane ENIs only (must span >= 2 AZs, must be in vpc_id). Empty (default) uses the node subnets, as before. Lets node groups stay in one AZ (a capacity reservation's) while the control plane meets EKS's two-AZ rule."
+  type        = list(string)
+  default     = []
+  validation {
+    condition     = alltrue([for s in var.eks_control_plane_subnet_ids : can(regex("^subnet-[0-9a-f]{8,17}$", s))])
+    error_message = "eks_control_plane_subnet_ids must contain only subnet IDs."
+  }
+}
+
+variable "eks_cluster_api_ingress_security_group_ids" {
+  description = "Security groups allowed to reach the cluster API on 443 through the private endpoint (for example a workstation in the same VPC, which resolves the endpoint to private IPs). Positional keys - append only."
+  type        = list(string)
+  default     = []
+  validation {
+    condition     = alltrue([for s in var.eks_cluster_api_ingress_security_group_ids : can(regex("^sg-[0-9a-f]{8,17}$", s))])
+    error_message = "eks_cluster_api_ingress_security_group_ids must contain only security group IDs."
+  }
+}
+
+variable "eks_pod_grant_foundation_datasets_bucket" {
+  description = "Include the Foundation bucket <project>-<environment>-datasets-<account> in the pod IRSA S3 policy. Default true (unchanged). The workshop sets false: it uses only eks_pod_extra_s3_buckets, so no unused, predictable bucket name is trusted."
+  type        = bool
+  default     = true
+}
+
+# Network from SSM (Foundation) only when it was not passed in explicitly.
 data "aws_ssm_parameter" "eks_vpc_id" {
-  count = var.enable_eks_cluster ? 1 : 0
+  count = var.enable_eks_cluster && var.vpc_id == "" ? 1 : 0
   name  = "/${var.project_name}/vpc-id"
 }
 
 data "aws_ssm_parameter" "eks_private_subnet_ids" {
-  count = var.enable_eks_cluster ? 1 : 0
+  count = var.enable_eks_cluster && length(var.private_subnet_ids) == 0 ? 1 : 0
   name  = "/${var.project_name}/private-subnet-ids"
 }
 
@@ -123,13 +150,19 @@ data "aws_subnet" "eks_gpu_az_subnet" {
   count = var.enable_eks_cluster && var.eks_gpu_availability_zone != "" ? 1 : 0
   filter {
     name   = "subnet-id"
-    values = split(",", data.aws_ssm_parameter.eks_private_subnet_ids[0].value)
+    values = local.eks_private_subnet_ids
   }
   availability_zone = var.eks_gpu_availability_zone
 }
 
 locals {
-  eks_private_subnet_ids = var.enable_eks_cluster ? split(",", data.aws_ssm_parameter.eks_private_subnet_ids[0].value) : []
+  # Explicit network variables win; otherwise SSM when the cluster is enabled.
+  eks_vpc_id = var.vpc_id != "" ? var.vpc_id : (
+    var.enable_eks_cluster ? data.aws_ssm_parameter.eks_vpc_id[0].value : ""
+  )
+  eks_private_subnet_ids = length(var.private_subnet_ids) > 0 ? var.private_subnet_ids : (
+    var.enable_eks_cluster ? split(",", data.aws_ssm_parameter.eks_private_subnet_ids[0].value) : []
+  )
 
   # GPU node group subnet: pinned to the Capacity Block's AZ when specified,
   # otherwise falls back to all private subnets (on-demand path).
@@ -153,11 +186,35 @@ module "cosmos3_eks" {
   cluster_name    = "${local.prefix}-${var.eks_cluster_name}"
   cluster_version = var.eks_kubernetes_version
 
-  vpc_id     = data.aws_ssm_parameter.eks_vpc_id[0].value
+  vpc_id     = local.eks_vpc_id
   subnet_ids = local.eks_private_subnet_ids
+
+  # Control plane ENIs only. EKS requires them to span two AZs, but the node groups may
+  # need to stay in one (a capacity reservation's AZ), so the control plane can be given
+  # its own subnet list. Empty (default) makes the module's coalescelist fall back to
+  # subnet_ids, which is the previous behavior.
+  control_plane_subnet_ids = var.eks_control_plane_subnet_ids
 
   cluster_endpoint_public_access  = true
   cluster_endpoint_private_access = true
+
+  # With private access on, EKS associates a private hosted zone with the cluster VPC, so
+  # a workstation in the same VPC resolves the endpoint to the control-plane ENIs' private
+  # IPs. Those ENIs carry the module's cluster security group, which by default admits
+  # only node traffic; without these rules kubectl and the workstation's `terraform plan`
+  # (the Helm provider refreshes against the API) time out. The source is a security group
+  # rather than a CIDR so the rule stays as narrow as the workstation and does not drift.
+  # Keys are positional ("ingress_api_sg_0", ...): append only. An empty list adds nothing.
+  cluster_security_group_additional_rules = {
+    for idx, sg in var.eks_cluster_api_ingress_security_group_ids : "ingress_api_sg_${idx}" => {
+      description              = "Kubernetes API from workshop workstation (private endpoint)"
+      type                     = "ingress"
+      protocol                 = "tcp"
+      from_port                = 443
+      to_port                  = 443
+      source_security_group_id = sg
+    }
+  }
 
   enable_irsa = true
 
@@ -174,6 +231,14 @@ module "cosmos3_eks" {
   # caused for access entries, and it is the last thing standing between an attendee and a
   # clean "No changes" plan.
   kms_key_administrators = var.eks_admin_principal_arns
+
+  # Keep the account-root statement in the key policy. This is already the module default
+  # in v20.37.2 (variables.tf kms_key_enable_default_policy = true, passed to
+  # terraform-aws-modules/kms 2.1.0 as enable_default_policy), so pinning it changes
+  # nothing in the plan. It is pinned so a future ~> 20.0 default change cannot remove
+  # that statement: the Cleanup page's CloudShell destroy relies on it to schedule key
+  # deletion after both kms_key_administrators roles were deleted with the stack.
+  kms_key_enable_default_policy = true
 
   # Deliberately false: this option derives a "cluster_creator" access entry from
   # whoever ran `terraform apply` (data.aws_caller_identity), so a later plan or apply
@@ -272,7 +337,7 @@ module "cosmos3_eks" {
       instance_types = [var.eks_gpu_node_instance_type]
       # Capacity Block nodes must use CAPACITY_BLOCK capacity type.
       capacity_type = local.eks_gpu_capacity_block_specified ? "CAPACITY_BLOCK" : "ON_DEMAND"
-      ami_type      = "AL2_x86_64_GPU"
+      ami_type      = "AL2023_x86_64_NVIDIA"
 
       min_size     = 0
       max_size     = 1
@@ -391,16 +456,25 @@ resource "aws_iam_policy" "cosmos3_pod_s3" {
   name        = "${local.prefix}-cosmos3-pod-s3"
   description = "S3 read/write for the Cosmos3 generation pod (cosmos-samples/ output, dataset input)"
 
-  # The Foundation datasets bucket plus any buckets created outside this Terraform.
+  # Buckets the pod may use: eks_pod_extra_s3_buckets, plus the Foundation datasets
+  # bucket (<project>-<environment>-datasets-<account>) when
+  # eks_pod_grant_foundation_datasets_bucket is true (the standalone default).
   #
   # The workshop's per-participant data bucket (physical-ai-data-<account>) is created
-  # by CloudFormation, not here, and it does not follow the
-  # <project>-<environment>-datasets-<account> naming this module assumes. Without it
+  # by CloudFormation, not here, and it does not follow the Foundation naming. Without it
   # listed, a generation pod cannot read the teleoperation dataset the lab tells
   # attendees to use - the pod fails with AccessDenied even though the object exists.
+  #
+  # The workshop turns the Foundation grant off. Event accounts have no Foundation
+  # deployment, and S3 bucket names are global: the Foundation name is predictable, so
+  # if that bucket does not exist anyone could create it in their own account and the
+  # pod's PutObject grant would let data be written there. Least privilege: grant only
+  # the buckets the workshop actually uses.
+  #
   # Computed inline rather than in a `locals` block: the account-id data source is
   # count-gated on enable_eks_cluster, so a top-level local would fail to evaluate when
-  # the cluster is disabled.
+  # the cluster is disabled. distinct() keeps first-occurrence order, so with defaults
+  # the policy JSON is unchanged.
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -408,16 +482,23 @@ resource "aws_iam_policy" "cosmos3_pod_s3" {
         Sid      = "ListBuckets"
         Effect   = "Allow"
         Action   = ["s3:ListBucket"]
-        Resource = [for b in concat(["${var.project_name}-${var.environment}-datasets-${data.aws_caller_identity.eks_current[0].account_id}"], var.eks_pod_extra_s3_buckets) : "arn:aws:s3:::${b}"]
+        Resource = [for b in distinct(concat(var.eks_pod_grant_foundation_datasets_bucket ? ["${var.project_name}-${var.environment}-datasets-${data.aws_caller_identity.eks_current[0].account_id}"] : [], var.eks_pod_extra_s3_buckets)) : "arn:aws:s3:::${b}"]
       },
       {
         Sid      = "ReadWriteObjects"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject"]
-        Resource = [for b in concat(["${var.project_name}-${var.environment}-datasets-${data.aws_caller_identity.eks_current[0].account_id}"], var.eks_pod_extra_s3_buckets) : "arn:aws:s3:::${b}/*"]
+        Resource = [for b in distinct(concat(var.eks_pod_grant_foundation_datasets_bucket ? ["${var.project_name}-${var.environment}-datasets-${data.aws_caller_identity.eks_current[0].account_id}"] : [], var.eks_pod_extra_s3_buckets)) : "arn:aws:s3:::${b}/*"]
       }
     ]
   })
+
+  lifecycle {
+    precondition {
+      condition     = var.eks_pod_grant_foundation_datasets_bucket || length(var.eks_pod_extra_s3_buckets) > 0
+      error_message = "Pod S3 policy would grant no bucket: set eks_pod_extra_s3_buckets or keep eks_pod_grant_foundation_datasets_bucket = true."
+    }
+  }
 }
 
 resource "aws_iam_policy" "cosmos3_pod_secrets" {
