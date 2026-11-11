@@ -12,13 +12,19 @@
 #   GRAD_ACCUM_STEPS    - Gradient accumulation steps (default: 4)
 #   CHECKPOINT_BUCKET   - S3 bucket for checkpoint upload
 #   CHECKPOINT_PREFIX   - S3 key prefix (default: checkpoints/groot-n17/<job_id>)
+#   UPLOAD_TRAINING_STATE - false (default) | true. False uploads the deployable
+#                         final model only (~12.6 GB); true also uploads every
+#                         intermediate checkpoint-<N>/ with its optimizer,
+#                         scheduler and RNG state (~38 GB for a 100-step run).
 #   EMBODIMENT_CONFIG   - embodiment modality config to use: ur3 (default) | g1_dex3
 #   MODALITY_CONFIG_PATH- explicit path to a modality config module (wins over
 #                         EMBODIMENT_CONFIG; must exist inside the container)
 #   TUNE_VISUAL         - 0 (default, upstream behaviour) | 1. Off keeps the
 #                         vision tower frozen so the job fits one 48 GB L40S;
 #                         on adds ~1.15B trainable params and needs 4 GPUs.
-#   HF_TOKEN            - HuggingFace token for model download (optional)
+#   HF_TOKEN            - HuggingFace token for model download. Needed (directly or
+#                         via HF_TOKEN_SECRET_ID) unless the archive variables below
+#                         are set: the Cosmos-Reason2-2B backbone is gated (see NOTE).
 #   HF_TOKEN_SECRET_ID  - Secrets Manager secret id/ARN holding the token. Used
 #                         only when local model archives are absent and HF_TOKEN is unset.
 #   GROOT_BASE_MODEL_ARCHIVE_S3_URI - participant-S3 GR00T N1.7 tar archive
@@ -30,9 +36,12 @@
 # both models, rewrites GR00T's nested backbone reference to the local Reason2 directory,
 # and enables Hugging Face/Transformers offline mode.
 #
-# NOTE: the base model nvidia/GR00T-N1.7-3B is NOT gated on HuggingFace
-# (the hub API reports gated:false), so a missing/unresolvable token is a
-# warning, not a failure. The token only matters for gated or private models.
+# NOTE: nvidia/GR00T-N1.7-3B itself is not gated on HuggingFace (the hub API
+# reports gated:false), but its VLM backbone nvidia/Cosmos-Reason2-2B IS a gated
+# repo, and training downloads it. Without a token from an account that has been
+# granted access to that repo, the backbone download fails with HTTP 401. A
+# missing/unresolvable token is still only a warning here, not a failure, so the
+# job stops later, at that download. The offline archive path needs no token.
 # =============================================================================
 
 set -e
@@ -56,6 +65,16 @@ GROOT_BASE_MODEL_SHA256="${GROOT_BASE_MODEL_SHA256:-}"
 COSMOS_REASON2_ARCHIVE_S3_URI="${COSMOS_REASON2_ARCHIVE_S3_URI:-}"
 COSMOS_REASON2_SHA256="${COSMOS_REASON2_SHA256:-}"
 LOCAL_MODEL_ROOT="/opt/ml/input/models"
+
+# Validated before any download or training so a typo cannot cost a full run.
+# Same accepted spellings as the TUNE_VISUAL flag in train_entrypoint_n17.py.
+UPLOAD_TRAINING_STATE_RAW="${UPLOAD_TRAINING_STATE:-false}"
+case "$(printf '%s' "$UPLOAD_TRAINING_STATE_RAW" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) UPLOAD_TRAINING_STATE=true ;;
+    0|false|no|off) UPLOAD_TRAINING_STATE=false ;;
+    *) echo "ERROR: UPLOAD_TRAINING_STATE='${UPLOAD_TRAINING_STATE_RAW}' is not a boolean; use true or false" >&2
+       exit 1 ;;
+esac
 
 # --- Prepare participant-S3 model archives for offline event training ---
 materialize_model_archive() {  # label uri sha destination required-file
@@ -194,16 +213,22 @@ echo "  Job ID:           $JOB_ID"
 echo "  Embodiment:       $EMBODIMENT_CONFIG"
 echo "  Modality config:  ${MODALITY_CONFIG_PATH:-<from embodiment>}"
 echo "  Tune visual:      $TUNE_VISUAL"
+echo "  Upload state:     $UPLOAD_TRAINING_STATE (UPLOAD_TRAINING_STATE)"
 echo "============================================================"
 
 mkdir -p "$OUTPUT_DIR"
 
 # --- Resolve the HuggingFace token from Secrets Manager if not passed directly ---
 # The value is assigned, never printed; only "resolved / not resolved" is logged.
+warn_gated_backbone() {
+    echo "  WARNING: the GR00T N1.7 backbone nvidia/Cosmos-Reason2-2B is a gated HuggingFace"
+    echo "           repo. Without a token its download will fail with HTTP 401 Unauthorized."
+}
 if [ -z "$ARCHIVE_SETTINGS_PRESENT" ] && [ -z "${HF_TOKEN:-}" ] && [ -n "$SECRET_ID" ]; then
     echo "Resolving the HuggingFace token from Secrets Manager..."
-    # `|| true`-style fallback: the base model is not gated, so a failed lookup
-    # must not kill the job under `set -e`.
+    # `|| true`-style fallback: a failed lookup must not kill the job under
+    # `set -e`. It is reported below; the gated backbone download is where a
+    # missing token actually fails.
     HF_TOKEN=$(aws secretsmanager get-secret-value \
         --secret-id "$SECRET_ID" \
         --region "${AWS_DEFAULT_REGION:-us-east-2}" \
@@ -211,8 +236,12 @@ if [ -z "$ARCHIVE_SETTINGS_PRESENT" ] && [ -z "${HF_TOKEN:-}" ] && [ -n "$SECRET
     if [ -n "$HF_TOKEN" ]; then
         echo "  HuggingFace credential: resolved from Secrets Manager"
     else
-        echo "  HuggingFace credential: NOT resolved (continuing; base model is not gated)"
+        echo "  HuggingFace credential: NOT resolved (continuing)"
+        warn_gated_backbone
     fi
+elif [ -z "$ARCHIVE_SETTINGS_PRESENT" ] && [ -z "${HF_TOKEN:-}" ]; then
+    echo "  HuggingFace credential: none (HF_TOKEN and HF_TOKEN_SECRET_ID are both unset)"
+    warn_gated_backbone
 fi
 
 # --- Export HF token if set ---
@@ -277,11 +306,56 @@ PY
 fi
 
 # --- Upload checkpoints to S3 ---
+# launch_finetune.py saves the final model (weights + config.json + processor/ +
+# experiment_cfg/) at the output root AND keeps up to --save-total-limit
+# intermediate checkpoint-<N>/ directories, each repeating the weights plus
+# optimizer/scheduler/RNG state. A full sync therefore stores the model twice:
+# 38.1 GB for a 100-step run, of which the root model is 12.6 GB. Nothing in this
+# toolchain resumes from a checkpoint-<N>/, so by default only the root is
+# uploaded; UPLOAD_TRAINING_STATE=true restores the full sync. If the root holds no
+# weights, the newest checkpoint-<N>/ is uploaded without its training state
+# instead, so a successful run never uploads no model.
+has_model_weights() {  # dir
+    for f in "$1"/model*.safetensors "$1"/pytorch_model*.bin; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+newest_checkpoint() {  # dir -> prints the highest-numbered checkpoint-<N> path, or nothing
+    best=""; best_step=-1
+    for d in "$1"/checkpoint-*/; do
+        [ -d "$d" ] || continue
+        d="${d%/}"; step="${d##*/checkpoint-}"
+        [[ "$step" =~ ^[0-9]+$ ]] || continue
+        if [ "$step" -gt "$best_step" ]; then best_step="$step"; best="$d"; fi
+    done
+    printf '%s' "$best"
+}
+
 if [ -n "${CHECKPOINT_BUCKET:-}" ]; then
     S3_PREFIX="${CHECKPOINT_PREFIX:-checkpoints/groot-n17/${JOB_ID}}"
-    echo "Uploading checkpoints to s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}/ ..."
-    aws s3 sync "$OUTPUT_DIR" "s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}/" --region "${AWS_DEFAULT_REGION:-us-east-2}"
-    echo "Done. Checkpoints uploaded to s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}/"
+    S3_DEST="s3://${CHECKPOINT_BUCKET}/${S3_PREFIX}"
+    S3_REGION="${AWS_DEFAULT_REGION:-us-east-2}"
+    if [ "$UPLOAD_TRAINING_STATE" = "true" ]; then
+        echo "Uploading checkpoints to ${S3_DEST}/ (full output incl. checkpoint-<N>/ training state) ..."
+        aws s3 sync "$OUTPUT_DIR" "${S3_DEST}/" --region "$S3_REGION"
+    else
+        echo "Uploading checkpoints to ${S3_DEST}/ (final model only; UPLOAD_TRAINING_STATE=true adds checkpoint-<N>/) ..."
+        aws s3 sync "$OUTPUT_DIR" "${S3_DEST}/" --region "$S3_REGION" --exclude "checkpoint-*/*"
+        if ! has_model_weights "$OUTPUT_DIR"; then
+            FALLBACK_CHECKPOINT="$(newest_checkpoint "$OUTPUT_DIR")"
+            if [ -n "$FALLBACK_CHECKPOINT" ]; then
+                FALLBACK_NAME="$(basename "$FALLBACK_CHECKPOINT")"
+                echo "WARNING: no model weights at ${OUTPUT_DIR}; uploading ${FALLBACK_NAME}/ without its training state instead"
+                aws s3 sync "$FALLBACK_CHECKPOINT" "${S3_DEST}/${FALLBACK_NAME}/" --region "$S3_REGION" \
+                    --exclude "optimizer.pt" --exclude "scheduler.pt" --exclude "rng_state*.pth" \
+                    --exclude "*optim_states.pt"
+            else
+                echo "WARNING: no model weights at ${OUTPUT_DIR} and no checkpoint-<N>/ directory to fall back to"
+            fi
+        fi
+    fi
+    echo "Done. Checkpoints uploaded to ${S3_DEST}/"
 else
     echo "WARNING: CHECKPOINT_BUCKET not set. Checkpoints will be lost when container exits."
 fi
