@@ -162,3 +162,11 @@ stage, it decides which stage to run next based on what it observed the robot do
 
 Apache 2.0 — see [LICENSE](../LICENSE). `strands-robots` is Apache 2.0
 ([strands-labs/robots](https://github.com/strands-labs/robots)).
+
+---
+
+## Samples
+
+- [multi-robot-task-planning](multi-robot-task-planning/): a Strands Agents planner on Amazon Bedrock AgentCore Runtime that
+  coordinates a mixed fleet (a ROS 2 arm, simulated walkers and a humanoid, and two real SO-101 arms) over AWS IoT
+  Core, with every safety rule on the robot. Runs end to end in simulation from its notebook.

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!-- A 4-joint arm on ros2_control MOCK hardware (mock_components/GenericSystem): commands are echoed back as
+     state. Command path only, no physics. -->
+<robot name="ros_arm">
+  <link name="world"/>
+  <link name="base"><visual><geometry><cylinder radius="0.06" length="0.05"/></geometry></visual></link>
+  <link name="l1"><visual><geometry><box size="0.04 0.04 0.20"/></geometry></visual></link>
+  <link name="l2"><visual><geometry><box size="0.04 0.04 0.18"/></geometry></visual></link>
+  <link name="l3"><visual><geometry><box size="0.03 0.03 0.12"/></geometry></visual></link>
+  <link name="tool"><visual><geometry><box size="0.03 0.05 0.03"/></geometry></visual></link>
+  <joint name="fixed" type="fixed"><parent link="world"/><child link="base"/></joint>
+  <joint name="j1" type="revolute"><parent link="base"/><child link="l1"/><origin xyz="0 0 0.05"/><axis xyz="0 0 1"/>
+    <limit lower="-2.0" upper="2.0" effort="10" velocity="2.0"/></joint>
+  <joint name="j2" type="revolute"><parent link="l1"/><child link="l2"/><origin xyz="0 0 0.20"/><axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="10" velocity="2.0"/></joint>
+  <joint name="j3" type="revolute"><parent link="l2"/><child link="l3"/><origin xyz="0 0 0.18"/><axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="10" velocity="2.0"/></joint>
+  <joint name="j4" type="revolute"><parent link="l3"/><child link="tool"/><origin xyz="0 0 0.12"/><axis xyz="0 0 1"/>
+    <limit lower="-3.0" upper="3.0" effort="5" velocity="3.0"/></joint>
+  <ros2_control name="ros_arm" type="system">
+    <hardware><plugin>mock_components/GenericSystem</plugin></hardware>
+    <joint name="j1"><command_interface name="position"/><state_interface name="position"><param name="initial_value">0.0</param></state_interface><state_interface name="velocity"/><state_interface name="effort"/></joint>
+    <joint name="j2"><command_interface name="position"/><state_interface name="position"><param name="initial_value">0.0</param></state_interface><state_interface name="velocity"/><state_interface name="effort"/></joint>
+    <joint name="j3"><command_interface name="position"/><state_interface name="position"><param name="initial_value">0.0</param></state_interface><state_interface name="velocity"/><state_interface name="effort"/></joint>
+    <joint name="j4"><command_interface name="position"/><state_interface name="position"><param name="initial_value">0.0</param></state_interface><state_interface name="velocity"/><state_interface name="effort"/></joint>
+  </ros2_control>
+</robot>

@@ -1,0 +1,100 @@
+{
+ "arm1": {
+  "policy_envelope": {
+   "shoulder_pan": [
+    -63.7,
+    16.5
+   ],
+   "shoulder_lift": [
+    -113.4,
+    70.1
+   ],
+   "elbow_flex": [
+    -87.9,
+    111.1
+   ],
+   "wrist_flex": [
+    11.0,
+    107.2
+   ],
+   "wrist_roll": [
+    -49.3,
+    30.7
+   ],
+   "gripper": [
+    -5.0,
+    50.9
+   ]
+  },
+  "rest": [
+   -5.8,
+   -97.19,
+   93.45,
+   72.04,
+   0.66,
+   0.66
+  ],
+  "episodes": 101,
+  "picks_found": 100,
+  "hold_range": [
+   4.0,
+   13.0
+  ],
+  "open_above": 15.0,
+  "release_pan_median": -52.3,
+  "release_pan_p5_p95": [
+   -54.5,
+   -49.6
+  ],
+  "hold_s_median": 2.57
+ },
+ "arm2": {
+  "policy_envelope": {
+   "shoulder_pan": [
+    -22.3,
+    55.1
+   ],
+   "shoulder_lift": [
+    -113.6,
+    43.2
+   ],
+   "elbow_flex": [
+    -57.2,
+    111.3
+   ],
+   "wrist_flex": [
+    9.7,
+    106.5
+   ],
+   "wrist_roll": [
+    -27.0,
+    59.4
+   ],
+   "gripper": [
+    -5.0,
+    43.1
+   ]
+  },
+  "rest": [
+   -3.87,
+   -103.91,
+   96.75,
+   63.52,
+   2.64,
+   0.84
+  ],
+  "episodes": 112,
+  "picks_found": 105,
+  "hold_range": [
+   4.0,
+   13.0
+  ],
+  "open_above": 15.0,
+  "release_pan_median": 44.1,
+  "release_pan_p5_p95": [
+   40.9,
+   48.5
+  ],
+  "hold_s_median": 2.93
+ }
+}

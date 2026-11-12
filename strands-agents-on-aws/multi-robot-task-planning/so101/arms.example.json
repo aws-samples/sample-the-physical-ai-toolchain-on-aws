@@ -1,0 +1,22 @@
+{
+ "arm-1": {
+  "zone": "black-parts",
+  "port": "/dev/ttyACM0",
+  "calibration_id": "arm1_follower",
+  "cameras": {"wrist": {"index": 1, "w": 640, "h": 480}, "overhead": {"index": 0, "w": 640, "h": 360}},
+  "max_relative_target": 12,
+  "policy": "rsundaraws/act_arm1_fill",
+  "dataset": "rsundaraws/so101_arm1_fixedspot",
+  "poses": "arm1"
+ },
+ "arm-2": {
+  "zone": "blue-parts",
+  "port": "/dev/ttyACM1",
+  "calibration_id": "arm2_follower",
+  "cameras": {"wrist": {"index": 2, "w": 640, "h": 480}},
+  "max_relative_target": 12,
+  "policy": "rsundaraws/act_arm2_fill_wristonly",
+  "dataset": "rsundaraws/so101_arm2_fixedspot",
+  "poses": "arm2"
+ }
+}
