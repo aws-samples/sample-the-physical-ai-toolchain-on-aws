@@ -1,0 +1,37 @@
+{
+    "pipelineName": "PAI Toolchain - GR00T fine-tune (AWS Batch)",
+    "category": "Training",
+    "description": "Fine-tunes NVIDIA GR00T N1.7 on a LeRobot v2 dataset held on a VAMS asset as one AWS Batch job on the Physical AI Toolchain's GPU compute environment. Runs in the toolchain account; the checkpoint is written back to the asset. The SageMaker Pipeline path is the sibling pipeline pai-gr00t-finetune.",
+    "executionConfig": {
+        "executionType": "EventBridge",
+        "waitForCallback": "Enabled",
+        "taskTimeout": "57600",
+        "taskHeartbeatTimeout": "1800",
+        "eventBridge": {
+            "source": "pai.toolchain.bridge",
+            "detailType": "pai.gr00t-finetune-batch"
+        }
+    },
+    "systemConfig": {
+        "inputFileArity": "multi",
+        "assetScope": {
+            "wholeAsset": true
+        },
+        "metadataInputs": {
+            "assetMetadata": false,
+            "fileMetadata": false,
+            "fileAttributes": false
+        },
+        "requireTemplate": true,
+        "allowCustomTemplateOverride": false,
+        "inputFileFilters": {
+            "allow": [
+                "*.parquet",
+                "*.mp4",
+                "*.json",
+                "*.jsonl"
+            ],
+            "exclude": []
+        }
+    }
+}
