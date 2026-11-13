@@ -62,7 +62,7 @@ See [`README.md`](README.md) for the overview, the EC2-vs-EKS comparison, and va
 Store your HF token in Secrets Manager:
 ```bash
 aws secretsmanager create-secret --name physical-ai/hf-token \
-  --secret-string "hf_YOUR_TOKEN_HERE" --region us-east-2
+  --secret-string "hf_YOUR_TOKEN_HERE" --region <REGION>
 ```
 
 ---
@@ -352,6 +352,8 @@ The Capacity Block itself expires automatically at its end time — no separate 
 | Download stalls on a weight shard | HuggingFace rate-limiting | `docker restart cosmos3` — cached shards persist in `/opt/hf-cache` |
 | SSM not registering | Instance profile missing SSM policy, or no outbound internet | Verify `AmazonSSMManagedInstanceCore` attached; subnet has NAT/IGW |
 | Generation request returns `HTTP:000` / curl times out, or server logs show `504 Gateway Timeout` after ~10 min | `/v1/videos/sync` has a hardcoded ~600s server-side abort, independent of your client's `--max-time` | Use the async job API instead (`POST /v1/videos` → poll `GET /v1/videos/{id}` → `GET /v1/videos/{id}/content`) — already what `generate-v2v.sh` and `cosmos3-job.yaml` do. Confirmed hitting this on Nano, whose full 189-frame/720p generation (~10-12 min on 1 GPU) exceeds the sync endpoint's limit |
+| Container exits `255` within ~10 min of `docker run`, only ~12 log lines, no traceback | Transient failure during the first HuggingFace fetch. Not OOM and not disk — observed on a healthy `g6e.4xlarge` with 124 GB RAM and 375 GB free | `docker start cosmos3`. Weights already in `/opt/hf-cache` are reused, so the restart reaches `/v1/models` in ~10 min. Confirmed twice on first boot |
+| `InsufficientInstanceCapacity` for `g6e.*` across every AZ | g6e (L40S) capacity in a region can be exhausted for all sizes at once, on spot *and* on-demand | Retry — it does free up (observed a ~30 min wait in us-west-2). Note `infra/ec2.tf` picks `subnets.ids[0]`, so pin `-var="availability_zone=..."` to steer to an AZ that has capacity instead of letting the provider retry one AZ for 30+ min |
 | `torch.OutOfMemoryError` during VAE decode (Nano, single-GPU instance) | Default VAE decode path needs more VRAM than a `g6e.4xlarge`'s ~44GB usable | Add `--vae-use-tiling` to the `vllm serve` command — already set for `COSMOS_MODEL="nano"` in `setup-cosmos3-server.sh` and `cosmos3-job.yaml` |
 
 ---

@@ -11,15 +11,25 @@
 
 set -e
 
-# Account-specific — replace both before running (see ec2-deployment-guide.md).
-# Or set DATASETS_BUCKET directly, e.g. from:
-#   terraform -chdir=../foundation/infra output -raw datasets_bucket_name
-REGION="<REGION>"
-ACCOUNT_ID="<ACCOUNT_ID>"
-DATASETS_BUCKET="physical-ai-dev-datasets-${ACCOUNT_ID}"
+# Region and account are auto-detected (IMDSv2 + STS) so the script needs no
+# editing. Override any of these by exporting them before running, e.g.
+#   DATASETS_BUCKET=$(terraform -chdir=../foundation/infra output -raw datasets_bucket_name)
+if [ -z "${REGION:-}" ]; then
+  IMDS_TOKEN=$(curl -fsS --connect-timeout 1 -m 3 -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null || true)
+  REGION=$(curl -fsS --connect-timeout 1 -m 3 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+    "http://169.254.169.254/latest/meta-data/placement/region" 2>/dev/null || true)
+fi
+if [ -z "$REGION" ]; then
+  echo "ERROR: could not determine region from IMDS; export REGION=<region> and re-run" >&2
+  exit 1
+fi
+ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --region "$REGION" --query Account --output text)}"
+DATASETS_BUCKET="${DATASETS_BUCKET:-physical-ai-dev-datasets-${ACCOUNT_ID}}"
+echo "Region: $REGION  Bucket: $DATASETS_BUCKET"
 
 # Must match COSMOS_MODEL used in setup-cosmos3-server.sh ("super" or "nano").
-COSMOS_MODEL="super"
+COSMOS_MODEL="${COSMOS_MODEL:-super}"
 
 case "$COSMOS_MODEL" in
   super) MODEL_ID="nvidia/Cosmos3-Super" ;;
