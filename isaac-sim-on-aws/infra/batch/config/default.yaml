@@ -1,0 +1,19 @@
+# Simulation configuration
+physics_hz: 240
+render_hz: 60
+solver: "TGS"
+position_iterations: 16
+velocity_iterations: 1
+gravity: [0.0, 0.0, -9.81]
+
+# Environment (path relative to Isaac Sim asset root)
+environment_usd: "/Isaac/Environments/Simple_Room/simple_room.usd"
+
+# Rendering
+render_width: 640
+render_height: 480
+
+# Simulation
+num_steps: 500
+num_joints: 7
+capture_interval: 10

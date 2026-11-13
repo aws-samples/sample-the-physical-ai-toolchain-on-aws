@@ -1,0 +1,6 @@
+usd-core>=24.8
+numpy>=1.26
+scipy>=1.12
+boto3>=1.35
+pyyaml>=6.0
+matplotlib>=3.8

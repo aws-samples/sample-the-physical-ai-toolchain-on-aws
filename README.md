@@ -159,4 +159,5 @@ Apache 2.0 — see [LICENSE](LICENSE).
 - **Ignacio Salvar** — Solutions Architect, AWS
 - **Adam Weber** — Senior Solutions Architect, AWS
 - **Gopi Krishnamurthy** - Senior Solutions Architect, AWS
+- **Asif Haque** - Senior Technical Account Manager, AWS
 
