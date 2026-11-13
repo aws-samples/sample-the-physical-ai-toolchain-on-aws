@@ -30,9 +30,9 @@
 # Foundation role has no grant on, and gives the workers an identity that cannot write
 # there. See trust_boundary.tf for the full rationale and the residual limitation.
 #
-# If the ECR repos already exist in the target account, import them with
-# `terraform import` (see the Teardown section in README.md); the component is
-# otherwise fresh-account-only.
+# If image repositories have another state owner, reference them through
+# existing_ecr_repos and remove those names from ecr_repos. This grants build
+# access without importing them or taking over their lifecycle.
 # =============================================================================
 
 data "aws_caller_identity" "current" {}
@@ -100,6 +100,9 @@ resource "aws_ecr_repository" "repos" {
   # Live images are expensive to rebuild; never let `terraform destroy` drop a
   # repo full of pushed images. Teardown is deliberate + documented (README.md, Teardown).
   lifecycle {
+    # `pai arena destroy` may override this in its saved deployment directory
+    # only after archiving evidence and checking newly owned repositories are
+    # empty. Supplied repositories remain data sources and are never deleted.
     prevent_destroy = true
   }
 

@@ -69,10 +69,11 @@ def main():
     except ImportError:
         pass
 
-    # NOTE: there is intentionally no `pai eval` command. Policy evaluation
-    # (open-loop and closed-loop) runs IN-PROCESS with Isaac Lab on the GPU
-    # workstation, which does not have `pai` installed (the CLI is the laptop-side
-    # control plane). Eval runs via training/scripts/eval_*.py directly there.
+    from pai.commands import arena
+    arena.register(cli)
+
+    # The original workstation workflow uses training/scripts/eval_*.py.
+    # Arena's pipeline evaluation is exposed through `pai arena run`.
 
     try:
         from pai.commands import export

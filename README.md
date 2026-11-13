@@ -143,6 +143,27 @@ All resources tear down with `terraform destroy` or `aws cloudformation delete-s
 - **Platform teams** deploying NVIDIA tools on AWS infrastructure
 - **Anyone curious** about how robots learn from demonstrations and simulation
 
+## Python environment
+
+Use Python 3.11 or 3.12 for the shared CLI and Arena component. From the
+repository root:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e . -e ./isaac-lab-arena-on-aws
+pai arena --help
+pai arena cells --details
+```
+
+For Arena training and evaluation, follow the
+[executable runbook](isaac-lab-arena-on-aws/notebooks/runbook.ipynb).
+It reads the `arena` section of `config.json`, prepares infrastructure and
+images, trains and evaluates on a GPU EC2 instance or in SageMaker, displays
+results and recordings, then removes the resources it created. The notebook
+lists the additional client tools, account permissions and model access needed
+before deployment. The existing `vla` command remains available as an alias.
+
 ---
 
 ## Contributing
@@ -159,4 +180,3 @@ Apache 2.0 — see [LICENSE](LICENSE).
 - **Ignacio Salvar** — Solutions Architect, AWS
 - **Adam Weber** — Senior Solutions Architect, AWS
 - **Gopi Krishnamurthy** - Senior Solutions Architect, AWS
-

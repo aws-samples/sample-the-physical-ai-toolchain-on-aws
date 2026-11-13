@@ -79,6 +79,8 @@ def select_existing(args, store):
     project = args.project or supplied.get("project") or previous.get("project") or "physical-ai"
     profile = args.profile or previous.get("profile")
     session = aws_session(profile, args.region)
+    from .cli_settings import require_account
+    require_account(session, getattr(args, "account_id", None))
     cfg = discover(session, project)
     for other in (previous, supplied):
         if other and (other.get("account_id") != cfg.account_id or other.get("region") != cfg.region):
@@ -117,12 +119,13 @@ def select_existing(args, store):
     if local.get("instance_id"):
         if not local.get("host_region"):
             raise ValueError("--local-host requires --host-region")
+        on_selected_host = False
         if session.get_credentials().method == "iam-role":
             identity = local_instance()
-            if (identity["accountId"], identity["instanceId"], identity["region"]) != (
+            on_selected_host = (identity["accountId"], identity["instanceId"], identity["region"]) == (
                 cfg.account_id, local["instance_id"], local["host_region"],
-            ):
-                raise ValueError("This EC2 host differs from the selected account, instance or host region")
+            )
+        if on_selected_host:
             local["instance_type"] = identity["instanceType"]
             local["observed_state"] = "running"
         else:

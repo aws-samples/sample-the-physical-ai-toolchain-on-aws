@@ -49,30 +49,30 @@ def test_pipeline_declares_the_parameter_and_defaults_it_off():
 
 
 def test_launch_request_sends_the_parameter_as_an_enum_string():
-    """The CLI's store_true must arrive as "true"/"false", not Python True/False.
-
-    EvalRecordVideo declares enum_values=["true","false"], so a bool would be
-    rejected by StartPipelineExecution -- the same class of payload defect
-    test_launcher_payload_valid exists for.
-    """
-    source = (_REPO / "src/vla_pipeline/launch_request.py").read_text()
-    assert '"EvalRecordVideo"' in source, "launch_request no longer sends the parameter"
-    line = next(ln for ln in source.splitlines() if '"EvalRecordVideo"' in ln)
-    assert '"true"' in line and '"false"' in line, (
-        f"EvalRecordVideo must be sent as an enum string, got: {line.strip()}")
-
-
-def test_the_cli_exposes_record_video_as_an_opt_in_switch():
+    """SageMaker requires a string enum; inspect the actual resolved payload."""
     from vla_pipeline.cli import parser
+    from vla_pipeline.launch_request import resolve_run
 
     args = parser().parse_args([
-        "run", "--deployment", "d", "--cell", "gr00t-n16-arena", "--mode", "managed"])
-    assert args.record_video is False, "capture must be off unless --record-video is passed"
+        "run", "--deployment", "d", "--cell", "gr00t-n16-arena", "--mode", "local",
+        "--sample", "--max-runtime-seconds", "21600", "--record-video"])
+    assert resolve_run(args)["parameters"]["EvalRecordVideo"] == "true"
 
-    args = parser().parse_args([
-        "run", "--deployment", "d", "--cell", "gr00t-n16-arena", "--mode", "managed",
-        "--record-video"])
-    assert args.record_video is True
+
+def test_recording_defaults_off_without_a_config_preference(tmp_path):
+    from vla_pipeline.cli import parser
+    from vla_pipeline.cli_settings import apply_settings
+    from vla_pipeline.launch_request import resolve_run
+
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+    base = ["--config", str(config), "run", "--deployment", "d", "--cell", "gr00t-n16-arena",
+            "--mode", "local", "--sample", "--max-runtime-seconds", "21600"]
+    for flags, expected in (([], False), (["--record-video"], True), (["--no-record-video"], False)):
+        args = parser().parse_args(base + flags)
+        apply_settings(args)
+        request = resolve_run(args)
+        assert (request["parameters"].get("EvalRecordVideo", "false") == "true") is expected
 
 
 def test_submit_simeval_carries_the_same_knob():

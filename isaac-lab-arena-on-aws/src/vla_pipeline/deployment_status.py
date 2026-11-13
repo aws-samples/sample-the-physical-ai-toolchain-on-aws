@@ -8,6 +8,7 @@ import sys
 
 from .deployment import aws_session
 from .remote_commands import observe
+from .cli_context import command_name
 
 
 def follow_deployment(store, name, *, as_json, timeout_seconds):
@@ -35,7 +36,7 @@ def follow_deployment(store, name, *, as_json, timeout_seconds):
         if record["status"] in {"Ready", "Selected", "Planned"}:
             return 0
         if record["status"] in {"Failed", "Interrupted"}:
-            print(f"Resume preparation with vla deploy --name {name} --resume", file=sys.stderr)
+            print(f"Resume preparation with {command_name()} deploy --name {name} --resume", file=sys.stderr)
             return 1
         coordinator = record.get("coordinator", {})
         if coordinator.get("host") == socket.gethostname() and coordinator.get("pid"):
@@ -43,9 +44,10 @@ def follow_deployment(store, name, *, as_json, timeout_seconds):
                 os.kill(coordinator["pid"], 0)
             except ProcessLookupError:
                 print("The local preparation coordinator has exited. Cloud work may still be running; "
-                      f"continue with vla deploy --name {name} --resume.", file=sys.stderr)
+                      f"continue with {command_name()} deploy --name {name} --resume.", file=sys.stderr)
                 return 1
         time.sleep(min(30, max(0, deadline - time.monotonic())))
-    print(f"Stopped following preparation. Inspect vla status {name}; "
-          f"use vla deploy --name {name} --resume if its coordinator disconnected.", file=sys.stderr)
+    print(f"Stopped following preparation. Inspect {command_name()} status {name}; "
+          f"use {command_name()} deploy --name {name} --resume if its coordinator disconnected.",
+          file=sys.stderr)
     return 2

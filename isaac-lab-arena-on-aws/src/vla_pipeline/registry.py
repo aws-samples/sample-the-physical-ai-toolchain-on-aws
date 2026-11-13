@@ -326,7 +326,7 @@ def check_storage_fits(instance_type: str, volume_gb: int, ec2_client=None, *,
     ):
         raise RegistryError(
             f"{instance_type} has no NVIDIA GPU. FineTune and SimEval require CUDA GPU instances; "
-            "see 'vla cells --details' and the README instance matrix.")
+            "inspect the cells --details command and the README instance matrix.")
 
     storage = info[0].get("InstanceStorageInfo") or {}
     local_gb = storage.get("TotalSizeInGB")

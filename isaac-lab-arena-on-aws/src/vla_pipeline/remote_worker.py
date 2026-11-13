@@ -50,6 +50,45 @@ def prepare_host_images(deployment):
     print("Host dependencies and selected images are prepared; launch checks remain.")
 
 
+def inspect_host(deployment):
+    """Read current GPU, Docker images and both disks without preparing or starting work."""
+    import shutil
+    from .source import identity
+    from .registry import named_cells
+
+    require_host(deployment)
+    commit = identity()
+    if commit != deployment["source_commit"]:
+        raise ValueError("GPU host source differs from the selected deployment")
+    images = sorted({uri for selected in deployment["images"].values() for uri in selected.values()})
+    inspected = {}
+    for uri in images:
+        result = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", uri],
+                                capture_output=True, text=True, timeout=30)
+        inspected[uri] = result.stdout.strip() if result.returncode == 0 else None
+    gpu = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader"],
+        text=True, timeout=30).strip()
+    profiles = [named_cells()[name]["local_profile"] for name in deployment["images"]
+                if named_cells()[name]["local_profile"]]
+    budgets = [script("local/local_scratch.py").initial_budget(profile, ["FineTune", "SimEval"])
+               for profile in profiles]
+    scratch = Path(deployment["local"]["scratch_root"])
+    disks = {}
+    for name, path in (("root", Path("/")), ("scratch", scratch)):
+        required = max((budget[name] for budget in budgets), default=0)
+        free = shutil.disk_usage(path).free / 1024**3
+        disks[name] = {"path": str(path), "free_gib": round(free, 2),
+                       "required_gib": required, "passed": free >= required}
+    separate = scratch.stat().st_dev != Path("/").stat().st_dev
+    return {
+        "source_commit": commit, "gpu": gpu, "images": inspected,
+        "disks": disks, "scratch_is_separate": separate,
+        "sample_ready": all(inspected.values()) and separate and all(d["passed"] for d in disks.values()),
+        "scope": "Current images and sample disk reserves; each run also checks its selected budgets and GPU lock.",
+    }
+
+
 def run_action(payload, store):
     from .execution import refresh, prepare, source_identity, stop, submit
 
@@ -82,6 +121,14 @@ def run_action(payload, store):
             record = stop(record, store=store)
         elif action == "verify":
             return refresh(record, store, verify=True)
+        elif action == "cleanup":
+            from .cleanup import cleanup
+            return cleanup(record, store, execute=True)
+        elif action == "report":
+            from .reporting import archive_local
+            record["evidence_archive"] = archive_local(record)
+            store.save("runs", record)
+            return record
         elif action != "status":
             raise ValueError(f"Unknown transport action: {action}")
     return refresh(record, store)
@@ -89,12 +136,17 @@ def run_action(payload, store):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["prepare", "exchange"])
+    parser.add_argument("action", choices=["prepare", "inspect", "exchange"])
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--deployment")
     parser.add_argument("--payload")
     args = parser.parse_args()
     store = Store(args.state_dir)
+    if args.action == "inspect":
+        with contextlib.redirect_stdout(sys.stderr):
+            result = inspect_host(store.load("deployments", args.deployment))
+        print("VLA_HOST_INSPECTION=" + json.dumps(result), flush=True)
+        return
     if args.action == "prepare":
         from .execution import source_identity
 

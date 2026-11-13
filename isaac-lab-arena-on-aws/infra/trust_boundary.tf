@@ -293,9 +293,9 @@ data "aws_iam_policy_document" "job_runtime_common" {
     resources = ["*"]
   }
 
-  # Pull only, and only the images these jobs actually run: this project's own repositories
-  # and the AWS Deep Learning Container that SageMaker training and processing jobs start
-  # from. Matches the DLC scoping already used for the CodeBuild role in main.tf.
+  # Training images use fixed vla/* names; the Foundation Arena image uses the project
+  # prefix. Grant both declared sets, including repositories reused from another
+  # deployment, without granting access to every repository under either prefix.
   statement {
     sid    = "EcrPullJobImages"
     effect = "Allow"
@@ -304,10 +304,15 @@ data "aws_iam_policy_document" "job_runtime_common" {
       "ecr:GetDownloadUrlForLayer",
       "ecr:BatchGetImage",
     ]
-    resources = [
-      "arn:aws:ecr:${local.region}:${local.account_id}:repository/${var.project_name}/*",
-      "arn:aws:ecr:${local.region}:${var.dlc_account_id}:repository/pytorch-training",
-    ]
+    resources = concat(
+      [for repo in aws_ecr_repository.repos : repo.arn],
+      [for repo in data.aws_ecr_repository.existing : repo.arn],
+      [
+        data.aws_ecr_repository.arena.arn,
+        "arn:aws:ecr:${local.region}:${var.dlc_account_id}:repository/pytorch-training",
+        "arn:aws:ecr:${local.region}:${var.sklearn_account_id}:repository/sagemaker-scikit-learn",
+      ],
+    )
   }
 
   # SageMaker writes job logs under /aws/sagemaker/. CreateLogGroup is included because a
