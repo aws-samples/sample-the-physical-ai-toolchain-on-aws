@@ -24,7 +24,7 @@ to train, refine, and deploy a pick-and-place robot policy.
 
 | Requirement | Why | How to check |
 |-------------|-----|--------------|
-| AWS Account with GPU quota | Training runs on `ml.g5.12xlarge` | `aws service-quotas get-service-quota --service-code sagemaker --quota-code L-3B05A85A` |
+| AWS Account with GPU quota | Training runs on `ml.g5.12xlarge` | `aws service-quotas get-service-quota --service-code sagemaker --quota-code L-C6383286` (ml.g5.12xlarge for training job usage) |
 | AWS CLI v2 configured | Deploy infrastructure | `aws sts get-caller-identity` |
 | Node.js 18+ | CDK requires it | `node --version` |
 | AWS CDK CLI | Deploy stacks | `npx cdk --version` |
@@ -112,6 +112,19 @@ npx cdk synth --context mode=simple 2>&1 | head -5
 # Should print: Successfully synthesized to cdk.out
 cd ..
 ```
+
+At this point only the first three `pai doctor` checks need to pass:
+
+| Check | Expected now |
+|-------|--------------|
+| [1/5] AWS credentials | PASS |
+| [2/5] AWS region | PASS (a "validated region is us-west-2" warning is informational if you chose another region) |
+| [3/5] iam:PassRole | PASS |
+| [4/5] isaac-lab image in ECR | FAIL until the Foundation stack is deployed (Step 8) and its isaac-lab CodeBuild job finishes (up to an hour; needs the NGC key from Step 6) |
+| [5/5] Foundation infrastructure | FAIL, because the Foundation stack is not deployed yet |
+
+`pai doctor` exits non-zero ("Some checks failed") while checks 4 and 5 fail. That is
+expected here; continue to Step 8.
 
 ### 8. Deploy the Foundation stack — builds start automatically
 
