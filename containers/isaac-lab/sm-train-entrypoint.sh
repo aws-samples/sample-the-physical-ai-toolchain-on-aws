@@ -3,7 +3,7 @@
 # Isaac Lab SageMaker Training Entrypoint
 #
 # Based on the official AWS pattern from:
-# https://github.com/awslabs/awsome-distributed-ai/tree/main/3.test_cases/pytorch/nvidia-isaac-lab
+# https://github.com/awslabs/awsome-distributed-ai/tree/main/examples/use-cases/isaac-lab
 #
 # Parses SageMaker's resource config for multi-node topology, then launches
 # Isaac Lab RL training via torchrun.

@@ -451,7 +451,7 @@ procedural randomization provides.
 For production-scale generation (thousands of videos, continuous flywheel loop), deploy
 the vLLM-Omni server on **Amazon EKS** instead of bare EC2. The Kubernetes manifest
 is at `kubernetes/generate-vllm-omni-super.yaml` (adapted from the validated
-[awslabs/awsome-distributed-ai/cosmos3](https://github.com/awslabs/awsome-distributed-ai/tree/main/3.test_cases/pytorch/cosmos3)
+[awslabs/awsome-distributed-ai/cosmos3](https://github.com/awslabs/awsome-distributed-ai/tree/main/examples/use-cases/cosmos3)
 reference, MIT-0).
 
 ---
