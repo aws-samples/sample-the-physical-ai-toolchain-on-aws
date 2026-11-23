@@ -97,6 +97,22 @@ This toolchain supports two usage patterns depending on where you are in your Ph
 
 ---
 
+## Companion Workshop: Physical AI on Amazon SageMaker HyperPod
+
+[**Physical AI on Amazon SageMaker HyperPod**](https://catalog.us-east-1.prod.workshops.aws/workshops/00b35c0d-b380-4107-a60c-a9a07cfcc906) is a hands-on AWS workshop that runs the robot-learning loop (simulate, learn, evaluate) on one [SageMaker HyperPod](https://aws.amazon.com/sagemaker/ai/hyperpod/) cluster with NVIDIA RTX PRO 4500 Blackwell GPUs (`ml.g7.2xlarge`). The components above run each stage as its own SageMaker or AWS Batch job. The workshop runs the same NVIDIA stack on a persistent cluster that a team shares, orchestrated by either Amazon EKS or Slurm. It is separate from this repository's own [labs](workshop/README.md).
+
+| Workshop module | What you run | Related component |
+|-----------------|--------------|-------------------|
+| RL training | A Unitree H1 humanoid learns to walk on rough terrain, with 4,096 robots on one GPU (Isaac Lab 3.0, rsl_rl PPO) | [Isaac Lab](isaac-lab-on-aws/) |
+| Live view | Watch the RTX-rendered simulation from your laptop: Isaac Sim over WebRTC (EKS) or an Amazon DCV desktop (Slurm) | [Isaac Sim](isaac-sim-on-aws/) |
+| Imitation learning | Post-train GR00T N1.6-3B on 100 demonstrations of a humanoid putting a bottle in a fridge | [Isaac GR00T](isaac-gr00t-on-aws/) |
+| Closed-loop evaluation | NVIDIA's fine-tuned GR00T checkpoint for that task drives a simulated GR1 humanoid in Isaac Lab Arena 0.3.1, which reports a success rate and records rollout videos | [Isaac Lab Arena Evaluation](isaac-lab-arena-on-aws/) |
+| Operations | Track every run in SageMaker MLflow, watch GPU dashboards in Grafana (Amazon Managed Service for Prometheus), and inject a node failure to watch HyperPod recover the job | - |
+
+The EKS option also covers HyperPod task governance (Kueue priorities and preemption) and optional modules for Ray (KubeRay, Ray Tune) and SkyPilot. Each option takes about 2 hours, at level 300-400.
+
+---
+
 ## Pick and Place Example Use Case Included
 
 The toolkit is generic infrastructure for any robot, any task, any hardware. To demonstrate it working end-to-end, we provide a complete **pick-and-place** example — the most common industrial robot task (bin picking, kitting, palletizing).
