@@ -2,6 +2,7 @@
 # Cosmos on AWS: start or stop the private Cosmos 3 server on EKS.
 #
 #   bash cosmos-service.sh start    install the Helm release and wait until it is ready
+#                                   (reuses a release pre-started by event-provision.sh)
 #   bash cosmos-service.sh stop     uninstall it and wait until the GPU node is removed
 #   bash cosmos-service.sh status   show the release, Pod and GPU node state
 #
@@ -41,6 +42,12 @@ pod_state() {
     | head -1 | awk '{print $1 ($2=="true" ? ", ready" : "")}'
 }
 release_exists() { helm status "$HELM_RELEASE" -n "$NS" >/dev/null 2>&1; }
+release_status() { helm status "$HELM_RELEASE" -n "$NS" 2>/dev/null | awk '/^STATUS:/ {print $2; exit}'; }
+deployment_ready() {
+  local r
+  r=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+  echo "${r:-0}"
+}
 leftovers() {
   release_exists \
     || kubectl get deployment "$DEPLOYMENT_NAME" -n "$NS" >/dev/null 2>&1 \
@@ -55,6 +62,31 @@ start() {
     [ -n "${!v:-}" ] || fail "$v is missing from $ENV_FILE; run the pre-flight again"
   done
   command -v helm >/dev/null 2>&1 || fail "helm not found; run the pre-flight again"
+
+  # At an AWS event, account provisioning pre-starts this release (event-provision.sh).
+  # Reuse it rather than upgrading: a second Helm operation would collide with a
+  # pre-start that is still running.
+  if release_exists; then
+    local rel_status elapsed=0
+    rel_status=$(release_status)
+    case "$rel_status" in
+      deployed|pending-install|pending-upgrade) ;;
+      *) fail "$HELM_RELEASE exists with status '${rel_status:-unknown}'; run Step 7 (cosmos-service.sh stop), then Step 3 again" ;;
+    esac
+    info "$HELM_RELEASE is already installed (pre-started for this event); checking readiness"
+    until [ "$(deployment_ready)" -ge 1 ] && [ "$(release_status)" = "deployed" ]; do
+      [ "$elapsed" -lt "$START_TIMEOUT_MIN" ] \
+        || fail "$HELM_RELEASE is not Ready after $START_TIMEOUT_MIN minutes; contact the facilitator"
+      release_exists \
+        || fail "the pre-started $HELM_RELEASE did not finish and was removed; run Step 3 again to install it"
+      local pod; pod=$(pod_state || true)
+      info "waiting ${elapsed} min: release $(release_status), GPU nodes $(gpu_nodes), Cosmos Pod ${pod:-not scheduled yet}"
+      sleep 60; elapsed=$((elapsed + 1))
+    done
+    pass "Helm release $HELM_RELEASE deployed"
+    check_ready
+    return
+  fi
 
   info "Installing $HELM_RELEASE. GPU billing starts now; allow about 20 minutes."
   local log="$HOME/.physical-ai/cosmos-start.log"
@@ -77,12 +109,13 @@ start() {
     fail "Helm did not finish; --atomic removed the release, so nothing is running. Log: $log"
   fi
   pass "Helm release $HELM_RELEASE deployed"
+  check_ready
+}
 
+check_ready() {
   kubectl get deployment "$DEPLOYMENT_NAME" -n "$NS" >/dev/null 2>&1 \
     || fail "Deployment $DEPLOYMENT_NAME not found"
-  local ready
-  ready=$(kubectl get deployment "$DEPLOYMENT_NAME" -n "$NS" -o jsonpath='{.status.readyReplicas}')
-  [ "${ready:-0}" -ge 1 ] || fail "Deployment $DEPLOYMENT_NAME has no ready replica"
+  [ "$(deployment_ready)" -ge 1 ] || fail "Deployment $DEPLOYMENT_NAME has no ready replica"
   pass "Deployment $DEPLOYMENT_NAME is 1/1 Ready"
 
   local svc_type

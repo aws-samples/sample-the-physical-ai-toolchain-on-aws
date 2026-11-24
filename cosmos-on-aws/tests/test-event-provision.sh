@@ -148,10 +148,15 @@ printf 'sha256sum %s\n' "$*" >> "$STUB_LOG"
 if [ "${1:-}" = "-c" ]; then cat >/dev/null; exit 0; fi
 printf '%s  %s\n' "${STUB_SHA256:-${CENTRAL_WEIGHTS_SHA256:-stub}}" "${1:-file}"
 EOF
-chmod +x "$STUBS/aws" "$STUBS/terraform" "$STUBS/kubectl" "$STUBS/curl" "$STUBS/sha256sum"
+cat > "$STUBS/helm" <<'EOF'
+#!/bin/bash
+printf 'helm %s\n' "$*" >> "$STUB_LOG"
+exit "${STUB_HELM_RC:-0}"
+EOF
+chmod +x "$STUBS/aws" "$STUBS/terraform" "$STUBS/kubectl" "$STUBS/curl" "$STUBS/sha256sum" "$STUBS/helm"
 
 # Guard: under the case PATH every tool must resolve to its stub, never a real binary.
-for tool in aws terraform kubectl curl sha256sum; do
+for tool in aws terraform kubectl curl sha256sum helm; do
   resolved="$(PATH="$STUBS:/usr/bin:/bin" command -v "$tool")"
   [ "$resolved" = "$STUBS/$tool" ] || { echo "stub guard: $tool resolves to $resolved" >&2; exit 2; }
 done
@@ -537,6 +542,57 @@ finish "j   POD_GRANT_FOUNDATION_BUCKET=false, no DATA_BUCKET -> exit 1 before p
 LOG="$G_LOG"; RC=0; CASE_OK=1; CASE_MSGS=""; ERR="$WORK/case-g/stderr"
 expect "describe-subnets has --region us-east-2" has_re "$LOG" '^aws ec2 describe-subnets .*--region us-east-2( |$)'
 finish "k   describe-subnets called with --region us-east-2"
+
+# (p) COSMOS_PRESTART: the attendees' release is pre-started only with a GPU capacity reservation
+CR=cr-0b4f1b642f89633ee
+IMG=111111111111.dkr.ecr.us-east-2.amazonaws.com/cosmos@sha256:abc
+UPPER_SHA="$(printf '%s' "$ARCHIVE_SHA" | tr '[:lower:]' '[:upper:]')"
+
+run_case p-auto-od "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" \
+  "DATA_BUCKET=$DATA" "COSMOS_IMAGE_URI=$IMG"
+expect "exit 0" rc_is 0
+expect "on-demand skip logged" has "$OUT" "COSMOS_PRESTART=auto and no GPU capacity reservation - not pre-starting Cosmos"
+expect "no helm install" hasnt "$LOG" "helm upgrade"
+finish "p   COSMOS_PRESTART unset, no GPU_CR_ID -> no pre-start"
+
+run_case p-auto-cb "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$UPPER_SHA" \
+  "DATA_BUCKET=$DATA" "COSMOS_IMAGE_URI=$IMG" "GPU_CR_ID=$CR" "STUB_SHA256=$ARCHIVE_SHA"
+expect "exit 0" rc_is 0
+expect "helm upgrade --install of the attendees' release" has "$LOG" "helm upgrade --install cosmos3-g1-server"
+expect "archive URI from the relayed archive" has "$LOG" "model.archiveS3Uri=s3://$DATA/cosmos3-assets/archives/cosmos3-nano.tar"
+expect "SHA-256 lower-cased" has "$LOG" "model.archiveSha256=$ARCHIVE_SHA"
+expect "image from COSMOS_IMAGE_URI" has "$LOG" "image.ref=$IMG"
+expect "waits atomically" has "$LOG" "--wait --timeout 30m --atomic"
+expect "ready logged" has "$OUT" "Cosmos pre-started: cosmos3-g1-server is Ready"
+expect "pre-start before completion line" line_before "$OUT" "Cosmos pre-started" "Pre-provisioning complete"
+finish "p   COSMOS_PRESTART unset, GPU_CR_ID set -> release pre-started"
+
+run_case p-false "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" \
+  "DATA_BUCKET=$DATA" "COSMOS_IMAGE_URI=$IMG" "GPU_CR_ID=$CR" "COSMOS_PRESTART=false"
+expect "exit 0" rc_is 0
+expect "no helm install" hasnt "$LOG" "helm upgrade"
+finish "p   COSMOS_PRESTART=false with GPU_CR_ID -> no pre-start"
+
+run_case p-no-image "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" \
+  "DATA_BUCKET=$DATA" "GPU_CR_ID=$CR" "COSMOS_PRESTART=true"
+expect "exit 0" rc_is 0
+expect "missing input logged" has "$OUT" "WARNING: pre-start needs the weights archive"
+expect "no helm install" hasnt "$LOG" "helm upgrade"
+finish "p   COSMOS_PRESTART=true without COSMOS_IMAGE_URI -> warning, no pre-start"
+
+run_case p-helm-fails "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" \
+  "DATA_BUCKET=$DATA" "COSMOS_IMAGE_URI=$IMG" "GPU_CR_ID=$CR" "STUB_HELM_RC=1"
+expect "exit 0 (not fatal)" rc_is 0
+expect "failure logged" has "$OUT" "WARNING: cosmos3-g1-server did not become Ready"
+expect "completion still logged" has "$OUT" "Pre-provisioning complete - account is event-ready"
+finish "p   pre-start Helm failure -> warning, provisioning still completes"
+
+run_case p-bad "CENTRAL_WEIGHTS_URL=$PRESIGNED" "CENTRAL_WEIGHTS_SHA256=$ARCHIVE_SHA" \
+  "DATA_BUCKET=$DATA" "COSMOS_IMAGE_URI=$IMG" "GPU_CR_ID=$CR" "COSMOS_PRESTART=yes"
+expect "exit 0" rc_is 0
+expect "bad value logged" has "$OUT" "COSMOS_PRESTART='yes' is not auto, true or false"
+expect "no helm install" hasnt "$LOG" "helm upgrade"
+finish "p   COSMOS_PRESTART=yes -> warning, no pre-start"
 
 echo
 echo "Summary: $PASS passed, $FAIL failed, $SKIP skipped"

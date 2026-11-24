@@ -249,7 +249,16 @@ check_no_release() {
   [ "$ok_eks" = 1 ] || needs="$needs, EKS access (check 5)"
   [ "$ok_helm" = 1 ] || needs="$needs, Helm (check 6)"
   [ -z "$needs" ] || { skip "$needs"; return 1; }
-  if helm status "$HELM_RELEASE" --namespace default >/dev/null 2>&1 \
+  # At an AWS event, account provisioning pre-starts this release (event-provision.sh).
+  # A deployed or still-installing release is expected there; Step 3 reuses it.
+  local rel_status
+  rel_status=$(helm status "$HELM_RELEASE" --namespace default 2>/dev/null | awk '/^STATUS:/ {print $2; exit}')
+  case "$rel_status" in
+    deployed|pending-install)
+      pass "$HELM_RELEASE pre-started for this event ($rel_status); Step 3 reuses it"
+      return 0 ;;
+  esac
+  if [ -n "$rel_status" ] \
     || kubectl get deployment "$DEPLOYMENT_NAME" --namespace default >/dev/null 2>&1 \
     || kubectl get service "$SERVICE_NAME" --namespace default >/dev/null 2>&1; then
     fail "$HELM_RELEASE already exists; uninstall it (Step 7) first"; return 1

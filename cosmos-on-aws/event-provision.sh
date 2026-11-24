@@ -49,6 +49,13 @@
 #   COSMOS_IMAGE_URI    ECR image for vllm-omni cosmos3. When GPU_DESIRED_SIZE is above
 #                       0, the staging Job runs it, which pre-pulls it into that node's
 #                       image cache. At the default 0 it is not pulled during provisioning.
+#   COSMOS_PRESTART     auto | true | false (default auto). Installs the attendees'
+#                       cosmos3-g1-server release at the end of provisioning, so the lab's
+#                       Step 3 finds it Ready instead of waiting ~20 min. auto = only when
+#                       GPU_CR_ID is set: a Capacity Block or capacity reservation bills
+#                       whether or not it is used, so the warm node costs nothing extra,
+#                       while an on-demand node would bill from provisioning until an
+#                       attendee runs Step 7 (cosmos-service.sh stop).
 #   DATA_BUCKET         Workshop data bucket (optional). The pod IRSA policy grants it,
 #                       and CENTRAL_WEIGHTS_S3 is relayed into it when the account has no
 #                       /physical-ai/datasets-bucket SSM parameter.
@@ -89,6 +96,9 @@ CENTRAL_WEIGHTS_S3="${CENTRAL_WEIGHTS_S3:-}"
 CENTRAL_WEIGHTS_URL="${CENTRAL_WEIGHTS_URL:-}"
 CENTRAL_WEIGHTS_SHA256="${CENTRAL_WEIGHTS_SHA256:-}"
 COSMOS_IMAGE_URI="${COSMOS_IMAGE_URI:-}"
+COSMOS_PRESTART="${COSMOS_PRESTART:-auto}"
+# Same Helm version the workstation pre-flight installs.
+HELM_VERSION="${HELM_VERSION:-v3.17.3}"
 WORKSTATION_ROLE_ARN="${WORKSTATION_ROLE_ARN:-}"
 VPC_ID="${VPC_ID:-}"
 EKS_NODE_SUBNET_IDS="${EKS_NODE_SUBNET_IDS:-}"
@@ -641,6 +651,61 @@ elif [ -n "$CENTRAL_WEIGHTS_URL" ]; then
 fi
 
 #-----------------------------------------------------------------------------------
+# 4b. Optional pre-start of the attendees' Cosmos server (defined here, called last).
+#
+# Installs the same release, chart and values as `cosmos-service.sh start`, so the
+# lab's Step 3 finds it Ready and Step 7 (`cosmos-service.sh stop`) removes it and
+# frees the GPU for the Batch labs. Cluster Autoscaler keeps the node while the Pod
+# runs. A failure is logged, not fatal: the account still works, and Step 3 starts
+# the server on demand. Needs the archive path (CENTRAL_WEIGHTS_URL relay); an
+# unpacked CENTRAL_WEIGHTS_S3 prefix is not what the chart reads, so it is skipped.
+#-----------------------------------------------------------------------------------
+COSMOS_RELEASE="cosmos3-g1-server"
+prestart_cosmos() {
+  case "$COSMOS_PRESTART" in
+    true) ;;
+    false) log "COSMOS_PRESTART=false - attendees start Cosmos in Step 3"; return 0 ;;
+    auto)
+      if [ -z "$GPU_CR_ID" ]; then
+        log "COSMOS_PRESTART=auto and no GPU capacity reservation - not pre-starting Cosmos (an on-demand GPU node would bill until Step 7)"
+        return 0
+      fi ;;
+    *) log "WARNING: COSMOS_PRESTART='${COSMOS_PRESTART}' is not auto, true or false - not pre-starting Cosmos"; return 0 ;;
+  esac
+  if [ -z "$WEIGHTS_ARCHIVE_KEY" ] || [ -z "$CENTRAL_WEIGHTS_SHA256" ] || [ -z "$COSMOS_IMAGE_URI" ]; then
+    log "WARNING: pre-start needs the weights archive, its SHA-256 and COSMOS_IMAGE_URI - not pre-starting Cosmos"
+    return 0
+  fi
+  if ! command -v helm >/dev/null 2>&1; then
+    log "Installing Helm ${HELM_VERSION}"
+    local archive="helm-${HELM_VERSION}-linux-amd64.tar.gz"
+    if ! { curl -fsSL -o "/tmp/${archive}" "https://get.helm.sh/${archive}" \
+        && curl -fsSL -o "/tmp/${archive}.sha256sum" "https://get.helm.sh/${archive}.sha256sum" \
+        && (cd /tmp && sha256sum -c "${archive}.sha256sum") \
+        && tar -xzf "/tmp/${archive}" -C /tmp \
+        && install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm; }; then
+      log "WARNING: Helm install failed - not pre-starting Cosmos; attendees start it in Step 3"
+      return 0
+    fi
+  fi
+  local archive_sha
+  archive_sha="$(printf '%s' "$CENTRAL_WEIGHTS_SHA256" | tr '[:upper:]' '[:lower:]')"
+  log "Pre-starting ${COSMOS_RELEASE} on capacity reservation ${GPU_CR_ID:-none} (waits up to 30 min)"
+  if helm upgrade --install "$COSMOS_RELEASE" "$SCRIPT_DIR/charts/cosmos3" \
+      --namespace default \
+      --set-string "aws.region=${AWS_REGION_NAME}" \
+      --set-string "image.ref=${COSMOS_IMAGE_URI}" \
+      --set-string "model.archiveS3Uri=s3://${WEIGHTS_BUCKET}/${WEIGHTS_ARCHIVE_KEY}" \
+      --set-string "model.archiveSha256=${archive_sha}" \
+      --wait --timeout 30m --atomic --history-max 3; then
+    kubectl get deployment "$COSMOS_RELEASE" -n default || true
+    log "Cosmos pre-started: ${COSMOS_RELEASE} is Ready, so the lab's Step 3 returns at once"
+  else
+    log "WARNING: ${COSMOS_RELEASE} did not become Ready (is the capacity reservation active yet?). --atomic removed it; attendees start it in Step 3, or re-run this build once it is active"
+  fi
+}
+
+#-----------------------------------------------------------------------------------
 # 5. Staging Job: node-local weight cache + image pre-pull, in one step.
 #
 # hostPath, deliberately not EFS: the cluster runs in the workshop VPC, so the stack's
@@ -661,6 +726,7 @@ fi
 # The Cosmos chart fetches and verifies the archive from S3 on a cold node instead.
 if [ "$GPU_DESIRED_SIZE" -eq 0 ]; then
   log "GPU_DESIRED_SIZE=0 - skipping the staging Job; the first Cosmos workload scales up a GPU node and fetches the weights from S3"
+  prestart_cosmos
   log "Pre-provisioning complete - account is event-ready"
   exit 0
 fi
@@ -765,6 +831,7 @@ EOF
 log "Waiting for staging to finish (weights + image pull can take ~10 min)"
 if kubectl wait --for=condition=complete --timeout=45m job/cosmos3-staging -n default; then
   kubectl logs job/cosmos3-staging -n default --tail=10 || true
+  prestart_cosmos
   log "Pre-provisioning complete - account is event-ready"
 else
   log "ERROR: staging Job did not complete; preserving pod diagnostics in CodeBuild logs:"
